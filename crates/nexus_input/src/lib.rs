@@ -336,3 +336,34 @@ mod tests {
         assert_eq!(u8_to_state(255), SessionState::Inactive);
     }
 }
+
+pub fn show_client_permission_dialog(server_addr: &str, session_id: &str) -> Result<bool> {
+    let message = format!(
+        "Incoming Access Request: Server [{}] requests access using Session ID [{}]. Do you approve this connection?",
+        server_addr, session_id
+    );
+    let title = "NexusP2P Client Permission";
+
+    let message_utf16: Vec<u16> = message.encode_utf16().chain(std::iter::once(0)).collect();
+    let title_utf16: Vec<u16> = title.encode_utf16().chain(std::iter::once(0)).collect();
+
+    let response = unsafe {
+        MessageBoxW(
+            None,
+            PCWSTR(message_utf16.as_ptr()),
+            PCWSTR(title_utf16.as_ptr()),
+            MB_YESNO | MB_ICONQUESTION | MB_TOPMOST | MB_SETFOREGROUND,
+        )
+    };
+
+    if response == IDYES {
+        Ok(true)
+    } else if response == IDNO {
+        Ok(false)
+    } else {
+        Err(anyhow!(
+            "MessageBoxW returned unexpected response code: {}",
+            response.0
+        ))
+    }
+}

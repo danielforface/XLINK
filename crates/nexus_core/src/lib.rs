@@ -1,4 +1,3 @@
-use rand::distributions::{Distribution, Uniform};
 use rand::rngs::OsRng;
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
@@ -6,7 +5,6 @@ use std::sync::atomic::{AtomicU8, Ordering};
 use thiserror::Error;
 
 const SESSION_ID_RANDOM_BYTES: usize = 6;
-const ACCESS_PASSWORD_MAX: u32 = 999_999;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub enum SessionState {
@@ -115,7 +113,6 @@ fn is_transition_allowed(from: SessionState, to: SessionState) -> bool {
 #[derive(Debug, Clone)]
 pub struct SessionCredentials {
     pub session_id: String,
-    pub access_password: String,
 }
 
 impl SessionCredentials {
@@ -126,21 +123,13 @@ impl SessionCredentials {
         rng.fill_bytes(&mut session_id_bytes);
         let session_id = hex::encode(session_id_bytes);
 
-        let distribution = Uniform::new_inclusive(0_u32, ACCESS_PASSWORD_MAX);
-        let access_password = format!("{:06}", distribution.sample(&mut rng));
-
-        Self {
-            session_id,
-            access_password,
-        }
+        Self { session_id }
     }
 
-    pub fn verify(&self, target_id: &str, password: &str) -> Result<(), SecurityError> {
+    pub fn verify(&self, target_id: &str) -> Result<(), SecurityError> {
         let id_matches = constant_time_equals(target_id.as_bytes(), self.session_id.as_bytes());
-        let password_matches =
-            constant_time_equals(password.as_bytes(), self.access_password.as_bytes());
 
-        if id_matches && password_matches {
+        if id_matches {
             Ok(())
         } else {
             Err(SecurityError::AuthenticationFailed)
@@ -177,9 +166,14 @@ pub enum ControlMessage {
     AuthRequest {
         requester_id: String,
         target_id: String,
-        password: String,
     },
     AuthResult { success: bool, message: String },
+    AccessRequest {
+        session_id: String,
+    },
+    AccessDecision {
+        approved: bool,
+    },
     SessionConsent { approved: bool },
     SimulatedMouseMove { x_norm: f32, y_norm: f32 },
     SimulatedKeyEvent { virtual_key: u16, pressed: bool },
@@ -234,7 +228,6 @@ mod tests {
         let original = ControlMessage::AuthRequest {
             requester_id: "requester".to_string(),
             target_id: "target".to_string(),
-            password: "123456".to_string(),
         };
 
         let encoded = bincode::serialize(&original).expect("serialize ControlMessage");
@@ -244,11 +237,9 @@ mod tests {
             ControlMessage::AuthRequest {
                 requester_id,
                 target_id,
-                password,
             } => {
                 assert_eq!(requester_id, "requester");
                 assert_eq!(target_id, "target");
-                assert_eq!(password, "123456");
             }
             other => panic!("unexpected control message variant: {other:?}"),
         }
@@ -291,14 +282,13 @@ mod tests {
     fn credential_verification_uses_expected_values() {
         let credentials = SessionCredentials {
             session_id: "abc12345".to_string(),
-            access_password: "654321".to_string(),
         };
 
         credentials
-            .verify("abc12345", "654321")
-            .expect("matching credentials should pass");
+            .verify("abc12345")
+            .expect("matching session id should pass");
         assert!(matches!(
-            credentials.verify("abc12345", "000000"),
+            credentials.verify("wrong-target"),
             Err(SecurityError::AuthenticationFailed)
         ));
     }

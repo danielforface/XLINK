@@ -1,14 +1,23 @@
 # NexusP2P
 
-NexusP2P is a Windows-focused remote support engine written in Rust.
+NexusP2P is a Windows-focused remote support engine written in Rust, now powered by a modern desktop GUI built with `eframe` + `egui`.
 
 ## Features
 
+- Modern native desktop GUI (no command prompt workflow)
+- Host/Client tabbed control surface with live session telemetry
+- Out-of-band Access ID exchange:
+  - Copy to clipboard
+  - Save/load `.nexus` connection files
+  - QR code generation, QR PNG export, and QR image/clipboard decoding
 - QUIC transport with certificate fingerprint pinning
-- Explicit host consent before session activation
-- DXGI Desktop Duplication host capture path
-- Client remote session viewer window
-- Session-gated Win32 `SendInput` support (optional via CLI)
+- ID-only connection workflow (server needs only Session ID inside Access ID)
+- Explicit multi-gate permission flow:
+  - Server requests client permission
+  - Client approves/denies in GUI
+  - Host user gives final local consent in GUI modal
+- DXGI Desktop Duplication host capture
+- Session-gated Win32 `SendInput` support
 
 ## Prerequisites
 
@@ -17,76 +26,55 @@ NexusP2P is a Windows-focused remote support engine written in Rust.
 
 ## Development Validation
 
-Run all tests and compile checks:
-
 ```powershell
-cargo test --workspace
 cargo check --workspace
+cargo test --workspace
 ```
 
-## Running Locally
+## Run The GUI App
 
-### Interactive all-in-one mode
+```powershell
+cargo run
+```
 
-The same executable can act as Host or Client. If you run without flags, it opens an interactive gateway:
+or with packaged binary:
 
 ```powershell
 ./dist/nexus-p2p.exe
 ```
 
-You can choose:
+The app opens directly in the desktop GUI (no CLI prompts).
 
-- `1` Host session (Server)
-- `2` Connect to host (Client)
+## Host Workflow
 
-Client mode prompts for target Access ID and Access Password.
+1. Open `Host Mode`.
+2. Set port/FPS/advertise address and click `Start Hosting`.
+3. Share generated Access ID out-of-band using one of:
+   - `Copy Access ID`
+   - `Save Connection File`
+  - `Export QR PNG`
+  - QR shown in host dashboard
+4. Wait for incoming session request panel and consent chain.
 
-### 1) Start host/server
+## Client Workflow
 
-```powershell
-cargo run -- --server --port 5000 --fps 30
-```
+1. Open `Client Mode`.
+2. Provide Access ID by one of:
+   - Paste text
+   - Load connection file
+   - Load QR image
+   - Decode QR from clipboard image
+3. Click `Connect`.
+4. Approve or deny server access request in GUI prompt.
 
-For active OS input injection on host, opt in explicitly:
+## Optional Automation Flags
 
-```powershell
-cargo run -- --server --port 5000 --fps 30 --inject-input
-```
+For automated smoke tests:
 
-If the host is behind NAT or has multiple interfaces, set an explicit advertised endpoint:
-
-```powershell
-cargo run -- --server --port 5000 --advertise 192.168.1.42:5000
-```
-
-The server prints:
-
-- SHA-256 certificate fingerprint
-- one-time Session ID
-- 6-digit Access Password
-- Access ID (contains host endpoint + fingerprint + Session ID)
-
-### 2) Start client
-
-```powershell
-cargo run -- --access-id <ACCESS_ID> --access-password <ACCESS_PASSWORD>
-```
-
-Optional custom client name:
-
-```powershell
-cargo run -- --access-id <ACCESS_ID> --access-password <ACCESS_PASSWORD> --display-name workstation-a
-```
-
-Advanced/manual mode is still supported if needed:
-
-```powershell
-cargo run -- --client 127.0.0.1:5000 --fingerprint <SERVER_FINGERPRINT> --target-id <SESSION_ID> --access-password <ACCESS_PASSWORD>
-```
+- `NEXUS_AUTO_CLIENT_PERMISSION=1` auto-approves client-side access requests.
+- `NEXUS_AUTO_CONSENT=1` auto-approves host local consent.
 
 ## Production Build
-
-Use the packaging script:
 
 ```powershell
 ./scripts/build-release.ps1
@@ -97,7 +85,7 @@ Artifacts:
 - `dist/nexus-p2p.exe`
 - `dist/README.md`
 
-## Production Test Pass
+## Production Validation Script
 
 ```powershell
 ./scripts/test-production.ps1
