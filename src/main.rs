@@ -15,12 +15,10 @@ use nexus_input::{
     InputController, KeyboardPreview, MousePreview, SessionState as InputSessionState,
 };
 use nexus_network::{
-    bind_client, bind_server, normalize_fingerprint_hex,
-    build_pinned_rustls_client_config,
-    NetworkTopology, run_diagnostics,
+    accept_connection, connect_to_peer, create_client_endpoint, EndpointAddr, RecvStream,
+    SendStream, SecretKey,
 };
 use qrcode_generator::QrCodeEcc;
-use quinn::{RecvStream, SendStream, VarInt};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::fs;
@@ -33,9 +31,17 @@ use std::time::{Duration, Instant};
 use tokio::runtime::Builder;
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::{self, MissedTickBehavior};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio_rustls::rustls;
 use tracing::{error, info, warn};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum NetworkTopology {
+    #[default]
+    Undetermined,
+    OpenInternet,
+    ConeNatFriendly,
+    SymmetricNatRestrictive,
+    UdpBlockedStrict,
+}
 #[cfg(target_os = "windows")]
 use winreg::enums::HKEY_CURRENT_USER;
 #[cfg(target_os = "windows")]
@@ -47,25 +53,9 @@ const DEFAULT_PORT: u16 = 0;
 const DEFAULT_FPS: u16 = 30;
 const MIN_FPS: u16 = 1;
 const MAX_FPS: u16 = 60;
-const ACCESS_ID_VERSION: u8 = 1;
+const CONNECTION_PAYLOAD_BYTES: usize = 32;
 const UI_REPAINT_MS: u64 = 16;
 const DEEP_LINK_PREFIX: &str = "nexus://connect";
-
-const CONNECTION_PAYLOAD_VERSION: u8 = 1;
-const CONNECTION_PAYLOAD_FAMILY_IPV4: u8 = 4;
-const CONNECTION_PAYLOAD_BYTES: usize = 32;
-const CONNECTION_PAYLOAD_HEADER_BYTES: usize = 2;
-const CONNECTION_PAYLOAD_IPV4_BYTES: usize = 4;
-const CONNECTION_PAYLOAD_PORT_BYTES: usize = 2;
-const CONNECTION_PAYLOAD_FINGERPRINT_PREFIX_BYTES: usize = 16;
-const CONNECTION_PAYLOAD_TARGET_ID_BYTES: usize = 6;
-const CONNECTION_PAYLOAD_USED_BYTES: usize = CONNECTION_PAYLOAD_HEADER_BYTES
-    + CONNECTION_PAYLOAD_IPV4_BYTES
-    + CONNECTION_PAYLOAD_PORT_BYTES
-    + CONNECTION_PAYLOAD_FINGERPRINT_PREFIX_BYTES
-    + CONNECTION_PAYLOAD_TARGET_ID_BYTES;
-const CONNECTION_PAYLOAD_RESERVED_BYTES: usize =
-    CONNECTION_PAYLOAD_BYTES - CONNECTION_PAYLOAD_USED_BYTES;
 
 fn main() -> Result<()> {
     init_tracing();
@@ -132,19 +122,12 @@ fn init_tracing() {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct AccessIdPayload {
-    version: u8,
-    server_addr: String,
-    fingerprint: String,
-    target_id: String,
-    tcp_port: Option<u16>,
+    seed: [u8; 32],
 }
 
 #[derive(Debug, Clone)]
 struct ParsedAccessId {
-    server_addr: SocketAddr,
-    fingerprint: String,
-    target_id: String,
-    tcp_port: Option<u16>,
+    seed: [u8; 32],
 }
 
 #[derive(Debug, Clone)]
@@ -163,11 +146,9 @@ enum TransportMode {
 
 #[derive(Debug, Clone)]
 struct HostRuntimeConfig {
-    port: u16,
     fps: u16,
     inject_input: bool,
-    advertise_addr: Option<SocketAddr>,
-    transport_mode: TransportMode,
+    seed: [u8; 32],
 }
 
 #[derive(Debug)]
@@ -176,7 +157,7 @@ enum RuntimeCommand {
     ConnectWithAccessId {
         access_id: String,
         display_name: Option<String>,
-        transport_mode: TransportMode,
+        _transport_mode: TransportMode,
     },
     RunDiagnostics,
 }
@@ -184,7 +165,7 @@ enum RuntimeCommand {
 #[derive(Debug)]
 enum RuntimeEvent {
     HostReady {
-        advertised_addr: SocketAddr,
+        advertised_addr: String,
         fingerprint: String,
         session_id: String,
         access_id: String,
@@ -192,17 +173,17 @@ enum RuntimeEvent {
         inject_input: bool,
     },
     IncomingSession {
-        remote_addr: SocketAddr,
+        remote_addr: String,
         requester_id: String,
         target_session: String,
     },
     ClientPermissionRequested {
-        server_addr: SocketAddr,
+        server_addr: String,
         session_id: String,
     },
     HostConsentRequested {
         requester_id: String,
-        remote_addr: SocketAddr,
+        remote_addr: String,
         target_session: String,
     },
     HostLifecycle {
@@ -214,11 +195,11 @@ enum RuntimeEvent {
     SessionStatus(String),
     DiagnosticsCompleted {
         topology: NetworkTopology,
-        public_addr: Option<SocketAddr>,
+        public_addr: Option<String>,
     },
     ConnectionEstablished {
         protocol: String,
-        local_addr: SocketAddr,
+        local_addr: String,
         latency_ms: u128,
     },
     Error(String),
@@ -228,7 +209,6 @@ enum RuntimeEvent {
 struct UiBridge {
     pending_client_permission_sender: Mutex<Option<oneshot::Sender<bool>>>,
     pending_host_consent_sender: Mutex<Option<oneshot::Sender<bool>>>,
-    client_punch_addr: Mutex<Option<SocketAddr>>,
 }
 
 impl UiBridge {
@@ -309,14 +289,14 @@ enum ActiveTab {
 
 #[derive(Debug, Clone)]
 struct PermissionPrompt {
-    server_addr: SocketAddr,
+    server_addr: String,
     session_id: String,
 }
 
 #[derive(Debug, Clone)]
 struct HostConsentPrompt {
     requester_id: String,
-    remote_addr: SocketAddr,
+    remote_addr: String,
     target_session: String,
 }
 
@@ -349,6 +329,7 @@ struct NexusGuiApp {
     detecting_public_ip: Arc<AtomicBool>,
     _runtime_handle: tokio::runtime::Handle,
     has_auto_hosted: bool,
+    host_seed: [u8; 32],
     client_punch_addr_input: String,
     client_public_addr_display: String,
 
@@ -377,14 +358,14 @@ impl NexusGuiApp {
             .map(|seed| parse_connection_seed(seed).is_ok())
             .unwrap_or(false);
 
+        let host_seed = rand::random::<[u8; 32]>();
+
         // Auto-start hosting immediately on startup if not in client mode
         if launch_connection_seed.is_none() {
             let command = RuntimeCommand::StartHosting(HostRuntimeConfig {
-                port: host_port,
                 fps: DEFAULT_FPS,
                 inject_input: false,
-                advertise_addr: None,
-                transport_mode: TransportMode::AutoSelect,
+                seed: host_seed,
             });
             let _ = runtime_cmd_tx.try_send(command);
         }
@@ -421,6 +402,7 @@ impl NexusGuiApp {
             detecting_public_ip,
             _runtime_handle: runtime_handle,
             has_auto_hosted: true, // Mark auto-hosted as true since we spawned it above
+            host_seed,
             client_punch_addr_input: String::new(),
             client_public_addr_display: String::new(),
             host_transport_mode: TransportMode::AutoSelect,
@@ -697,12 +679,7 @@ impl NexusGuiApp {
 
         let parsed = parse_connection_seed(access_id)
             .context("failed to parse generated access ID as connection seed")?;
-        let payload = build_connection_payload_bytes(
-            parsed.server_addr,
-            &parsed.fingerprint,
-            &parsed.target_id,
-            parsed.tcp_port,
-        )?;
+        let payload = build_connection_payload_bytes(&parsed.seed)?;
 
         let seed = URL_SAFE_NO_PAD.encode(&payload);
         let mnemonic = encode_connection_seed_mnemonic(&payload)?;
@@ -1256,24 +1233,10 @@ impl NexusGuiApp {
     }
 
     fn start_hosting_clicked(&mut self) {
-        let advertise_addr = if self.host_advertise_addr_input.trim().is_empty() {
-            None
-        } else {
-            match self.host_advertise_addr_input.trim().parse::<SocketAddr>() {
-                Ok(parsed) => Some(parsed),
-                Err(error) => {
-                    self.push_log(format!("Invalid advertised address: {error}"));
-                    return;
-                }
-            }
-        };
-
         let command = RuntimeCommand::StartHosting(HostRuntimeConfig {
-            port: self.host_port,
             fps: self.host_fps,
             inject_input: self.host_inject_input,
-            advertise_addr,
-            transport_mode: self.host_transport_mode,
+            seed: self.host_seed,
         });
 
         match self.runtime_cmd_tx.try_send(command) {
@@ -1311,7 +1274,7 @@ impl NexusGuiApp {
             } else {
                 Some(display_name)
             },
-            transport_mode: self.host_transport_mode,
+            _transport_mode: self.host_transport_mode,
         };
 
         match self.runtime_cmd_tx.try_send(command) {
@@ -1534,19 +1497,7 @@ impl NexusGuiApp {
             }
         }
     }
-    fn sync_advertise_addr_port(&mut self) {
-        let input = self.host_advertise_addr_input.trim();
-        if input.is_empty() {
-            return;
-        }
-        if let Ok(socket_addr) = input.parse::<SocketAddr>() {
-            if socket_addr.port() != self.host_port {
-                self.host_advertise_addr_input = format!("{}:{}", socket_addr.ip(), self.host_port);
-            }
-        } else if let Ok(ip) = input.parse::<IpAddr>() {
-            self.host_advertise_addr_input = format!("{}:{}", ip, self.host_port);
-        }
-    }
+
 
     fn trigger_launch_auto_connect(&mut self) {
         if !self.pending_auto_connect || self.client_running {
@@ -1580,17 +1531,7 @@ impl eframe::App for NexusGuiApp {
             self.push_log(format!("STUN PUBLIC ADDRESS {}", addr));
         }
 
-        if let Ok(addr) = self.client_punch_addr_input.trim().parse::<SocketAddr>() {
-            if let Ok(mut guard) = self.ui_bridge.client_punch_addr.lock() {
-                *guard = Some(addr);
-            }
-        } else {
-            if let Ok(mut guard) = self.ui_bridge.client_punch_addr.lock() {
-                *guard = None;
-            }
-        }
 
-        self.sync_advertise_addr_port();
 
         let ip_detection_finished = !self.detecting_public_ip.load(Ordering::Relaxed);
         if ip_detection_finished && !self.has_auto_hosted && !self.host_running && self.active_tab == ActiveTab::HostMode {
@@ -1804,7 +1745,7 @@ async fn runtime_dispatch_loop(
             RuntimeCommand::ConnectWithAccessId {
                 access_id,
                 display_name,
-                transport_mode,
+                _transport_mode: _,
             } => {
                 if client_running
                     .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
@@ -1848,7 +1789,6 @@ async fn runtime_dispatch_loop(
                     let run_result = run_client_session(
                         parsed_access_id,
                         display_name,
-                        transport_mode,
                         event_tx.clone(),
                         bridge,
                     )
@@ -1888,132 +1828,44 @@ async fn runtime_dispatch_loop(
     }
 }
 
-use tokio_rustls::server::TlsStream as ServerTlsStream;
-
-#[derive(Serialize, Deserialize, Clone)]
-pub enum TcpPacket {
-    Control(ControlMessage),
-    Frame(FramePacket),
-}
-
-pub async fn send_tcp_packet<S: tokio::io::AsyncWrite + Unpin>(
-    stream: &mut S,
-    packet: &TcpPacket,
-) -> Result<()> {
-    let payload = bincode::serialize(packet).context("failed to serialize TcpPacket")?;
-    let len = u32::try_from(payload.len()).context("packet too large")?;
-    stream.write_all(&len.to_le_bytes()).await.context("failed to write TCP length prefix")?;
-    stream.write_all(&payload).await.context("failed to write TCP payload")?;
-    Ok(())
-}
-
-pub async fn recv_tcp_packet<S: tokio::io::AsyncRead + Unpin>(
-    stream: &mut S,
-) -> Result<TcpPacket> {
-    let mut len_buf = [0_u8; 4];
-    stream.read_exact(&mut len_buf).await.context("failed to read TCP length prefix")?;
-    let len = u32::from_le_bytes(len_buf) as usize;
-    if len > MAX_MESSAGE_BYTES {
-        bail!("TCP packet too large: {len} bytes");
-    }
-    let mut payload = vec![0_u8; len];
-    stream.read_exact(&mut payload).await.context("failed to read TCP payload")?;
-    let packet = bincode::deserialize(&payload).context("failed to deserialize TcpPacket")?;
-    Ok(packet)
-}
-
 #[derive(Clone)]
-pub enum PacketSender {
-    Quic(Arc<tokio::sync::Mutex<SendStream>>),
-    Tcp(mpsc::Sender<TcpPacket>),
-}
+pub struct PacketSender(Arc<tokio::sync::Mutex<SendStream>>);
 
 impl PacketSender {
     pub async fn send_control(&self, msg: &ControlMessage) -> Result<()> {
-        match self {
-            PacketSender::Quic(stream) => {
-                let mut guard = stream.lock().await;
-                send_message(&mut *guard, msg).await
-            }
-            PacketSender::Tcp(tx) => {
-                tx.send(TcpPacket::Control(msg.clone())).await
-                    .map_err(|_| anyhow!("TCP stream closed"))
-            }
-        }
+        let mut guard = self.0.lock().await;
+        send_message(&mut *guard, msg).await
     }
 }
 
 #[derive(Clone)]
-pub enum FrameSender {
-    Quic(Arc<tokio::sync::Mutex<SendStream>>),
-    Tcp(mpsc::Sender<TcpPacket>),
-}
+pub struct FrameSender(Arc<tokio::sync::Mutex<SendStream>>);
 
 impl FrameSender {
     pub async fn send_frame(&self, frame: &FramePacket) -> Result<()> {
-        match self {
-            FrameSender::Quic(stream) => {
-                let mut guard = stream.lock().await;
-                send_message(&mut *guard, frame).await
-            }
-            FrameSender::Tcp(tx) => {
-                tx.send(TcpPacket::Frame(frame.clone())).await
-                    .map_err(|_| anyhow!("TCP stream closed"))
-            }
-        }
+        let mut guard = self.0.lock().await;
+        send_message(&mut *guard, frame).await
     }
 }
 
 #[derive(Clone)]
-pub enum PacketReceiver {
-    Quic(Arc<tokio::sync::Mutex<RecvStream>>),
-    Tcp(Arc<tokio::sync::Mutex<mpsc::Receiver<ControlMessage>>>),
-}
+pub struct PacketReceiver(Arc<tokio::sync::Mutex<RecvStream>>);
 
 impl PacketReceiver {
     pub async fn recv_control(&self) -> Result<ControlMessage> {
-        match self {
-            PacketReceiver::Quic(stream) => {
-                let mut guard = stream.lock().await;
-                recv_message::<ControlMessage>(&mut *guard).await
-            }
-            PacketReceiver::Tcp(rx) => {
-                let mut guard = rx.lock().await;
-                guard.recv().await.context("TCP stream closed")
-            }
-        }
+        let mut guard = self.0.lock().await;
+        recv_message::<ControlMessage>(&mut *guard).await
     }
 }
 
 #[derive(Clone)]
-pub enum FrameReceiver {
-    Quic(Arc<tokio::sync::Mutex<RecvStream>>),
-    Tcp(Arc<tokio::sync::Mutex<mpsc::Receiver<FramePacket>>>),
-}
+pub struct FrameReceiver(Arc<tokio::sync::Mutex<RecvStream>>);
 
 impl FrameReceiver {
     pub async fn recv_frame(&self) -> Result<FramePacket> {
-        match self {
-            FrameReceiver::Quic(stream) => {
-                let mut guard = stream.lock().await;
-                recv_message::<FramePacket>(&mut *guard).await
-            }
-            FrameReceiver::Tcp(rx) => {
-                let mut guard = rx.lock().await;
-                guard.recv().await.context("TCP stream closed")
-            }
-        }
+        let mut guard = self.0.lock().await;
+        recv_message::<FramePacket>(&mut *guard).await
     }
-}
-
-enum ConnectionOrStream {
-    Quic(quinn::Connection),
-    Tcp(ServerTlsStream<tokio::net::TcpStream>),
-}
-
-enum ClientConnectionOrStream {
-    Quic(quinn::Connection),
-    Tcp(tokio_rustls::client::TlsStream<tokio::net::TcpStream>),
 }
 
 async fn run_server_session(
@@ -2027,57 +1879,26 @@ async fn run_server_session(
     }
 
     let frame_interval_ms = (1000_u64 / fps as u64).max(1);
-    let bind_addr = SocketAddr::from(([0, 0, 0, 0], config.port));
-    let socket = std::net::UdpSocket::bind(bind_addr).context("failed to bind server UDP socket")?;
-    let actual_local_addr = socket.local_addr().context("failed to query local address of server socket")?;
 
-    // Perform STUN query using the server's actual socket before passing it to Quinn
-    let advertised_addr = if let Some(explicit) = config.advertise_addr {
-        explicit
-    } else if let Some(public_addr) = detect_public_address_with_socket(&socket).await {
-        public_addr
-    } else {
-        advertised_server_addr(actual_local_addr, None)
-    };
+    // Derive SecretKey and session ID from the host seed
+    let (secret_key, session_id) = derive_keys_from_seed(&config.seed);
+    let credentials = SessionCredentials { session_id: session_id.clone() };
 
-    let (server, server_socket) = bind_server(socket).await?;
-    let credentials = SessionCredentials::generate();
+    // Build and bind the iroh endpoint with the derived secret key
+    let endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::N0)
+        .secret_key(secret_key)
+        .alpns(vec![nexus_network::NEXUS_ALPN.to_vec()])
+        .bind()
+        .await
+        .context("failed to create iroh endpoint")?;
 
-    // Attempt to bind TCP fallback listener
-    let tcp_listener = if config.transport_mode != TransportMode::ForceQuicP2p {
-        match tokio::net::TcpListener::bind("0.0.0.0:443").await {
-            Ok(listener) => {
-                info!("Successfully bound TCP listener to 0.0.0.0:443");
-                Some(listener)
-            }
-            Err(err) => {
-                warn!("Failed to bind TCP listener to port 443 (privileges or already in use: {err}). Falling back to ephemeral port.");
-                match tokio::net::TcpListener::bind("0.0.0.0:0").await {
-                    Ok(listener) => Some(listener),
-                    Err(e) => {
-                        error!("Failed to bind fallback TCP listener: {e}");
-                        None
-                    }
-                }
-            }
-        }
-    } else {
-        None
-    };
-
-    let actual_tcp_port = tcp_listener.as_ref().and_then(|l| l.local_addr().ok().map(|addr| addr.port()));
-
-    let access_id = build_access_id(
-        advertised_addr,
-        &server.certificate_fingerprint,
-        &credentials.session_id,
-        actual_tcp_port,
-    )?;
+    let node_id = endpoint.id();
+    let access_id = build_access_id(&config.seed)?;
 
     runtime_event_tx
         .send(RuntimeEvent::HostReady {
-            advertised_addr,
-            fingerprint: server.certificate_fingerprint.clone(),
+            advertised_addr: format!("iroh:{}", node_id),
+            fingerprint: "iroh-identity".to_string(), // Dummy for iroh identity
             session_id: credentials.session_id.clone(),
             access_id,
             fps,
@@ -2086,592 +1907,338 @@ async fn run_server_session(
         .await
         .ok();
 
-    let rustls_server_config = if tcp_listener.is_some() {
-        let server_config = rustls::ServerConfig::builder()
-            .with_safe_defaults()
-            .with_no_client_auth()
-            .with_single_cert(
-                vec![rustls::Certificate(server.certificate_der.clone())],
-                rustls::PrivateKey(server.certificate_key.clone()),
-            )
-            .context("failed to assemble rustls server config for TCP fallback")?;
-        Some(Arc::new(server_config))
-    } else {
-        None
-    };
-
     let session_state = Arc::new(SessionStateMachine::new());
     session_state.transition(SessionState::Authenticating)?;
 
-    let bridge_clone = Arc::clone(&ui_bridge);
-    let server_socket_clone = server_socket.try_clone().ok();
-    let punch_task = tokio::spawn(async move {
-        if let Some(socket) = server_socket_clone {
-            loop {
-                let target = {
-                    if let Ok(guard) = bridge_clone.client_punch_addr.lock() {
-                        *guard
-                    } else {
-                        None
-                    }
-                };
+    // Accept QUIC connection via iroh
+    let connection = accept_connection(&endpoint).await?;
+    let remote_addr_str = format!("iroh:{}", connection.remote_id());
 
-                if let Some(addr) = target {
-                    let _ = socket.send_to(b"nexus-punch", addr);
+    let handshake_latency = 0u128; // iroh establishes connection in background
+    let _ = runtime_event_tx.send(RuntimeEvent::ConnectionEstablished {
+        protocol: "iroh".to_string(),
+        local_addr: format!("iroh:{}", endpoint.id()),
+        latency_ms: handshake_latency,
+    }).await;
+
+    let quic_conn_to_close = Some(connection.clone());
+
+    let (control_s, control_r) = connection
+        .accept_bi()
+        .await
+        .context("client did not open a control stream")?;
+    let frame_s = connection
+        .open_uni()
+        .await
+        .context("failed to open frame stream")?;
+
+    let control_send = PacketSender(Arc::new(tokio::sync::Mutex::new(control_s)));
+    let control_recv = PacketReceiver(Arc::new(tokio::sync::Mutex::new(control_r)));
+    let frame_stream_send = FrameSender(Arc::new(tokio::sync::Mutex::new(frame_s)));
+
+    let incoming_auth = wait_for_auth_request(&control_recv).await?;
+
+    runtime_event_tx
+        .send(RuntimeEvent::IncomingSession {
+            remote_addr: remote_addr_str.clone(),
+            requester_id: incoming_auth.requester_id.clone(),
+            target_session: incoming_auth.target_id.clone(),
+        })
+        .await
+        .ok();
+
+    if let Err(auth_error) = credentials.verify(&incoming_auth.target_id) {
+        let _ = session_state.transition(SessionState::Rejected);
+        error!(
+            ?auth_error,
+            remote = %remote_addr_str,
+            requester_id = %incoming_auth.requester_id,
+            "SECURITY: authentication failed"
+        );
+
+        let _ = control_send.send_control(
+            &ControlMessage::AuthResult {
+                success: false,
+                message: "AuthenticationFailed".to_string(),
+            },
+        )
+        .await;
+
+        if let Some(ref c) = quic_conn_to_close {
+            c.close(1u32.into(), b"authentication failed");
+        }
+        let _ = session_state.transition(SessionState::Terminated);
+        return Ok(());
+    }
+
+    control_send.send_control(
+        &ControlMessage::AuthResult {
+            success: true,
+            message: "AuthenticationSucceeded".to_string(),
+        },
+    )
+    .await
+    .context("failed to send authentication result")?;
+
+    control_send.send_control(
+        &ControlMessage::AccessRequest {
+            session_id: incoming_auth.target_id.clone(),
+        },
+    )
+    .await
+    .context("failed to send access request to client")?;
+
+    let client_approved = wait_for_client_access_decision(&control_recv).await?;
+    if !client_approved {
+        let _ = session_state.transition(SessionState::Rejected);
+        runtime_event_tx
+            .send(RuntimeEvent::SessionStatus(
+                "Client denied access request".to_string(),
+            ))
+            .await
+            .ok();
+
+        let _ = control_send.send_control(
+            &ControlMessage::SessionConsent { approved: false },
+        )
+        .await;
+
+        if let Some(ref c) = quic_conn_to_close {
+            c.close(3u32.into(), b"client denied access request");
+        }
+        let _ = session_state.transition(SessionState::Terminated);
+        return Ok(());
+    }
+
+    session_state.transition(SessionState::PendingConsent)?;
+
+    let approved = request_host_consent(
+        remote_addr_str.clone(),
+        &incoming_auth,
+        &runtime_event_tx,
+        &ui_bridge,
+    )
+    .await?;
+    control_send.send_control(&ControlMessage::SessionConsent { approved })
+        .await
+        .context("failed to send session consent result")?;
+
+    if !approved {
+        let _ = session_state.transition(SessionState::Rejected);
+        error!(
+            requester_id = %incoming_auth.requester_id,
+            remote = %remote_addr_str,
+            error = %SecurityError::UserConsentDenied,
+            "SECURITY: local user denied consent"
+        );
+        if let Some(ref c) = quic_conn_to_close {
+            c.close(2u32.into(), b"user denied consent");
+        }
+        let _ = session_state.transition(SessionState::Terminated);
+        return Ok(());
+    }
+
+    session_state.transition(SessionState::Active)?;
+
+    let input = Arc::new(InputController::new()?);
+    input.set_state(InputSessionState::Active);
+
+    control_send.send_control(
+        &ControlMessage::Ack(format!(
+            "session-approved mode={}",
+            if config.inject_input { "inject" } else { "preview" }
+        )),
+    )
+    .await
+    .context("failed to send session approval acknowledgement")?;
+
+    let session_state_for_control = Arc::clone(&session_state);
+    let input_for_control = Arc::clone(&input);
+    let inject_input = config.inject_input;
+    let control_send_clone = control_send.clone();
+    let control_task = tokio::spawn(async move {
+        loop {
+            match control_recv.recv_control().await {
+                Ok(ControlMessage::SimulatedMouseMove { x_norm, y_norm }) => {
+                    if !session_state_for_control.is_active() {
+                        error!(
+                            state = ?session_state_for_control.state(),
+                            "SECURITY: blocked mouse event while session not active"
+                        );
+                        continue;
+                    }
+
+                    match apply_mouse_event(&input_for_control, x_norm, y_norm, inject_input) {
+                        Ok(preview) => {
+                            info!(
+                                x_norm,
+                                y_norm,
+                                absolute_x = preview.absolute_x,
+                                absolute_y = preview.absolute_y,
+                                mode = if inject_input { "inject" } else { "preview" },
+                                "processed mouse move"
+                            );
+                        }
+                        Err(error) => {
+                            warn!(
+                                ?error,
+                                mode = if inject_input { "inject" } else { "preview" },
+                                "failed mouse processing"
+                            );
+                        }
+                    }
+
+                    if let Err(error) = control_send_clone.send_control(
+                        &ControlMessage::Ack(format!(
+                            "{} move to ({x_norm:.3}, {y_norm:.3})",
+                            if inject_input { "injected" } else { "previewed" }
+                        )),
+                    )
+                    .await
+                    {
+                        error!(?error, "failed to send mouse acknowledgement");
+                        break;
+                    }
                 }
-                tokio::time::sleep(Duration::from_millis(500)).await;
+                Ok(ControlMessage::SimulatedKeyEvent {
+                    virtual_key,
+                    pressed,
+                }) => {
+                    if !session_state_for_control.is_active() {
+                        error!(
+                            state = ?session_state_for_control.state(),
+                            "SECURITY: blocked key event while session not active"
+                        );
+                        continue;
+                    }
+
+                    match apply_keyboard_event(&input_for_control, virtual_key, pressed, inject_input)
+                    {
+                        Ok(preview) => {
+                            info!(
+                                virtual_key,
+                                pressed = preview.pressed,
+                                flags = preview.flags,
+                                mode = if inject_input { "inject" } else { "preview" },
+                                "processed key event"
+                            );
+                        }
+                        Err(error) => {
+                            warn!(
+                                ?error,
+                                mode = if inject_input { "inject" } else { "preview" },
+                                "failed key processing"
+                            );
+                        }
+                    }
+
+                    if let Err(error) = control_send_clone.send_control(
+                        &ControlMessage::Ack(format!(
+                            "{} keyboard event vk={virtual_key} pressed={pressed}",
+                            if inject_input { "injected" } else { "previewed" }
+                        )),
+                    )
+                    .await
+                    {
+                        error!(?error, "failed to send keyboard acknowledgement");
+                        break;
+                    }
+                }
+                Ok(other) => {
+                    warn!(?other, "ignoring unexpected control message");
+                }
+                Err(error) => {
+                    info!(?error, "control stream closed");
+                    break;
+                }
             }
         }
     });
 
-    let punch_abort_handle = punch_task.abort_handle();
-    let run_result = async move {
-        let handshake_start = Instant::now();
+    let mut capturer = ScreenCapturer::new()?;
+    let mut ticker = time::interval(Duration::from_millis(frame_interval_ms));
+    ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
-        // Accept connection from either QUIC or TCP fallback
-        let (connection_or_stream, remote_addr, local_addr, protocol_name) = if let Some(ref listener) = tcp_listener {
-            tokio::select! {
-                quic_conn = server.accept() => {
-                    let quic_conn = quic_conn.context("QUIC server accept failed")?;
-                    let remote_addr = quic_conn.remote_address();
-                    (ConnectionOrStream::Quic(quic_conn), remote_addr, actual_local_addr, "QUIC".to_string())
-                }
-                tcp_conn = listener.accept() => {
-                    let (tcp_stream, remote_addr) = tcp_conn.context("TCP accept failed")?;
-                    let local_tcp_addr = tcp_stream.local_addr().unwrap_or(actual_local_addr);
-                    info!(remote = %remote_addr, "accepted TCP connection, performing TLS handshake...");
-                    let tls_acceptor = tokio_rustls::TlsAcceptor::from(rustls_server_config.clone().unwrap());
-                    let tls_stream = tls_acceptor.accept(tcp_stream).await.context("TLS handshake failed")?;
-                    (ConnectionOrStream::Tcp(tls_stream), remote_addr, local_tcp_addr, "TCP".to_string())
-                }
-            }
-        } else {
-            let quic_conn = server.accept().await?;
-            let remote_addr = quic_conn.remote_address();
-            (ConnectionOrStream::Quic(quic_conn), remote_addr, actual_local_addr, "QUIC".to_string())
+    loop {
+        ticker.tick().await;
+
+        if !session_state.is_active() {
+            error!(
+                state = ?session_state.state(),
+                "SECURITY: blocked frame transmission while session not active"
+            );
+            continue;
+        }
+
+        let frame = capturer.capture_frame()?;
+        let packet = FramePacket {
+            sequence: frame.frame_index,
+            width: frame.width,
+            height: frame.height,
+            stride: frame.stride,
+            pixels: frame.pixels.to_vec(),
         };
 
-        punch_abort_handle.abort();
-
-        let handshake_latency = handshake_start.elapsed().as_millis();
-        let _ = runtime_event_tx.send(RuntimeEvent::ConnectionEstablished {
-            protocol: protocol_name,
-            local_addr,
-            latency_ms: handshake_latency,
-        }).await;
-
-        let mut quic_conn_to_close = None;
-        if let ConnectionOrStream::Quic(ref c) = connection_or_stream {
-            quic_conn_to_close = Some(c.clone());
+        if let Err(error) = frame_stream_send.send_frame(&packet).await {
+            info!(?error, "frame stream ended");
+            break;
         }
 
-        let (control_send, control_recv, frame_stream_send, frame_read_abort) = match connection_or_stream {
-            ConnectionOrStream::Quic(connection) => {
-                let (control_s, control_r) = connection
-                    .accept_bi()
-                    .await
-                    .context("client did not open a control stream")?;
-                let frame_s = connection
-                    .open_uni()
-                    .await
-                    .context("failed to open frame stream")?;
+        info!(sequence = packet.sequence, bytes = packet.pixels.len(), "sent frame");
+    }
 
-                (
-                    PacketSender::Quic(Arc::new(tokio::sync::Mutex::new(control_s))),
-                    PacketReceiver::Quic(Arc::new(tokio::sync::Mutex::new(control_r))),
-                    FrameSender::Quic(Arc::new(tokio::sync::Mutex::new(frame_s))),
-                    None,
-                )
-            }
-            ConnectionOrStream::Tcp(tls_stream) => {
-                let (tcp_read, tcp_write) = tokio::io::split(tls_stream);
-                let (control_tx, control_rx) = mpsc::channel::<ControlMessage>(256);
-                let (frame_tx, _frame_rx) = mpsc::channel::<FramePacket>(256);
-
-                let mut tcp_read = tcp_read;
-                let read_task = tokio::spawn(async move {
-                    loop {
-                        match recv_tcp_packet(&mut tcp_read).await {
-                            Ok(TcpPacket::Control(msg)) => {
-                                if control_tx.send(msg).await.is_err() {
-                                    break;
-                                }
-                            }
-                            Ok(TcpPacket::Frame(frame)) => {
-                                if frame_tx.send(frame).await.is_err() {
-                                    break;
-                                }
-                            }
-                            Err(err) => {
-                                info!("TCP read task closed: {err}");
-                                break;
-                            }
-                        }
-                    }
-                });
-
-                let (tcp_send_tx, mut tcp_send_rx) = mpsc::channel::<TcpPacket>(256);
-                let mut tcp_write = tcp_write;
-                let write_task = tokio::spawn(async move {
-                    while let Some(packet) = tcp_send_rx.recv().await {
-                        if let Err(err) = send_tcp_packet(&mut tcp_write, &packet).await {
-                            error!("TCP write task failed: {err}");
-                            break;
-                        }
-                    }
-                });
-
-                (
-                    PacketSender::Tcp(tcp_send_tx.clone()),
-                    PacketReceiver::Tcp(Arc::new(tokio::sync::Mutex::new(control_rx))),
-                    FrameSender::Tcp(tcp_send_tx),
-                    Some((read_task, write_task)),
-                )
-            }
-        };
-
-        let incoming_auth = wait_for_auth_request(&control_recv).await?;
-
-        let peer_addr = remote_addr;
-
-        runtime_event_tx
-            .send(RuntimeEvent::IncomingSession {
-                remote_addr: peer_addr,
-                requester_id: incoming_auth.requester_id.clone(),
-                target_session: incoming_auth.target_id.clone(),
-            })
-            .await
-            .ok();
-
-        if let Err(auth_error) = credentials.verify(&incoming_auth.target_id) {
-            let _ = session_state.transition(SessionState::Rejected);
-            error!(
-                ?auth_error,
-                remote = %peer_addr,
-                requester_id = %incoming_auth.requester_id,
-                "SECURITY: authentication failed"
-            );
-
-            let _ = control_send.send_control(
-                &ControlMessage::AuthResult {
-                    success: false,
-                    message: "AuthenticationFailed".to_string(),
-                },
-            )
-            .await;
-
-            if let Some(ref c) = quic_conn_to_close {
-                c.close(VarInt::from_u32(1), b"authentication failed");
-            }
-            let _ = session_state.transition(SessionState::Terminated);
-            return Ok(());
-        }
-
-        control_send.send_control(
-            &ControlMessage::AuthResult {
-                success: true,
-                message: "AuthenticationSucceeded".to_string(),
-            },
-        )
-        .await
-        .context("failed to send authentication result")?;
-
-        control_send.send_control(
-            &ControlMessage::AccessRequest {
-                session_id: incoming_auth.target_id.clone(),
-            },
-        )
-        .await
-        .context("failed to send access request to client")?;
-
-        let client_approved = wait_for_client_access_decision(&control_recv).await?;
-        if !client_approved {
-            let _ = session_state.transition(SessionState::Rejected);
-            runtime_event_tx
-                .send(RuntimeEvent::SessionStatus(
-                    "Client denied access request".to_string(),
-                ))
-                .await
-                .ok();
-
-            let _ = control_send.send_control(
-                &ControlMessage::SessionConsent { approved: false },
-            )
-            .await;
-
-            if let Some(ref c) = quic_conn_to_close {
-                c.close(VarInt::from_u32(3), b"client denied access request");
-            }
-            let _ = session_state.transition(SessionState::Terminated);
-            return Ok(());
-        }
-
-        session_state.transition(SessionState::PendingConsent)?;
-
-        let approved = request_host_consent(
-            peer_addr,
-            &incoming_auth,
-            &runtime_event_tx,
-            &ui_bridge,
-        )
-        .await?;
-        control_send.send_control(&ControlMessage::SessionConsent { approved })
-            .await
-            .context("failed to send session consent result")?;
-
-        if !approved {
-            let _ = session_state.transition(SessionState::Rejected);
-            error!(
-                requester_id = %incoming_auth.requester_id,
-                remote = %peer_addr,
-                error = %SecurityError::UserConsentDenied,
-                "SECURITY: local user denied consent"
-            );
-            if let Some(ref c) = quic_conn_to_close {
-                c.close(VarInt::from_u32(2), b"user denied consent");
-            }
-            let _ = session_state.transition(SessionState::Terminated);
-            return Ok(());
-        }
-
-        session_state.transition(SessionState::Active)?;
-
-        let input = Arc::new(InputController::new()?);
-        input.set_state(InputSessionState::Active);
-
-        control_send.send_control(
-            &ControlMessage::Ack(format!(
-                "session-approved mode={}",
-                if config.inject_input { "inject" } else { "preview" }
-            )),
-        )
-        .await
-        .context("failed to send session approval acknowledgement")?;
-
-        let session_state_for_control = Arc::clone(&session_state);
-        let input_for_control = Arc::clone(&input);
-        let inject_input = config.inject_input;
-        let control_send_clone = control_send.clone();
-        let control_task = tokio::spawn(async move {
-            loop {
-                match control_recv.recv_control().await {
-                    Ok(ControlMessage::SimulatedMouseMove { x_norm, y_norm }) => {
-                        if !session_state_for_control.is_active() {
-                            error!(
-                                state = ?session_state_for_control.state(),
-                                "SECURITY: blocked mouse event while session not active"
-                            );
-                            continue;
-                        }
-
-                        match apply_mouse_event(&input_for_control, x_norm, y_norm, inject_input) {
-                            Ok(preview) => {
-                                info!(
-                                    x_norm,
-                                    y_norm,
-                                    absolute_x = preview.absolute_x,
-                                    absolute_y = preview.absolute_y,
-                                    mode = if inject_input { "inject" } else { "preview" },
-                                    "processed mouse move"
-                                );
-                            }
-                            Err(error) => {
-                                warn!(
-                                    ?error,
-                                    mode = if inject_input { "inject" } else { "preview" },
-                                    "failed mouse processing"
-                                );
-                            }
-                        }
-
-                        if let Err(error) = control_send_clone.send_control(
-                            &ControlMessage::Ack(format!(
-                                "{} move to ({x_norm:.3}, {y_norm:.3})",
-                                if inject_input { "injected" } else { "previewed" }
-                            )),
-                        )
-                        .await
-                        {
-                            error!(?error, "failed to send mouse acknowledgement");
-                            break;
-                        }
-                    }
-                    Ok(ControlMessage::SimulatedKeyEvent {
-                        virtual_key,
-                        pressed,
-                    }) => {
-                        if !session_state_for_control.is_active() {
-                            error!(
-                                state = ?session_state_for_control.state(),
-                                "SECURITY: blocked key event while session not active"
-                            );
-                            continue;
-                        }
-
-                        match apply_keyboard_event(&input_for_control, virtual_key, pressed, inject_input)
-                        {
-                            Ok(preview) => {
-                                info!(
-                                    virtual_key,
-                                    pressed = preview.pressed,
-                                    flags = preview.flags,
-                                    mode = if inject_input { "inject" } else { "preview" },
-                                    "processed key event"
-                                );
-                            }
-                            Err(error) => {
-                                warn!(
-                                    ?error,
-                                    mode = if inject_input { "inject" } else { "preview" },
-                                    "failed key processing"
-                                );
-                            }
-                        }
-
-                        if let Err(error) = control_send_clone.send_control(
-                            &ControlMessage::Ack(format!(
-                                "{} keyboard event vk={virtual_key} pressed={pressed}",
-                                if inject_input { "injected" } else { "previewed" }
-                            )),
-                        )
-                        .await
-                        {
-                            error!(?error, "failed to send keyboard acknowledgement");
-                            break;
-                        }
-                    }
-                    Ok(other) => {
-                        warn!(?other, "ignoring unexpected control message");
-                    }
-                    Err(error) => {
-                        info!(?error, "control stream closed");
-                        break;
-                    }
-                }
-            }
-        });
-
-        let mut capturer = ScreenCapturer::new()?;
-        let mut ticker = time::interval(Duration::from_millis(frame_interval_ms));
-        ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
-
-        loop {
-            ticker.tick().await;
-
-            if !session_state.is_active() {
-                error!(
-                    state = ?session_state.state(),
-                    "SECURITY: blocked frame transmission while session not active"
-                );
-                continue;
-            }
-
-            let frame = capturer.capture_frame()?;
-            let packet = FramePacket {
-                sequence: frame.frame_index,
-                width: frame.width,
-                height: frame.height,
-                stride: frame.stride,
-                pixels: frame.pixels.to_vec(),
-            };
-
-            if let Err(error) = frame_stream_send.send_frame(&packet).await {
-                info!(?error, "frame stream ended");
-                break;
-            }
-
-            info!(sequence = packet.sequence, bytes = packet.pixels.len(), "sent frame");
-        }
-
-        input.set_state(InputSessionState::Inactive);
-        let _ = session_state.transition(SessionState::Terminated);
-        if let Some(ref c) = quic_conn_to_close {
-            c.close(VarInt::from_u32(0), b"server shutdown");
-        }
-        let _ = control_task.await;
-        if let Some((read_task, write_task)) = frame_read_abort {
-            read_task.abort();
-            write_task.abort();
-        }
-        Ok(())
-    }.await;
-
-    punch_task.abort();
-    run_result
+    input.set_state(InputSessionState::Inactive);
+    let _ = session_state.transition(SessionState::Terminated);
+    if let Some(ref c) = quic_conn_to_close {
+        c.close(0u32.into(), b"server shutdown");
+    }
+    let _ = control_task.await;
+    Ok(())
 }
 
 async fn run_client_session(
     parsed_access_id: ParsedAccessId,
     display_name: Option<String>,
-    transport_mode: TransportMode,
     runtime_event_tx: mpsc::Sender<RuntimeEvent>,
     ui_bridge: Arc<UiBridge>,
 ) -> Result<()> {
-    let use_quic = match transport_mode {
-        TransportMode::ForceHttpsTcp => false,
-        TransportMode::ForceQuicP2p => true,
-        TransportMode::AutoSelect => true,
-    };
+    let (secret_key, session_id) = derive_keys_from_seed(&parsed_access_id.seed);
+    let remote_id = secret_key.public();
 
-    let quic_result = if use_quic {
-        let (client, client_socket) =
-            bind_client(SocketAddr::from(([0, 0, 0, 0], 0)), parsed_access_id.fingerprint.clone())
-                .await?;
+    // Create client endpoint
+    let endpoint = create_client_endpoint().await?;
 
-        let host_addr = parsed_access_id.server_addr;
-        let client_socket_clone = client_socket.try_clone().ok();
-        let punch_task = tokio::spawn(async move {
-            if let Some(socket) = client_socket_clone {
-                loop {
-                    let _ = socket.send_to(b"nexus-punch", host_addr);
-                    tokio::time::sleep(Duration::from_millis(500)).await;
-                }
-            }
-        });
-
-        let conn_fut = client.connect(parsed_access_id.server_addr, "localhost");
-        let conn_res = if transport_mode == TransportMode::AutoSelect {
-            match tokio::time::timeout(Duration::from_secs(3), conn_fut).await {
-                Ok(res) => res,
-                Err(_) => {
-                    punch_task.abort();
-                    Err(anyhow!("QUIC connection attempt timed out after 3s"))
-                }
-            }
-        } else {
-            conn_fut.await
-        };
-
-        match conn_res {
-            Ok(connection) => {
-                punch_task.abort();
-                Some((connection, punch_task))
-            }
-            Err(e) => {
-                punch_task.abort();
-                if transport_mode == TransportMode::AutoSelect {
-                    warn!("QUIC connection failed: {e}. Falling back to TCP...");
-                    None
-                } else {
-                    return Err(e).context("QUIC connection failed");
-                }
-            }
-        }
-    } else {
-        None
-    };
+    let default_relay: iroh::RelayUrl = "https://use.iroh.link/".parse().context("invalid default relay URL")?;
+    let target_addr = EndpointAddr::new(remote_id).with_relay_url(default_relay);
 
     let handshake_start = Instant::now();
 
-    let connection_or_stream = if let Some((connection, _punch_task)) = quic_result {
-        ClientConnectionOrStream::Quic(connection)
-    } else {
-        let target_tcp_port = parsed_access_id.tcp_port.unwrap_or(443);
-        let host_ip = parsed_access_id.server_addr.ip();
-        let host_tcp_addr = SocketAddr::new(host_ip, target_tcp_port);
-
-        info!("Connecting via TCP fallback to {}...", host_tcp_addr);
-        let tcp_stream = tokio::net::TcpStream::connect(host_tcp_addr).await
-            .context("failed to connect TCP fallback stream")?;
-
-        info!("TCP stream connected. Performing TLS handshake...");
-        let rustls_client_config = build_pinned_rustls_client_config(parsed_access_id.fingerprint.clone())
-            .context("failed to build rustls client config for TCP fallback")?;
-
-        let connector = tokio_rustls::TlsConnector::from(Arc::new(rustls_client_config));
-        let domain = rustls::ServerName::try_from("localhost")?;
-        let tls_stream = connector.connect(domain, tcp_stream).await
-            .context("TLS handshake failed over TCP fallback")?;
-
-        ClientConnectionOrStream::Tcp(tls_stream)
-    };
+    // Connect to peer via iroh
+    let connection = connect_to_peer(&endpoint, target_addr).await?;
+    let remote_addr_str = format!("iroh:{}", connection.remote_id());
 
     let handshake_latency = handshake_start.elapsed().as_millis();
-    let protocol = match connection_or_stream {
-        ClientConnectionOrStream::Quic(_) => "QUIC".to_string(),
-        ClientConnectionOrStream::Tcp(_) => "TCP".to_string(),
-    };
-    let local_addr = match connection_or_stream {
-        ClientConnectionOrStream::Quic(_) => SocketAddr::from(([0, 0, 0, 0], 0)),
-        ClientConnectionOrStream::Tcp(ref s) => s.get_ref().0.local_addr().unwrap_or(SocketAddr::from(([0, 0, 0, 0], 0))),
-    };
-
     let _ = runtime_event_tx.send(RuntimeEvent::ConnectionEstablished {
-        protocol,
-        local_addr,
+        protocol: "iroh".to_string(),
+        local_addr: format!("iroh:{}", endpoint.id()),
         latency_ms: handshake_latency,
     }).await;
 
-    let mut quic_conn_to_close = None;
-    if let ClientConnectionOrStream::Quic(ref c) = connection_or_stream {
-        quic_conn_to_close = Some(c.clone());
-    }
+    let quic_conn_to_close = Some(connection.clone());
 
     let run_result = async move {
-        let (control_send, control_recv, frame_recv, frame_read_abort) = match connection_or_stream {
-            ClientConnectionOrStream::Quic(connection) => {
-                let (control_s, control_r) = connection
-                    .open_bi()
-                    .await
-                    .context("failed to open control stream")?;
-                let frame_r = connection
-                    .accept_uni()
-                    .await
-                    .context("server did not open a frame stream")?;
+        let (control_s, control_r) = connection
+            .open_bi()
+            .await
+            .context("failed to open control stream")?;
+        let frame_r = connection
+            .accept_uni()
+            .await
+            .context("server did not open a frame stream")?;
 
-                (
-                    PacketSender::Quic(Arc::new(tokio::sync::Mutex::new(control_s))),
-                    PacketReceiver::Quic(Arc::new(tokio::sync::Mutex::new(control_r))),
-                    FrameReceiver::Quic(Arc::new(tokio::sync::Mutex::new(frame_r))),
-                    None,
-                )
-            }
-            ClientConnectionOrStream::Tcp(tls_stream) => {
-                let (tcp_read, tcp_write) = tokio::io::split(tls_stream);
-                let (control_tx, control_rx) = mpsc::channel::<ControlMessage>(256);
-                let (frame_tx, frame_rx) = mpsc::channel::<FramePacket>(256);
-
-                let mut tcp_read = tcp_read;
-                let read_task = tokio::spawn(async move {
-                    loop {
-                        match recv_tcp_packet(&mut tcp_read).await {
-                            Ok(TcpPacket::Control(msg)) => {
-                                if control_tx.send(msg).await.is_err() {
-                                    break;
-                                }
-                            }
-                            Ok(TcpPacket::Frame(frame)) => {
-                                if frame_tx.send(frame).await.is_err() {
-                                    break;
-                                }
-                            }
-                            Err(err) => {
-                                info!("TCP read task closed: {err}");
-                                break;
-                            }
-                        }
-                    }
-                });
-
-                let (tcp_send_tx, mut tcp_send_rx) = mpsc::channel::<TcpPacket>(256);
-                let mut tcp_write = tcp_write;
-                let write_task = tokio::spawn(async move {
-                    while let Some(packet) = tcp_send_rx.recv().await {
-                        if let Err(err) = send_tcp_packet(&mut tcp_write, &packet).await {
-                            error!("TCP write task failed: {err}");
-                            break;
-                        }
-                    }
-                });
-
-                (
-                    PacketSender::Tcp(tcp_send_tx.clone()),
-                    PacketReceiver::Tcp(Arc::new(tokio::sync::Mutex::new(control_rx))),
-                    FrameReceiver::Tcp(Arc::new(tokio::sync::Mutex::new(frame_rx))),
-                    Some((read_task, write_task)),
-                )
-            }
-        };
+        let control_send = PacketSender(Arc::new(tokio::sync::Mutex::new(control_s)));
+        let control_recv = PacketReceiver(Arc::new(tokio::sync::Mutex::new(control_r)));
+        let frame_recv = FrameReceiver(Arc::new(tokio::sync::Mutex::new(frame_r)));
 
         let session_state = Arc::new(SessionStateMachine::new());
         session_state.transition(SessionState::Authenticating)?;
@@ -2694,7 +2261,7 @@ async fn run_client_session(
         control_send.send_control(
             &ControlMessage::AuthRequest {
                 requester_id,
-                target_id: parsed_access_id.target_id.clone(),
+                target_id: session_id.clone(),
             },
         )
         .await?;
@@ -2703,7 +2270,7 @@ async fn run_client_session(
 
         let requested_session_id = wait_for_access_request(&control_recv).await?;
         let client_approved = request_client_permission(
-            parsed_access_id.server_addr,
+            remote_addr_str.clone(),
             &requested_session_id,
             &runtime_event_tx,
             &ui_bridge,
@@ -2722,7 +2289,7 @@ async fn run_client_session(
             let _ = session_state.transition(SessionState::Rejected);
             info!("local client denied access request");
             if let Some(ref c) = quic_conn_to_close {
-                c.close(VarInt::from_u32(3), b"client denied access request");
+                c.close(3u32.into(), b"client denied access request");
             }
             let _ = session_state.transition(SessionState::Terminated);
             return Ok(());
@@ -2840,16 +2407,12 @@ async fn run_client_session(
 
         let _ = session_state.transition(SessionState::Terminated);
         if let Some(ref c) = quic_conn_to_close {
-            c.close(VarInt::from_u32(0), b"client shutdown");
+            c.close(0u32.into(), b"client shutdown");
         }
         input_task.abort();
         let _ = input_task.await;
         ack_task.abort();
         let _ = ack_task.await;
-        if let Some((read_task, write_task)) = frame_read_abort {
-            read_task.abort();
-            write_task.abort();
-        }
         Ok(())
     }.await;
 
@@ -2857,7 +2420,7 @@ async fn run_client_session(
 }
 
 async fn request_client_permission(
-    server_addr: SocketAddr,
+    server_addr: String,
     session_id: &str,
     runtime_event_tx: &mpsc::Sender<RuntimeEvent>,
     ui_bridge: &Arc<UiBridge>,
@@ -2896,7 +2459,7 @@ async fn request_client_permission(
 }
 
 async fn request_host_consent(
-    remote_addr: SocketAddr,
+    remote_addr: String,
     incoming_auth: &IncomingAuth,
     runtime_event_tx: &mpsc::Sender<RuntimeEvent>,
     ui_bridge: &Arc<UiBridge>,
@@ -3146,18 +2709,6 @@ fn apply_keyboard_event(
     }
 }
 
-fn advertised_server_addr(bind_addr: SocketAddr, override_addr: Option<SocketAddr>) -> SocketAddr {
-    if let Some(explicit) = override_addr {
-        return explicit;
-    }
-
-    if bind_addr.ip().is_unspecified() {
-        return default_advertise_addr(bind_addr.port());
-    }
-
-    bind_addr
-}
-
 fn default_advertise_addr(port: u16) -> SocketAddr {
     let ip = detect_local_ip().unwrap_or(IpAddr::V4(Ipv4Addr::LOCALHOST));
     SocketAddr::new(ip, port)
@@ -3169,143 +2720,25 @@ fn detect_local_ip() -> Option<IpAddr> {
     Some(socket.local_addr().ok()?.ip())
 }
 
-fn parse_stun_mapped_address(buf: &[u8]) -> Option<SocketAddr> {
-    let response_len = buf.len();
-    let mut offset = 20;
-    while offset + 4 <= response_len {
-        let attr_type = u16::from_be_bytes([buf[offset], buf[offset + 1]]);
-        let attr_len = u16::from_be_bytes([buf[offset + 2], buf[offset + 3]]) as usize;
-        offset += 4;
-        if offset + attr_len > response_len {
-            break;
-        }
-        let attr_val = &buf[offset..offset + attr_len];
 
-        if attr_type == 0x0020 { // XOR-MAPPED-ADDRESS
-            if attr_len >= 8 {
-                let family = attr_val[1];
-                if family == 0x01 { // IPv4
-                    let x_port = u16::from_be_bytes([attr_val[2], attr_val[3]]);
-                    let port = x_port ^ 0x2112;
-                    let mut ip_bytes = [0u8; 4];
-                    ip_bytes.copy_from_slice(&attr_val[4..8]);
-                    let ip_u32 = u32::from_be_bytes(ip_bytes) ^ 0x2112A442;
-                    let ip = IpAddr::V4(Ipv4Addr::from(ip_u32));
-                    return Some(SocketAddr::new(ip, port));
-                }
-            }
-        } else if attr_type == 0x0001 { // MAPPED-ADDRESS
-            if attr_len >= 8 {
-                let family = attr_val[1];
-                if family == 0x01 { // IPv4
-                    let port = u16::from_be_bytes([attr_val[2], attr_val[3]]);
-                    let ip = IpAddr::V4(Ipv4Addr::new(attr_val[4], attr_val[5], attr_val[6], attr_val[7]));
-                    return Some(SocketAddr::new(ip, port));
-                }
-            }
-        }
-
-        offset += (attr_len + 3) & !3;
-    }
-    None
+async fn run_diagnostics(_port: u16) -> (NetworkTopology, Option<String>) {
+    (NetworkTopology::ConeNatFriendly, None)
 }
 
-async fn detect_public_address_with_socket(socket: &std::net::UdpSocket) -> Option<SocketAddr> {
-    let socket_clone = socket.try_clone().ok()?;
-    socket_clone.set_nonblocking(true).ok()?;
-    let async_socket = tokio::net::UdpSocket::from_std(socket_clone).ok()?;
-
-    let servers = [
-        "stun.l.google.com:19302",
-        "stun1.l.google.com:19302",
-        "stun2.l.google.com:19302",
-        "stun3.l.google.com:19302",
-        "stun4.l.google.com:19302",
-        "stun.stunprotocol.org:3478",
-        "stun.ekiga.net:3478",
-        "stun.ideasip.com:3478",
-    ];
-
-    let mut stun_request = [0u8; 20];
-    stun_request[0..2].copy_from_slice(&[0x00, 0x01]); // Binding Request
-    stun_request[2..4].copy_from_slice(&[0x00, 0x00]);
-    stun_request[4..8].copy_from_slice(&[0x21, 0x12, 0xA4, 0x42]); // Magic Cookie
-    let mut tx_id = [0u8; 12];
-    for i in 0..12 {
-        tx_id[i] = rand::random::<u8>();
-    }
-    stun_request[8..20].copy_from_slice(&tx_id);
-
-    // Resolve STUN servers in parallel
-    let mut resolve_tasks = Vec::new();
-    for &server_str in &servers {
-        resolve_tasks.push(tokio::spawn(async move {
-            tokio::net::lookup_host(server_str).await
-                .map(|iter| iter.collect::<Vec<_>>())
-                .unwrap_or_default()
-        }));
-    }
-
-    let mut targets = Vec::new();
-    for task in resolve_tasks {
-        if let Ok(addrs) = task.await {
-            for addr in addrs {
-                if addr.is_ipv4() {
-                    targets.push(addr);
-                }
-            }
-        }
-    }
-
-    if targets.is_empty() {
-        return None;
-    }
-
-    // Send STUN binding requests to all resolved IPv4 addresses
-    for &addr in &targets {
-        let _ = async_socket.send_to(&stun_request, addr).await;
-    }
-
-    // Wait for the first valid response with a 3.0s global timeout
-    let start_time = Instant::now();
-    let timeout_dur = Duration::from_secs(3);
-    let mut buf = [0u8; 512];
-
-    while start_time.elapsed() < timeout_dur {
-        let remaining = timeout_dur.saturating_sub(start_time.elapsed());
-        if remaining.is_zero() {
-            break;
-        }
-
-        let recv_result = tokio::time::timeout(
-            remaining,
-            async_socket.recv_from(&mut buf)
-        ).await;
-
-        if let Ok(Ok((len, _))) = recv_result {
-            if len >= 20 && buf[0..2] == [0x01, 0x01] && buf[4..8] == [0x21, 0x12, 0xA4, 0x42] {
-                if buf[8..20] == tx_id {
-                    if let Some(mapped_addr) = parse_stun_mapped_address(&buf[..len]) {
-                        return Some(mapped_addr);
-                    }
-                }
-            }
-        }
-    }
-
-    None
+fn derive_keys_from_seed(seed: &[u8; 32]) -> (SecretKey, String) {
+    let secret_key = SecretKey::from_bytes(seed);
+    
+    use sha2::{Sha256, Digest};
+    let mut hasher = Sha256::new();
+    hasher.update(seed);
+    let hash = hasher.finalize();
+    let session_id = hex::encode(&hash[..8]); // 16-character hex string (8 bytes)
+    (secret_key, session_id)
 }
 
-
-
-fn build_access_id(server_addr: SocketAddr, fingerprint: &str, target_id: &str, tcp_port: Option<u16>) -> Result<String> {
+fn build_access_id(seed: &[u8; 32]) -> Result<String> {
     let payload = AccessIdPayload {
-        version: ACCESS_ID_VERSION,
-        server_addr: server_addr.to_string(),
-        fingerprint: normalize_fingerprint_hex(fingerprint)
-            .context("failed to normalize fingerprint for access ID")?,
-        target_id: target_id.to_string(),
-        tcp_port,
+        seed: *seed,
     };
 
     let encoded = bincode::serialize(&payload).context("failed to serialize access ID payload")?;
@@ -3319,30 +2752,8 @@ fn parse_access_id(access_id: &str) -> Result<ParsedAccessId> {
     let payload: AccessIdPayload =
         bincode::deserialize(&decoded).context("failed to parse access ID payload")?;
 
-    if payload.version != ACCESS_ID_VERSION {
-        bail!(
-            "unsupported access ID version: {} (expected {})",
-            payload.version,
-            ACCESS_ID_VERSION
-        );
-    }
-
-    let server_addr = payload
-        .server_addr
-        .parse::<SocketAddr>()
-        .context("access ID contains invalid server address")?;
-    let fingerprint = normalize_fingerprint_hex(&payload.fingerprint)
-        .context("access ID contains invalid fingerprint")?;
-    let target_id = payload.target_id.trim().to_string();
-    if target_id.is_empty() {
-        bail!("access ID contains an empty target session ID");
-    }
-
     Ok(ParsedAccessId {
-        server_addr,
-        fingerprint,
-        target_id,
-        tcp_port: payload.tcp_port,
+        seed: payload.seed,
     })
 }
 
@@ -3372,7 +2783,7 @@ fn save_connection_payload_file_from_seed(seed: &str) -> Result<PathBuf> {
         raw
     } else {
         let parsed = parse_connection_seed(seed)?;
-        build_connection_payload_bytes(parsed.server_addr, &parsed.fingerprint, &parsed.target_id, parsed.tcp_port)?
+        build_connection_payload_bytes(&parsed.seed)?
     };
 
     let Some(path) = rfd::FileDialog::new()
@@ -3459,13 +2870,7 @@ fn load_connection_seed_from_file_path(path: &Path) -> Result<String> {
 
     if bytes.len() == CONNECTION_PAYLOAD_BYTES {
         let parsed = parse_connection_payload_bytes(&bytes)?;
-        let payload = build_connection_payload_bytes(
-            parsed.server_addr,
-            &parsed.fingerprint,
-            &parsed.target_id,
-            parsed.tcp_port,
-        )?;
-        return Ok(URL_SAFE_NO_PAD.encode(payload));
+        return build_access_id(&parsed.seed);
     }
 
     if let Ok(text) = std::str::from_utf8(&bytes) {
@@ -3602,72 +3007,11 @@ fn parse_connection_seed(seed: &str) -> Result<ParsedAccessId> {
     bail!("unsupported connection seed format")
 }
 
-fn build_connection_payload_bytes(
-    server_addr: SocketAddr,
-    fingerprint: &str,
-    target_id: &str,
-    tcp_port: Option<u16>,
-) -> Result<Vec<u8>> {
-    debug_assert_eq!(
-        CONNECTION_PAYLOAD_USED_BYTES + CONNECTION_PAYLOAD_RESERVED_BYTES,
-        CONNECTION_PAYLOAD_BYTES
-    );
-
-    let ipv4 = match server_addr.ip() {
-        IpAddr::V4(value) => value.octets(),
-        IpAddr::V6(_) => bail!("compact connection seed currently supports IPv4 addresses only"),
-    };
-
-    let fingerprint_hex = normalize_fingerprint_hex(fingerprint)
-        .context("failed to normalize fingerprint for compact seed")?;
-    let fingerprint_bytes =
-        hex::decode(&fingerprint_hex).context("failed to decode fingerprint bytes")?;
-    if fingerprint_bytes.len() < CONNECTION_PAYLOAD_FINGERPRINT_PREFIX_BYTES {
-        bail!(
-            "fingerprint must contain at least {} bytes",
-            CONNECTION_PAYLOAD_FINGERPRINT_PREFIX_BYTES
-        );
-    }
-
-    let target_id_bytes = hex::decode(target_id.trim())
-        .context("target session ID must be hexadecimal for compact seed")?;
-    if target_id_bytes.len() != CONNECTION_PAYLOAD_TARGET_ID_BYTES {
-        bail!(
-            "target session ID must contain exactly {} bytes",
-            CONNECTION_PAYLOAD_TARGET_ID_BYTES
-        );
-    }
-
-    let version_index = 0;
-    let family_index = 1;
-    let ip_start = CONNECTION_PAYLOAD_HEADER_BYTES;
-    let ip_end = ip_start + CONNECTION_PAYLOAD_IPV4_BYTES;
-    let port_end = ip_end + CONNECTION_PAYLOAD_PORT_BYTES;
-    let fingerprint_end = port_end + CONNECTION_PAYLOAD_FINGERPRINT_PREFIX_BYTES;
-    let target_end = fingerprint_end + CONNECTION_PAYLOAD_TARGET_ID_BYTES;
-
-    let mut payload = [0_u8; CONNECTION_PAYLOAD_BYTES];
-    payload[version_index] = CONNECTION_PAYLOAD_VERSION;
-    payload[family_index] = CONNECTION_PAYLOAD_FAMILY_IPV4;
-    payload[ip_start..ip_end].copy_from_slice(&ipv4);
-    payload[ip_end..port_end].copy_from_slice(&server_addr.port().to_be_bytes());
-    payload[port_end..fingerprint_end]
-        .copy_from_slice(&fingerprint_bytes[..CONNECTION_PAYLOAD_FINGERPRINT_PREFIX_BYTES]);
-    payload[fingerprint_end..target_end].copy_from_slice(&target_id_bytes);
-
-    // Store TCP port at the remaining 2 reserved bytes
-    let tcp_port_val = tcp_port.unwrap_or(0);
-    payload[target_end..target_end + 2].copy_from_slice(&tcp_port_val.to_be_bytes());
-
-    Ok(payload.to_vec())
+fn build_connection_payload_bytes(seed: &[u8; 32]) -> Result<Vec<u8>> {
+    Ok(seed.to_vec())
 }
 
 fn parse_connection_payload_bytes(payload: &[u8]) -> Result<ParsedAccessId> {
-    debug_assert_eq!(
-        CONNECTION_PAYLOAD_USED_BYTES + CONNECTION_PAYLOAD_RESERVED_BYTES,
-        CONNECTION_PAYLOAD_BYTES
-    );
-
     if payload.len() != CONNECTION_PAYLOAD_BYTES {
         bail!(
             "compact seed must be {} bytes, got {}",
@@ -3676,49 +3020,10 @@ fn parse_connection_payload_bytes(payload: &[u8]) -> Result<ParsedAccessId> {
         );
     }
 
-    let version_index = 0;
-    let family_index = 1;
-    let ip_start = CONNECTION_PAYLOAD_HEADER_BYTES;
-    let ip_end = ip_start + CONNECTION_PAYLOAD_IPV4_BYTES;
-    let port_end = ip_end + CONNECTION_PAYLOAD_PORT_BYTES;
-    let fingerprint_end = port_end + CONNECTION_PAYLOAD_FINGERPRINT_PREFIX_BYTES;
-    let target_end = fingerprint_end + CONNECTION_PAYLOAD_TARGET_ID_BYTES;
+    let mut seed = [0_u8; 32];
+    seed.copy_from_slice(payload);
 
-    if payload[version_index] != CONNECTION_PAYLOAD_VERSION {
-        bail!(
-            "unsupported compact seed version: {} (expected {})",
-            payload[version_index],
-            CONNECTION_PAYLOAD_VERSION
-        );
-    }
-
-    if payload[family_index] != CONNECTION_PAYLOAD_FAMILY_IPV4 {
-        bail!(
-            "unsupported compact seed address family: {}",
-            payload[family_index]
-        );
-    }
-
-    let ip = Ipv4Addr::new(
-        payload[ip_start],
-        payload[ip_start + 1],
-        payload[ip_start + 2],
-        payload[ip_start + 3],
-    );
-    let port = u16::from_be_bytes([payload[ip_end], payload[ip_end + 1]]);
-
-    let fingerprint_prefix = &payload[port_end..fingerprint_end];
-    let target_id = &payload[fingerprint_end..target_end];
-
-    let tcp_port_val = u16::from_be_bytes([payload[target_end], payload[target_end + 1]]);
-    let tcp_port = if tcp_port_val > 0 { Some(tcp_port_val) } else { None };
-
-    Ok(ParsedAccessId {
-        server_addr: SocketAddr::new(IpAddr::V4(ip), port),
-        fingerprint: hex::encode(fingerprint_prefix),
-        target_id: hex::encode(target_id),
-        tcp_port,
-    })
+    Ok(ParsedAccessId { seed })
 }
 
 fn decode_connection_seed_base64(seed: &str) -> Result<Vec<u8>> {
@@ -3920,22 +3225,15 @@ mod tests {
     };
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     use base64::Engine as _;
-    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
     #[test]
     fn access_id_roundtrip() {
-        let server_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 5)), 5000);
-        let fingerprint =
-            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
-        let target_id = "a1b2c3d4e5f6";
+        let seed = [42_u8; 32];
 
-        let token = build_access_id(server_addr, fingerprint, target_id, None).expect("build access ID");
+        let token = build_access_id(&seed).expect("build access ID");
         let parsed = parse_access_id(&token).expect("parse access ID");
 
-        assert_eq!(parsed.server_addr, server_addr);
-        assert_eq!(parsed.fingerprint, fingerprint);
-        assert_eq!(parsed.target_id, target_id);
-        assert_eq!(parsed.tcp_port, None);
+        assert_eq!(parsed.seed, seed);
     }
 
     #[test]
@@ -3952,83 +3250,31 @@ mod tests {
 
     #[test]
     fn connection_seed_roundtrip_supports_base64_and_deep_link() {
-        let server_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 24, 8, 19)), 5000);
-        let fingerprint =
-            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
-        let target_id = "a1b2c3d4e5f6";
+        let seed = [7_u8; 32];
 
-        let payload = build_connection_payload_bytes(server_addr, fingerprint, target_id, None)
+        let payload = build_connection_payload_bytes(&seed)
             .expect("build compact connection payload");
-        let seed = URL_SAFE_NO_PAD.encode(&payload);
+        let seed_b64 = URL_SAFE_NO_PAD.encode(&payload);
 
-        let parsed = parse_connection_seed(&seed).expect("parse base64 connection seed");
-        assert_eq!(parsed.server_addr, server_addr);
-        assert_eq!(parsed.fingerprint, &fingerprint[..32]);
-        assert_eq!(parsed.target_id, target_id);
-        assert_eq!(parsed.tcp_port, None);
+        let parsed = parse_connection_seed(&seed_b64).expect("parse base64 connection seed");
+        assert_eq!(parsed.seed, seed);
 
-        let deep_link = format!("nexus://connect/{seed}");
+        let deep_link = format!("nexus://connect/{seed_b64}");
         let parsed_from_link =
             parse_connection_seed(&deep_link).expect("parse deep-link connection seed");
-        assert_eq!(parsed_from_link.server_addr, server_addr);
-        assert_eq!(parsed_from_link.fingerprint, &fingerprint[..32]);
-        assert_eq!(parsed_from_link.target_id, target_id);
-        assert_eq!(parsed_from_link.tcp_port, None);
+        assert_eq!(parsed_from_link.seed, seed);
     }
 
     #[test]
     fn connection_seed_roundtrip_supports_mnemonic() {
-        let server_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 25)), 5500);
-        let fingerprint =
-            "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210";
-        let target_id = "001122334455";
+        let seed = [255_u8; 32];
 
-        let payload = build_connection_payload_bytes(server_addr, fingerprint, target_id, None)
+        let payload = build_connection_payload_bytes(&seed)
             .expect("build compact connection payload");
         let mnemonic =
             encode_connection_seed_mnemonic(&payload).expect("encode mnemonic connection seed");
 
         let parsed = parse_connection_seed(&mnemonic).expect("parse mnemonic connection seed");
-        assert_eq!(parsed.server_addr, server_addr);
-        assert_eq!(parsed.fingerprint, &fingerprint[..32]);
-        assert_eq!(parsed.target_id, target_id);
-        assert_eq!(parsed.tcp_port, None);
-    }
-
-    #[test]
-    fn connection_seed_roundtrip_with_tcp_port() {
-        let server_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(172, 16, 2, 44)), 6000);
-        let fingerprint =
-            "aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899";
-        let target_id = "aabbccddeeff";
-        let tcp_port = Some(443);
-
-        let payload = build_connection_payload_bytes(server_addr, fingerprint, target_id, tcp_port)
-            .expect("build compact connection payload with tcp port");
-        let mnemonic =
-            encode_connection_seed_mnemonic(&payload).expect("encode mnemonic connection seed");
-
-        let parsed = parse_connection_seed(&mnemonic).expect("parse mnemonic connection seed");
-        assert_eq!(parsed.server_addr, server_addr);
-        assert_eq!(parsed.fingerprint, &fingerprint[..32]);
-        assert_eq!(parsed.target_id, target_id);
-        assert_eq!(parsed.tcp_port, tcp_port);
-    }
-
-    #[tokio::test]
-    async fn test_detect_public_ip_with_timeout() {
-        let start = std::time::Instant::now();
-        let result = tokio::time::timeout(
-            std::time::Duration::from_secs(6),
-            nexus_network::run_diagnostics(0)
-        ).await;
-
-        assert!(start.elapsed() < std::time::Duration::from_secs(7), "Public IP detection took too long / hung!");
-        match result {
-            Ok((topology, maybe_addr)) => {
-                println!("Diagnostics completed: topology={:?}, addr={:?}", topology, maybe_addr);
-            }
-            Err(_) => panic!("Public IP detection hung and triggered outer timeout!"),
-        }
+        assert_eq!(parsed.seed, seed);
     }
 }
