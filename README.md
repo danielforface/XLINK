@@ -6,6 +6,7 @@ NexusP2P is a Windows-focused remote support engine written in Rust, now powered
 
 - Modern native desktop GUI (no command prompt workflow)
 - Host/Client tabbed control surface with live session telemetry
+- Client Session Index history with one-click reconnect from successful sessions
 - Out-of-band Access ID exchange:
   - Copy to clipboard
   - Save/load `.nexus` connection files
@@ -66,6 +67,7 @@ The app opens directly in the desktop GUI (no CLI prompts).
    - Decode QR from clipboard image
 3. Click `Connect`.
 4. Approve or deny server access request in GUI prompt.
+5. Reconnect anytime by clicking a saved entry in `Session Index History`.
 
 ## Optional Automation Flags
 
