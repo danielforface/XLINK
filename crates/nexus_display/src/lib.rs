@@ -1,6 +1,6 @@
 use anyhow::{anyhow, Context, Result};
 use bytes::Bytes;
-use minifb::{Key, KeyRepeat, MouseMode, Window, WindowOptions};
+use minifb::{Key, KeyRepeat, MouseButton, MouseMode, Window, WindowOptions};
 use std::thread;
 use tokio::sync::mpsc::{self, Receiver, Sender};
 use windows::core::{ComInterface, Error as WindowsError};
@@ -51,6 +51,7 @@ pub struct ViewerFrame {
 #[derive(Debug, Clone)]
 pub enum ViewerInputEvent {
     MouseMove { x_norm: f32, y_norm: f32 },
+    MouseButton { button: u8, pressed: bool },
     Keyboard { virtual_key: u16, pressed: bool },
 }
 
@@ -348,6 +349,7 @@ fn run_remote_viewer(
 
     let mut pixel_buffer = vec![0_u32; width * height];
     let mut last_mouse_absolute: Option<(u16, u16)> = None;
+    let mut last_buttons = [false; 3];
 
     loop {
         if !window.is_open() {
@@ -374,10 +376,11 @@ fn run_remote_viewer(
                 .map_err(|error| anyhow!("failed to rebuild remote viewer window: {error}"))?;
             window.set_target_fps(60);
             last_mouse_absolute = None;
+            last_buttons = [false; 3];
         }
 
         copy_bgra_into_u32(&latest_frame, &mut pixel_buffer)?;
-        capture_window_input(&window, width, height, &input_tx, &mut last_mouse_absolute);
+        capture_window_input(&window, width, height, &input_tx, &mut last_mouse_absolute, &mut last_buttons);
 
         window
             .update_with_buffer(&pixel_buffer, width, height)
@@ -433,6 +436,7 @@ fn capture_window_input(
     height: usize,
     input_tx: &Sender<ViewerInputEvent>,
     last_mouse_absolute: &mut Option<(u16, u16)>,
+    last_buttons: &mut [bool; 3],
 ) {
     if let Some((mouse_x, mouse_y)) = window.get_mouse_pos(MouseMode::Discard) {
         let x_norm = normalize_position(mouse_x, width);
@@ -445,6 +449,23 @@ fn capture_window_input(
         if Some(absolute) != *last_mouse_absolute {
             let _ = input_tx.try_send(ViewerInputEvent::MouseMove { x_norm, y_norm });
             *last_mouse_absolute = Some(absolute);
+        }
+    }
+
+    // Edge-triggered button events are required for click, double-click and drag.
+    // Never drop transitions on the floor just because mouse motion is congested.
+    for (idx, button) in [MouseButton::Left, MouseButton::Right, MouseButton::Middle]
+        .iter().enumerate()
+    {
+        let down = window.get_mouse_down(*button);
+        if down != last_buttons[idx] {
+            if input_tx.blocking_send(ViewerInputEvent::MouseButton {
+                button: idx as u8,
+                pressed: down,
+            }).is_err() {
+                return;
+            }
+            last_buttons[idx] = down;
         }
     }
 
