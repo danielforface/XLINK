@@ -62,12 +62,11 @@ pub fn decode(packet: FramePacket) -> Result<ViewerFrame> {
             bail!("invalid JPEG payload size");
         }
         let mut reader = ImageReader::with_format(Cursor::new(&packet.pixels), ImageFormat::Jpeg);
-        reader.limits(Limits {
-            max_image_width: Some(MAX_DIMENSION),
-            max_image_height: Some(MAX_DIMENSION),
-            max_alloc: Some(MAX_DECODED_BYTES as u64),
-            ..Limits::default()
-        });
+        let mut limits = Limits::default();
+        limits.max_image_width = Some(MAX_DIMENSION);
+        limits.max_image_height = Some(MAX_DIMENSION);
+        limits.max_alloc = Some(MAX_DECODED_BYTES as u64);
+        reader.limits(limits);
         let image = reader.decode().context("failed to decode JPEG frame")?;
         if image.width() != packet.width || image.height() != packet.height {
             bail!("JPEG dimensions differ from transport metadata");
