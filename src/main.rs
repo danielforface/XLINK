@@ -2056,6 +2056,8 @@ async fn run_host_peer_session(
     let mut capture_failures = 0u32;
     let mut pacer = adaptive::AdaptiveFrameRate::new(fps);
     let mut delta_encoder = delta::DeltaEncoder::new();
+    let mut video_sequence = 0u64;
+    let mut last_video_packet = Instant::now();
     let mut ticker = time::interval(pacer.interval());
     ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
@@ -2078,7 +2080,7 @@ async fn run_host_peer_session(
         }
 
         let started = Instant::now();
-        let frame = match capturer.capture_frame() {
+        let frame = match capturer.capture_changed_frame() {
             Ok(frame) => {
                 capture_failures = 0;
                 frame
@@ -2100,14 +2102,25 @@ async fn run_host_peer_session(
                 continue;
             }
         };
-        // Constrain the desktop pixel budget before differencing and JPEG.
-        // A stable scaled canvas lets patches remain aligned across frames.
-        let frame = frame_codec::fit_desktop(frame, 1280, 800)?;
-        let Some(packet) = delta_encoder.encode(frame)? else {
-            // No pixels changed: never send a redundant full-screen JPEG.
-            // A periodic keyframe is automatically emitted by DeltaEncoder.
-            continue;
+        let maybe_packet = if let Some(frame) = frame {
+            // Stable size preserves spatial delta coordinates between captures.
+            let mut frame = frame_codec::fit_desktop(frame, 1280, 800)?;
+            frame.frame_index = video_sequence;
+            delta_encoder.encode(frame)?
+        } else {
+            None
         };
+        let packet = match maybe_packet {
+            Some(packet) => packet,
+            None if last_video_packet.elapsed() >= Duration::from_secs(10) => {
+                // No changed desktop pixels: keep QUIC alive with a tiny
+                // header rather than duplicating a full image.
+                delta::DeltaEncoder::heartbeat(video_sequence)
+            }
+            None => continue,
+        };
+        video_sequence = video_sequence.wrapping_add(1);
+        last_video_packet = Instant::now();
 
         match time::timeout(Duration::from_secs(8), frame_stream_send.send_frame(&packet)).await {
             Ok(Ok(())) => {}
@@ -2341,7 +2354,8 @@ async fn run_client_session(
                     }
 
                     let frame = match delta_decoder.decode(packet) {
-                        Ok(frame) => frame,
+                        Ok(Some(frame)) => frame,
+                        Ok(None) => continue, // heartbeat: no redraw and no pixels transferred
                         Err(error) => {
                             warn!(?error, "remote delta stream cannot be trusted; closing rather than showing corrupt output");
                             break;
