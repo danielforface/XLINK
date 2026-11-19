@@ -2,7 +2,7 @@ use anyhow::{anyhow, Context, Result};
 use bytes::Bytes;
 use minifb::{Key, KeyRepeat, MouseMode, Window, WindowOptions};
 use std::thread;
-use tokio::sync::mpsc::{self, Receiver, Sender, UnboundedReceiver, UnboundedSender};
+use tokio::sync::mpsc::{self, Receiver, Sender};
 use windows::core::{ComInterface, Error as WindowsError};
 use windows::Win32::Foundation::E_FAIL;
 use windows::Win32::Graphics::Direct3D::{D3D_DRIVER_TYPE_HARDWARE, D3D_FEATURE_LEVEL};
@@ -314,9 +314,9 @@ fn create_output_duplication(device: &ID3D11Device) -> Result<IDXGIOutputDuplica
 
 pub fn spawn_remote_viewer(
     title: &str,
-) -> Result<(Sender<ViewerFrame>, UnboundedReceiver<ViewerInputEvent>)> {
+) -> Result<(Sender<ViewerFrame>, Receiver<ViewerInputEvent>)> {
     let (frame_tx, mut frame_rx) = mpsc::channel::<ViewerFrame>(2);
-    let (input_tx, input_rx) = mpsc::unbounded_channel::<ViewerInputEvent>();
+    let (input_tx, input_rx) = mpsc::channel::<ViewerInputEvent>(256);
     let title = title.to_string();
 
     thread::Builder::new()
@@ -334,7 +334,7 @@ pub fn spawn_remote_viewer(
 fn run_remote_viewer(
     title: &str,
     frame_rx: &mut Receiver<ViewerFrame>,
-    input_tx: UnboundedSender<ViewerInputEvent>,
+    input_tx: Sender<ViewerInputEvent>,
 ) -> Result<()> {
     let Some(mut latest_frame) = frame_rx.blocking_recv() else {
         return Ok(());
@@ -423,7 +423,7 @@ fn capture_window_input(
     window: &Window,
     width: usize,
     height: usize,
-    input_tx: &UnboundedSender<ViewerInputEvent>,
+    input_tx: &Sender<ViewerInputEvent>,
     last_mouse_absolute: &mut Option<(u16, u16)>,
 ) {
     if let Some((mouse_x, mouse_y)) = window.get_mouse_pos(MouseMode::Discard) {
@@ -435,14 +435,14 @@ fn capture_window_input(
         );
 
         if Some(absolute) != *last_mouse_absolute {
-            let _ = input_tx.send(ViewerInputEvent::MouseMove { x_norm, y_norm });
+            let _ = input_tx.try_send(ViewerInputEvent::MouseMove { x_norm, y_norm });
             *last_mouse_absolute = Some(absolute);
         }
     }
 
     for key in window.get_keys_pressed(KeyRepeat::No) {
         if let Some(virtual_key) = minifb_key_to_virtual_key(key) {
-            let _ = input_tx.send(ViewerInputEvent::Keyboard {
+            let _ = input_tx.blocking_send(ViewerInputEvent::Keyboard {
                 virtual_key,
                 pressed: true,
             });
@@ -451,7 +451,7 @@ fn capture_window_input(
 
     for key in window.get_keys_released() {
         if let Some(virtual_key) = minifb_key_to_virtual_key(key) {
-            let _ = input_tx.send(ViewerInputEvent::Keyboard {
+            let _ = input_tx.blocking_send(ViewerInputEvent::Keyboard {
                 virtual_key,
                 pressed: false,
             });
