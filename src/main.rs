@@ -107,7 +107,7 @@ fn main() -> Result<()> {
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([920.0, 740.0])
-            .with_min_inner_size([680.0, 580.0]),
+            .with_min_inner_size([500.0, 530.0]),
         ..Default::default()
     };
 
@@ -1303,10 +1303,9 @@ impl NexusGuiApp {
                         ui.add(egui::Slider::new(&mut self.host_max_width, 960..=1920));
                     });
                     ui.add_space(12.0);
-                    ui.label("Trusted devices are not yet enabled. Future unattended access "
-                        .to a remembered computer requires explicit enrollment on BOTH devices, "
-                        .to_string()
-                        + "secure OS-backed credential storage and a visible revoke control.");
+                    ui.add(egui::Label::new(
+                        "Trusted devices are not enabled yet. Persistent access will require                          opt-in on both computers, encrypted device credentials and revocation."
+                    ).wrap(true));
                 });
         });
     }
