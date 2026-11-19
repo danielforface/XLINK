@@ -378,16 +378,7 @@ impl NexusGuiApp {
 
         let host_seed = rand::random::<[u8; 32]>();
 
-        // Auto-start hosting immediately on startup if not in client mode
-        if launch_connection_seed.is_none() {
-            let command = RuntimeCommand::StartHosting(HostRuntimeConfig {
-                fps: DEFAULT_FPS,
-                inject_input: false,
-                seed: host_seed,
-            });
-            let _ = runtime_cmd_tx.try_send(command);
-        }
-
+        // Hosting is opt-in. Opening the application must not expose a listener automatically.
         let detected_public_addr = Arc::new(Mutex::new(None));
         let detecting_public_ip = Arc::new(AtomicBool::new(true));
 
@@ -1952,7 +1943,7 @@ async fn run_server_session(
     runtime_event_tx
         .send(RuntimeEvent::HostReady {
             advertised_addr: format!("iroh:{}", node_id),
-            fingerprint: "iroh-identity".to_string(), // Dummy for iroh identity
+            fingerprint: node_id.to_string(), // Actual authenticated endpoint public identity
             session_id: credentials.session_id.clone(),
             access_id,
             fps,
@@ -2794,7 +2785,10 @@ fn detect_local_ip() -> Option<IpAddr> {
 
 
 async fn run_diagnostics(_port: u16) -> (NetworkTopology, Option<String>) {
-    (NetworkTopology::ConeNatFriendly, None)
+    // Do not report a fabricated NAT type or public address to technicians.
+    // P2P discovery is handled by iroh; this panel remains unknown until
+    // an actual topology probe is implemented and validated.
+    (NetworkTopology::Undetermined, None)
 }
 
 fn derive_session_id(endpoint_id: &[u8; 32]) -> String {
