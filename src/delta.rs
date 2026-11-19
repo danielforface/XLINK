@@ -13,6 +13,26 @@ use crate::frame_codec;
 const KEYFRAME_INTERVAL: Duration = Duration::from_secs(60);
 const DELTA_HEADER_LEN: usize = 20;
 const MAX_CANVAS_BYTES: usize = 64 * 1024 * 1024;
+const TILE_SIZE: usize = 128;
+const MAX_SPARSE_TILES: usize = 12;
+
+fn encode_crop(frame: &CapturedFrame, x: usize, y: usize, width: usize, height: usize)
+    -> Result<FramePacket>
+{
+    let full_width = frame.width as usize;
+    let mut pixels = Vec::with_capacity(width * height * 4);
+    for row in y..y + height {
+        let start = (row * full_width + x) * 4;
+        pixels.extend_from_slice(&frame.pixels[start..start + width * 4]);
+    }
+    frame_codec::encode(CapturedFrame {
+        width: width as u32,
+        height: height as u32,
+        stride: (width * 4) as u32,
+        frame_index: frame.frame_index,
+        pixels: pixels.into(),
+    })
+}
 
 pub struct DeltaEncoder {
     previous: Vec<u8>,
@@ -61,12 +81,16 @@ impl DeltaEncoder {
         let mut max_x = 0usize;
         let mut max_y = 0usize;
         let mut changed = false;
+        let tile_columns = width.div_ceil(TILE_SIZE);
+        let tile_rows = height.div_ceil(TILE_SIZE);
+        let mut dirty_tiles = vec![false; tile_columns * tile_rows];
         for y in 0..height {
             let start = y * width * 4;
             for x in 0..width {
                 let index = start + x * 4;
                 if self.previous[index..index + 4] != frame.pixels[index..index + 4] {
                     changed = true;
+                    dirty_tiles[(y / TILE_SIZE) * tile_columns + (x / TILE_SIZE)] = true;
                     min_x = min_x.min(x);
                     min_y = min_y.min(y);
                     max_x = max_x.max(x);
@@ -83,7 +107,38 @@ impl DeltaEncoder {
         let patch_height = max_y - min_y + 1;
         let patch_area = patch_width * patch_height;
         let full_area = width * height;
-        let packet = if patch_area * 2 >= full_area {
+        let dirty_tile_count = dirty_tiles.iter().filter(|dirty| **dirty).count();
+        let sparse = patch_area * 2 >= full_area
+            && dirty_tile_count >= 2
+            && dirty_tile_count <= MAX_SPARSE_TILES
+            && dirty_tile_count * TILE_SIZE * TILE_SIZE < full_area / 2;
+        let packet = if sparse {
+            // Multiple remote changes (e.g. caret + clock) should not turn
+            // the whole desktop into one giant dirty bounding rectangle.
+            // All tile patches travel atomically in a single ordered packet.
+            let mut payload = Vec::new();
+            payload.extend_from_slice(&(dirty_tile_count as u32).to_le_bytes());
+            for (i, dirty) in dirty_tiles.iter().copied().enumerate() {
+                if !dirty { continue; }
+                let x = (i % tile_columns) * TILE_SIZE;
+                let y = (i / tile_columns) * TILE_SIZE;
+                let patch_w = TILE_SIZE.min(width - x);
+                let patch_h = TILE_SIZE.min(height - y);
+                let patch = encode_crop(&frame, x, y, patch_w, patch_h)?;
+                let len = u32::try_from(patch.pixels.len()).context("tile payload too large")?;
+                for v in [x as u32, y as u32, patch.width, patch.height, patch.stride, len] {
+                    payload.extend_from_slice(&v.to_le_bytes());
+                }
+                payload.extend_from_slice(&patch.pixels);
+            }
+            FramePacket {
+                sequence: frame.frame_index,
+                width: frame.width,
+                height: frame.height,
+                stride: 3, // several independently compressed dirty tiles
+                pixels: payload,
+            }
+        } else if patch_area * 2 >= full_area {
             frame_codec::encode(frame.clone())?
         } else {
             let mut patch_pixels = Vec::with_capacity(patch_area * 4);
@@ -152,6 +207,55 @@ impl DeltaDecoder {
             }
             self.last_sequence = Some(sequence);
             return Ok(None);
+        }
+        if packet.stride == 3 {
+            let canvas = self.canvas.as_mut().context("tile delta without keyframe")?;
+            if canvas.width != packet.width || canvas.height != packet.height {
+                bail!("tile delta canvas dimensions mismatch");
+            }
+            if packet.pixels.len() < 4 {
+                bail!("truncated tile count");
+            }
+            let count = u32::from_le_bytes(packet.pixels[0..4].try_into().unwrap()) as usize;
+            if count == 0 || count > MAX_SPARSE_TILES {
+                bail!("invalid tile patch count");
+            }
+            let mut cursor = 4usize;
+            for _ in 0..count {
+                let header_end = cursor.checked_add(24).context("tile header overflow")?;
+                if header_end > packet.pixels.len() { bail!("truncated tile header"); }
+                let read = |pos: usize| u32::from_le_bytes(
+                    packet.pixels[pos..pos + 4].try_into().unwrap());
+                let x = read(cursor) as usize;
+                let y = read(cursor + 4) as usize;
+                let tile_w = read(cursor + 8);
+                let tile_h = read(cursor + 12);
+                let tile_stride = read(cursor + 16);
+                let payload_len = read(cursor + 20) as usize;
+                cursor = header_end;
+                let next = cursor.checked_add(payload_len).context("tile length overflow")?;
+                if next > packet.pixels.len() { bail!("truncated tile payload"); }
+                if x.checked_add(tile_w as usize).context("tile width overflow")? > canvas.width as usize
+                    || y.checked_add(tile_h as usize).context("tile height overflow")? > canvas.height as usize
+                    || tile_stride == 1 || tile_stride == 2 || tile_stride == 3
+                {
+                    bail!("tile bounds or codec invalid");
+                }
+                let tile = frame_codec::decode(FramePacket {
+                    sequence, width: tile_w, height: tile_h, stride: tile_stride,
+                    pixels: packet.pixels[cursor..next].to_vec(),
+                })?;
+                for row in 0..tile_h as usize {
+                    let dst = ((y + row) * canvas.width as usize + x) * 4;
+                    let src = row * tile.stride as usize;
+                    let size = tile_w as usize * 4;
+                    canvas.pixels[dst..dst+size].copy_from_slice(&tile.pixels[src..src+size]);
+                }
+                cursor = next;
+            }
+            if cursor != packet.pixels.len() { bail!("trailing bytes after tile delta"); }
+            self.last_sequence = Some(sequence);
+            return Ok(Some(canvas.clone()));
         }
         if packet.stride != 1 {
             let frame = frame_codec::decode(packet)?;
@@ -255,6 +359,28 @@ mod tests {
         changed[0..4].copy_from_slice(&[255,255,255,255]);
         let patch = encoder.encode(capture(64, 64, 1, changed)).unwrap().unwrap();
         assert!(DeltaDecoder::new().decode(patch).is_err());
+    }
+
+    #[test]
+    fn distant_small_changes_use_sparse_tiles_not_full_desktop() {
+        let width = 512usize;
+        let height = 512usize;
+        let mut encoder = DeltaEncoder::new();
+        let mut decoder = DeltaDecoder::new();
+        let initial = vec![0u8; width * height * 4];
+        let keyframe = encoder.encode(capture(512, 512, 0, initial.clone()))
+            .unwrap().unwrap();
+        decoder.decode(keyframe).unwrap().unwrap();
+        let mut updated = initial;
+        updated[0..4].copy_from_slice(&[255,255,255,255]);
+        let offset = ((height-1) * width + (width-1)) * 4;
+        updated[offset..offset+4].copy_from_slice(&[255,255,255,255]);
+        let packet = encoder.encode(capture(512,512,1,updated)).unwrap().unwrap();
+        assert_eq!(packet.stride, 3, "independent corners should use sparse tiles");
+        let canvas = decoder.decode(packet).unwrap().unwrap();
+        assert_eq!(&canvas.pixels[0..3], &[255,255,255]);
+        assert_eq!(&canvas.pixels[offset..offset+3], &[255,255,255]);
+        assert_eq!(&canvas.pixels[4..7], &[0,0,0]);
     }
 
     #[test]
