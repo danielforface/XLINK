@@ -492,7 +492,8 @@ impl NexusGuiApp {
                         remote_addr,
                         target_session,
                     });
-                    self.set_status("Awaiting host-side consent");
+                    self.active_tab = ActiveTab::HostMode;
+                    self.set_status("ACTION REQUIRED: approve or deny the technician on this computer");
                 }
                 RuntimeEvent::HostLifecycle { running } => {
                     self.host_running = running;
@@ -1248,22 +1249,23 @@ impl NexusGuiApp {
             return;
         };
 
-        egui::Window::new("Host Consent Required")
+        egui::Window::new("Remote support: your approval is required")
             .collapsible(false)
             .resizable(false)
             .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
             .show(ctx, |ui| {
+                ui.set_max_width(440.0);
                 ui.label(
-                    RichText::new("Incoming Remote Session")
+                    RichText::new("Technician requests access to this computer")
                         .strong()
-                        .size(18.0),
+                        .size(19.0),
                 );
                 ui.add_space(6.0);
-                ui.label(format!("Requester: {}", prompt.requester_id));
-                ui.label(format!("Remote Address: {}", prompt.remote_addr));
-                ui.label(format!("Target Session: {}", prompt.target_session));
+                ui.add(egui::Label::new(format!("Technician: {}", prompt.requester_id)).wrap(true));
+                ui.add(egui::Label::new(format!("Peer identity: {}", prompt.remote_addr)).wrap(true));
+                ui.add(egui::Label::new(format!("Session: {}", prompt.target_session)).wrap(true));
                 ui.add_space(10.0);
-                ui.label("Approve to activate desktop stream and optional input control.");
+                ui.add(egui::Label::new("Allow screen viewing? Keyboard and mouse control only if explicitly enabled in Host settings. You may revoke at any time.").wrap(true));
                 ui.add_space(12.0);
 
                 ui.horizontal(|ui| {
