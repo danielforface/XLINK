@@ -1298,6 +1298,9 @@ impl NexusGuiApp {
                             let _ = self.runtime_cmd_tx
                                 .try_send(RuntimeCommand::DisconnectClient);
                         }
+                        ui.add_space(7.0);
+                        ui.checkbox(&mut self.remember_this_computer,
+                            "Remember this computer if its owner also agrees");
                         ui.add_space(8.0);
                         ui.add(egui::Label::new(
                             RichText::new("The other person must approve the connection.")
@@ -1305,6 +1308,34 @@ impl NexusGuiApp {
                     });
             });
         });
+        let saved = self.trust_registry.saved_computers();
+        if !saved.is_empty() {
+            ui.add_space(17.0);
+            ui.vertical_centered(|ui| {
+                ui.label(RichText::new("SAVED COMPUTERS")
+                    .size(11.0).strong().color(muted));
+            });
+            ui.add_space(7.0);
+            for peer in saved.iter().take(8) {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(&peer.label).size(12.0).color(ink));
+                    if ui.add_enabled(!self.client_running, egui::Button::new("Connect"))
+                        .clicked() {
+                        if let Err(error) = self.runtime_cmd_tx.try_send(
+                            RuntimeCommand::ConnectTrusted {
+                                endpoint_id: peer.endpoint_id,
+                                display_name: None,
+                            }
+                        ) {
+                            self.push_log(format!("Cannot start saved connection: {error}"));
+                        } else {
+                            self.client_running = true;
+                            self.set_status("Connecting to trusted computer...");
+                        }
+                    }
+                });
+            }
+        }
         ui.add_space(16.0);
         ui.vertical_centered(|ui| {
             ui.add(egui::Label::new(
@@ -1314,37 +1345,133 @@ impl NexusGuiApp {
     }
 
     fn draw_preferences_screen(&mut self, ui: &mut egui::Ui) {
-        let width = ui.available_width().min(700.0);
+        let ink = Color32::from_rgb(25, 45, 72);
+        let muted = Color32::from_rgb(106, 123, 144);
+        let width = ui.available_width().min(700.0).max(0.0);
         ui.vertical_centered(|ui| {
             ui.heading("Preferences");
-            ui.label("Control how XLINK responds to support requests.");
+            ui.label("Your support, your control.");
         });
-        ui.add_space(24.0);
-        ui.allocate_ui(egui::vec2(width, 0.0), |ui| {
-            egui::Frame::none().fill(Color32::WHITE)
-                .rounding(Rounding::same(16.0))
-                .inner_margin(egui::Margin::same(22.0))
-                .show(ui, |ui| {
-                    ui.heading("Remote control permission");
-                    ui.checkbox(&mut self.host_inject_input,
-                        "Allow mouse and keyboard only after local approval");
-                    ui.label("Changes apply when the next Host listener starts.");
-                    ui.add_space(16.0);
-                    ui.heading("Video quality");
-                    ui.horizontal(|ui| {
-                        ui.label("Frame rate");
-                        ui.add(egui::Slider::new(&mut self.host_fps, MIN_FPS..=MAX_FPS));
+        ui.add_space(20.0);
+        ui.allocate_ui_with_layout(
+            egui::vec2(width, 0.0), egui::Layout::top_down(egui::Align::Center),
+            |ui| {
+                egui::Frame::none().fill(Color32::WHITE)
+                    .stroke(Stroke::new(1.0, Color32::from_rgb(225, 232, 241)))
+                    .rounding(Rounding::same(17.0))
+                    .inner_margin(egui::Margin::same(20.0))
+                    .show(ui, |ui| {
+                        ui.set_width((width - 40.0).max(100.0));
+                        ui.heading("Input permissions");
+                        ui.checkbox(&mut self.host_inject_input,
+                            "Allow mouse and keyboard after an approved request");
+                        ui.label(RichText::new(
+                            "Changes to video/input settings take effect at the next Host session."
+                        ).size(11.0).color(muted));
+                        ui.add_space(15.0);
+                        ui.heading("Video");
+                        ui.horizontal(|ui| {
+                            ui.label("Capture FPS");
+                            ui.add(egui::Slider::new(&mut self.host_fps, MIN_FPS..=MAX_FPS));
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label("Video width");
+                            ui.add(egui::Slider::new(&mut self.host_max_width, 960..=1920));
+                        });
+                        ui.add_space(17.0);
+                        ui.separator();
+                        ui.add_space(12.0);
+                        ui.heading("Trusted devices");
+                        ui.add(egui::Label::new(
+                            "An enrolled technician can reconnect using its authenticated                              device identity, without another approval prompt.                              No short code, private key or password is shared."
+                        ).wrap(true));
+                        ui.add_space(8.0);
+                        let mut allow = self.trust_registry.unattended_enabled();
+                        if ui.checkbox(&mut allow,
+                            "Allow unattended connections from explicitly trusted technicians"
+                        ).changed() {
+                            match self.trust_registry.set_unattended_enabled(allow) {
+                                Ok(()) => {
+                                    self.set_status(if allow {
+                                        "Trusted-device access enabled"
+                                    } else {
+                                        "Trusted-device access disabled"
+                                    });
+                                    if !allow && self.host_running {
+                                        let _ = self.runtime_cmd_tx
+                                            .try_send(RuntimeCommand::StopHosting);
+                                        self.generated_access_id = None;
+                                    }
+                                }
+                                Err(error) => self.push_log(
+                                    format!("Cannot update protected trust registry: {error}")
+                                ),
+                            }
+                        }
+                        ui.add_space(9.0);
+                        let technicians = self.trust_registry.trusted_technicians();
+                        if technicians.is_empty() {
+                            ui.label(RichText::new("No trusted technicians")
+                                .size(12.0).color(muted));
+                        }
+                        for technician in technicians {
+                            ui.horizontal(|ui| {
+                                let short_id = hex::encode(&technician.endpoint_id[..4]);
+                                ui.label(RichText::new(format!(
+                                    "{} · {}", technician.label, short_id
+                                )).color(ink));
+                                if ui.button("Revoke").clicked() {
+                                    match self.trust_registry.revoke_technician(
+                                        &technician.endpoint_id
+                                    ) {
+                                        Ok(()) => {
+                                            self.set_status("Technician trust revoked");
+                                            if self.host_running {
+                                                // Disconnect any currently active
+                                                // session, not only future sessions.
+                                                let _ = self.runtime_cmd_tx.try_send(
+                                                    RuntimeCommand::StopHosting
+                                                );
+                                            }
+                                        }
+                                        Err(error) => self.push_log(
+                                            format!("Revocation failed: {error}")
+                                        ),
+                                    }
+                                }
+                            });
+                        }
+                        ui.add_space(12.0);
+                        ui.heading("Remembered computers");
+                        let remembered = self.trust_registry.saved_computers();
+                        if remembered.is_empty() {
+                            ui.label(RichText::new("No saved computers")
+                                .size(12.0).color(muted));
+                        }
+                        for peer in remembered {
+                            ui.horizontal(|ui| {
+                                ui.label(RichText::new(&peer.label).color(ink));
+                                if ui.button("Forget").clicked() {
+                                    if let Err(error) = self.trust_registry.forget_computer(
+                                        &peer.endpoint_id
+                                    ) {
+                                        self.push_log(format!(
+                                            "Cannot remove saved computer: {error}"
+                                        ));
+                                    } else {
+                                        self.set_status("Remembered computer removed");
+                                    }
+                                }
+                            });
+                        }
+                        ui.add_space(9.0);
+                        ui.add(egui::Label::new(
+                            RichText::new("Your private identities and trust decisions are                                 protected by Windows DPAPI for your user account.")
+                                .size(11.0).color(muted)
+                        ).wrap(true));
                     });
-                    ui.horizontal(|ui| {
-                        ui.label("Max width");
-                        ui.add(egui::Slider::new(&mut self.host_max_width, 960..=1920));
-                    });
-                    ui.add_space(12.0);
-                    ui.add(egui::Label::new(
-                        "Trusted devices are not enabled yet. Persistent access will require                          opt-in on both computers, encrypted device credentials and revocation."
-                    ).wrap(true));
-                });
-        });
+            }
+        );
     }
 
     fn draw_logs_screen(&mut self, ui: &mut egui::Ui) {
