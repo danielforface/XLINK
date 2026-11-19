@@ -225,6 +225,9 @@ enum RuntimeEvent {
     HostLifecycle {
         running: bool,
     },
+    HostSessionActive {
+        active: bool,
+    },
     ClientLifecycle {
         running: bool,
     },
@@ -374,6 +377,7 @@ struct NexusGuiApp {
     ui_bridge: Arc<UiBridge>,
 
     host_running: bool,
+    host_session_active: bool,
     client_running: bool,
     status_message: String,
     session_logs: VecDeque<String>,
@@ -454,6 +458,7 @@ impl NexusGuiApp {
             runtime_event_rx,
             ui_bridge,
             host_running: false,
+            host_session_active: false,
             client_running: false,
             status_message: "Ready".to_string(),
             session_logs: VecDeque::with_capacity(200),
@@ -549,6 +554,9 @@ impl NexusGuiApp {
                 RuntimeEvent::HostLifecycle { running } => {
                     self.host_running = running;
                     if !running {
+                        self.host_session_active = false;
+                    }
+                    if !running {
                         self.pending_host_consent = None;
                         self.ui_bridge.clear_host_consent_sender();
                         // The temporary pairing code is revoked, while the
@@ -556,6 +564,14 @@ impl NexusGuiApp {
                         self.generated_access_id = None;
                         self.code_ready_at = None;
                         self.push_log("Host stopped; old access code invalidated".to_string());
+                    }
+                }
+                RuntimeEvent::HostSessionActive { active } => {
+                    self.host_session_active = active;
+                    if active {
+                        self.set_status("REMOTE SUPPORT SESSION ACTIVE");
+                    } else if self.host_running {
+                        self.set_status("Ready for another connection");
                     }
                 }
                 RuntimeEvent::PairingCodeRevoked => {
@@ -1867,7 +1883,10 @@ impl eframe::App for NexusGuiApp {
                         self.show_preferences = false;
                         self.refocus_number_input = true;
                     }
-                    if ui.available_width() > 430.0 {
+                    if self.host_session_active {
+                        ui.label(RichText::new("●  LIVE SUPPORT")
+                            .strong().size(11.0).color(Color32::from_rgb(190, 51, 65)));
+                    } else if ui.available_width() > 430.0 {
                         ui.label(RichText::new("Remote support")
                             .size(12.0).color(Color32::from_rgb(106, 123, 142)));
                     }
@@ -2398,6 +2417,9 @@ async fn run_server_session(
             &endpoint, &config, &credentials, &runtime_event_tx, &ui_bridge, fps,
             accepted, &trust_registry,
         ).await;
+        let _ = runtime_event_tx.send(RuntimeEvent::HostSessionActive {
+            active: false
+        }).await;
         match result {
             Ok(()) => {
                 let _ = runtime_event_tx.send(RuntimeEvent::SessionStatus(
@@ -2592,6 +2614,9 @@ async fn run_host_peer_session(
     }
 
     session_state.transition(SessionState::Active)?;
+    let _ = runtime_event_tx.send(RuntimeEvent::HostSessionActive {
+        active: true
+    }).await;
 
     let input = Arc::new(InputController::new()?);
     input.set_state(InputSessionState::Active);
