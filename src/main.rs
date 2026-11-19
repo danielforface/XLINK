@@ -1,5 +1,7 @@
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 
+mod frame_codec;
+
 use anyhow::{anyhow, bail, Context, Result};
 use arboard::Clipboard;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -47,7 +49,7 @@ use winreg::enums::HKEY_CURRENT_USER;
 #[cfg(target_os = "windows")]
 use winreg::RegKey;
 
-const PROTOCOL_VERSION: u16 = 1;
+const PROTOCOL_VERSION: u16 = 2;
 const MAX_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
 const MAX_CONTROL_MESSAGE_BYTES: usize = 64 * 1024;
 const MAX_FRAME_WIDTH: u32 = 16_384;
@@ -2230,13 +2232,7 @@ async fn run_server_session(
         }
 
         let frame = capturer.capture_frame()?;
-        let packet = FramePacket {
-            sequence: frame.frame_index,
-            width: frame.width,
-            height: frame.height,
-            stride: frame.stride,
-            pixels: frame.pixels.to_vec(),
-        };
+        let packet = frame_codec::encode(frame)?;
 
         if let Err(error) = frame_stream_send.send_frame(&packet).await {
             info!(?error, "frame stream ended");
@@ -2432,40 +2428,12 @@ async fn run_client_session(
                         continue;
                     }
 
-                    let Some(expected) = packet.checked_buffer_len() else {
-                        warn!(
-                            sequence = packet.sequence,
-                            width = packet.width,
-                            height = packet.height,
-                            stride = packet.stride,
-                            "dropping frame with overflowed buffer size"
-                        );
-                        continue;
-                    };
-
-                    if packet.width == 0 || packet.height == 0
-                        || packet.width > MAX_FRAME_WIDTH || packet.height > MAX_FRAME_HEIGHT
-                        || packet.stride < packet.width.saturating_mul(4)
-                    {
-                        warn!(sequence = packet.sequence, "dropping frame with invalid dimensions");
-                        continue;
-                    }
-
-                    if packet.pixels.len() != expected {
-                        warn!(
-                            sequence = packet.sequence,
-                            bytes = packet.pixels.len(),
-                            expected,
-                            "dropping frame with invalid payload size"
-                        );
-                        continue;
-                    }
-
-                    let frame = ViewerFrame {
-                        width: packet.width,
-                        height: packet.height,
-                        stride: packet.stride,
-                        pixels: packet.pixels,
+                    let frame = match frame_codec::decode(packet) {
+                        Ok(frame) => frame,
+                        Err(error) => {
+                            warn!(?error, "dropping malformed remote video frame");
+                            continue;
+                        }
                     };
 
                     match viewer_frame_tx.try_send(frame) {
