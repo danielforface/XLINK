@@ -69,12 +69,22 @@ The app opens directly in the desktop GUI (no CLI prompts).
 4. Approve or deny server access request in GUI prompt.
 5. Reconnect anytime by clicking a saved entry in `Session Index History`.
 
-## Optional Automation Flags
+## Consent and security
 
-For automated smoke tests:
+Every control session requires interactive approval on the remote computer.
+Environment flags cannot auto-approve access or bypass on-screen consent.
+`NEXUS_AUTO_CLIENT_PERMISSION=0` and `NEXUS_AUTO_CONSENT=0` can
+explicitly deny requests in negative-path tests, but positive approval is
+always a user action.
 
-- `NEXUS_AUTO_CLIENT_PERMISSION=1` auto-approves client-side access requests.
-- `NEXUS_AUTO_CONSENT=1` auto-approves host local consent.
+The first hardening pass bounds the viewer's frame handoff queue to two frames,
+drops excess frames instead of accumulating memory, validates incoming frame
+dimensions, and caps control messages independently of video frames.
+
+**Important:** The Windows CI build gate is a prerequisite, not a substitute
+for exercising two actual Windows machines across direct and relay connections.
+Do not deploy as production remote-support software until consent revocation,
+viewer lifecycle, reconnection, network loss, and input release tests pass.
 
 ## Production Build
 
