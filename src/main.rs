@@ -13,7 +13,7 @@ use nexus_core::{
     ControlMessage, FramePacket, SecurityError, SessionCredentials, SessionState,
     SessionStateMachine,
 };
-use nexus_display::{spawn_remote_viewer, ScreenCapturer, ViewerFrame, ViewerInputEvent};
+use nexus_display::{spawn_remote_viewer, ScreenCapturer, ViewerInputEvent};
 use nexus_input::{
     InputController, KeyboardPreview, MousePreview, SessionState as InputSessionState,
 };
@@ -3021,7 +3021,7 @@ fn load_connection_seed_from_file_path(path: &Path) -> Result<String> {
     }
 
     if bytes.len() == CONNECTION_PAYLOAD_BYTES {
-        let parsed = parse_connection_payload_bytes(&bytes)?;
+        parse_connection_payload_bytes(&bytes)?;
         return Ok(URL_SAFE_NO_PAD.encode(&bytes));
     }
 
