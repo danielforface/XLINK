@@ -1,5 +1,9 @@
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 
+mod adaptive;
+mod delta;
+mod frame_codec;
+
 use anyhow::{anyhow, bail, Context, Result};
 use arboard::Clipboard;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -10,7 +14,7 @@ use nexus_core::{
     ControlMessage, FramePacket, SecurityError, SessionCredentials, SessionState,
     SessionStateMachine,
 };
-use nexus_display::{spawn_remote_viewer, ScreenCapturer, ViewerFrame, ViewerInputEvent};
+use nexus_display::{spawn_remote_viewer, ScreenCapturer, ViewerInputEvent};
 use nexus_input::{
     InputController, KeyboardPreview, MousePreview, SessionState as InputSessionState,
 };
@@ -28,7 +32,7 @@ use bip39::{Language, Mnemonic};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use tokio::runtime::Builder;
+use tokio::runtime::{Builder, Runtime};
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::{self, MissedTickBehavior};
 use tracing::{error, info, warn};
@@ -47,8 +51,11 @@ use winreg::enums::HKEY_CURRENT_USER;
 #[cfg(target_os = "windows")]
 use winreg::RegKey;
 
-const PROTOCOL_VERSION: u16 = 1;
+const PROTOCOL_VERSION: u16 = 4;
 const MAX_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
+const MAX_CONTROL_MESSAGE_BYTES: usize = 64 * 1024;
+const MAX_FRAME_WIDTH: u32 = 16_384;
+const MAX_FRAME_HEIGHT: u32 = 16_384;
 const DEFAULT_PORT: u16 = 0;
 const DEFAULT_FPS: u16 = 30;
 const MIN_FPS: u16 = 1;
@@ -56,6 +63,16 @@ const MAX_FPS: u16 = 60;
 const CONNECTION_PAYLOAD_BYTES: usize = 32;
 const UI_REPAINT_MS: u64 = 16;
 const DEEP_LINK_PREFIX: &str = "nexus://connect";
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(25);
+
+/// Child tasks must not outlive a revoked remote-control session.
+struct AbortOnDrop<T>(tokio::task::JoinHandle<T>);
+impl<T> Drop for AbortOnDrop<T> {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 
 fn main() -> Result<()> {
     init_tracing();
@@ -66,11 +83,11 @@ fn main() -> Result<()> {
 
     let launch_connection_seed = parse_launch_connection_seed();
 
-    let runtime = Builder::new_multi_thread()
+    let runtime = Arc::new(Builder::new_multi_thread()
         .enable_all()
         .thread_name("nexus-runtime")
         .build()
-        .context("failed to create Tokio runtime")?;
+        .context("failed to create Tokio runtime")?);
 
     let (runtime_cmd_tx, runtime_cmd_rx) = mpsc::channel::<RuntimeCommand>(32);
     let (runtime_event_tx, runtime_event_rx) = mpsc::channel::<RuntimeEvent>(256);
@@ -105,7 +122,7 @@ fn main() -> Result<()> {
                     .expect("runtime event receiver missing"),
                 ui_bridge_slot.take().expect("UI bridge missing"),
                 launch_connection_seed.clone(),
-                runtime.handle().clone(),
+                Arc::clone(&runtime),
             );
             Box::new(app)
         }),
@@ -122,12 +139,13 @@ fn init_tracing() {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct AccessIdPayload {
-    seed: [u8; 32],
+    protocol_version: u8,
+    endpoint_id: [u8; 32],
 }
 
 #[derive(Debug, Clone)]
 struct ParsedAccessId {
-    seed: [u8; 32],
+    endpoint_id: [u8; 32],
 }
 
 #[derive(Debug, Clone)]
@@ -147,6 +165,7 @@ enum TransportMode {
 #[derive(Debug, Clone)]
 struct HostRuntimeConfig {
     fps: u16,
+    max_width: u16,
     inject_input: bool,
     seed: [u8; 32],
 }
@@ -160,6 +179,8 @@ enum RuntimeCommand {
         _transport_mode: TransportMode,
     },
     RunDiagnostics,
+    StopHosting,
+    DisconnectClient,
 }
 
 #[derive(Debug)]
@@ -310,6 +331,7 @@ struct NexusGuiApp {
 
     host_port: u16,
     host_fps: u16,
+    host_max_width: u16,
     host_inject_input: bool,
     host_advertise_addr_input: String,
 
@@ -327,7 +349,7 @@ struct NexusGuiApp {
     session_logs: VecDeque<String>,
     detected_public_addr: Arc<Mutex<Option<SocketAddr>>>,
     detecting_public_ip: Arc<AtomicBool>,
-    _runtime_handle: tokio::runtime::Handle,
+    _runtime: Arc<Runtime>,
     has_auto_hosted: bool,
     host_seed: [u8; 32],
     client_punch_addr_input: String,
@@ -347,7 +369,7 @@ impl NexusGuiApp {
         runtime_event_rx: mpsc::Receiver<RuntimeEvent>,
         ui_bridge: Arc<UiBridge>,
         launch_connection_seed: Option<String>,
-        runtime_handle: tokio::runtime::Handle,
+        runtime: Arc<Runtime>,
     ) -> Self {
         apply_modern_theme(&cc.egui_ctx);
 
@@ -360,16 +382,7 @@ impl NexusGuiApp {
 
         let host_seed = rand::random::<[u8; 32]>();
 
-        // Auto-start hosting immediately on startup if not in client mode
-        if launch_connection_seed.is_none() {
-            let command = RuntimeCommand::StartHosting(HostRuntimeConfig {
-                fps: DEFAULT_FPS,
-                inject_input: false,
-                seed: host_seed,
-            });
-            let _ = runtime_cmd_tx.try_send(command);
-        }
-
+        // Hosting is opt-in. Opening the application must not expose a listener automatically.
         let detected_public_addr = Arc::new(Mutex::new(None));
         let detecting_public_ip = Arc::new(AtomicBool::new(true));
 
@@ -386,7 +399,8 @@ impl NexusGuiApp {
             pending_auto_connect,
             host_port,
             host_fps: DEFAULT_FPS,
-            host_inject_input: false,
+            host_max_width: 1280,
+            host_inject_input: true,
             host_advertise_addr_input: default_advertise,
             client_display_name: String::new(),
             pending_client_permission: None,
@@ -400,7 +414,7 @@ impl NexusGuiApp {
             session_logs: VecDeque::with_capacity(200),
             detected_public_addr,
             detecting_public_ip,
-            _runtime_handle: runtime_handle,
+            _runtime: runtime,
             has_auto_hosted: true, // Mark auto-hosted as true since we spawned it above
             host_seed,
             client_punch_addr_input: String::new(),
@@ -482,14 +496,19 @@ impl NexusGuiApp {
                         remote_addr,
                         target_session,
                     });
-                    self.set_status("Awaiting host-side consent");
+                    self.active_tab = ActiveTab::HostMode;
+                    self.set_status("ACTION REQUIRED: approve or deny the technician on this computer");
                 }
                 RuntimeEvent::HostLifecycle { running } => {
                     self.host_running = running;
                     if !running {
                         self.pending_host_consent = None;
                         self.ui_bridge.clear_host_consent_sender();
-                        self.push_log("Host task finished".to_string());
+                        // Revocation invalidates previously shared endpoint codes.
+                        // A subsequent hosting session uses a fresh private identity.
+                        self.host_seed = rand::random::<[u8; 32]>();
+                        self.generated_access_id = None;
+                        self.push_log("Host stopped; old access code invalidated".to_string());
                     }
                 }
                 RuntimeEvent::ClientLifecycle { running } => {
@@ -565,69 +584,10 @@ impl NexusGuiApp {
             });
 
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                status_chip(
-                    ui,
-                    if self.client_running {
-                        "CLIENT ACTIVE"
-                    } else {
-                        "CLIENT READY"
-                    },
-                    if self.client_running {
-                        Color32::from_rgb(38, 123, 92)
-                    } else {
-                        Color32::from_rgb(59, 74, 96)
-                    },
-                );
-                status_chip(
-                    ui,
-                    if self.host_running {
-                        "🟢 LIVE & AVAILABLE"
-                    } else {
-                        "⚪ STANDBY"
-                    },
-                    if self.host_running {
-                        Color32::from_rgb(33, 115, 70)
-                    } else {
-                        Color32::from_rgb(65, 84, 110)
-                    },
-                );
-                match self.network_topology {
-                    NetworkTopology::Undetermined => {
-                        status_chip(
-                            ui,
-                            "⚪ Network Status: Detecting...",
-                            Color32::from_rgb(97, 107, 124),
-                        );
-                    }
-                    NetworkTopology::OpenInternet => {
-                        status_chip(
-                            ui,
-                            "🟢 Network Status: Excellent (Open Internet)",
-                            Color32::from_rgb(33, 115, 70),
-                        );
-                    }
-                    NetworkTopology::ConeNatFriendly => {
-                        status_chip(
-                            ui,
-                            "🟢 Network Status: Excellent (P2P Direct)",
-                            Color32::from_rgb(33, 115, 70),
-                        );
-                    }
-                    NetworkTopology::SymmetricNatRestrictive => {
-                        status_chip(
-                            ui,
-                            "🟠 Network Status: Restrictive (Symmetric NAT - TCP Recommended)",
-                            Color32::from_rgb(217, 119, 6),
-                        );
-                    }
-                    NetworkTopology::UdpBlockedStrict => {
-                        status_chip(
-                            ui,
-                            "🔴 Network Status: Blocked UDP (HTTPS Fallback Enforced)",
-                            Color32::from_rgb(198, 40, 40),
-                        );
-                    }
-                }
+                status_chip(ui,
+                    if self.host_running { "Host listening" } else { "Host idle" },
+                    if self.host_running { Color32::from_rgb(33, 115, 70) }
+                    else { Color32::from_rgb(59, 74, 96) });
             });
         });
 
@@ -679,7 +639,7 @@ impl NexusGuiApp {
 
         let parsed = parse_connection_seed(access_id)
             .context("failed to parse generated access ID as connection seed")?;
-        let payload = build_connection_payload_bytes(&parsed.seed)?;
+        let payload = build_connection_payload_bytes(&parsed.endpoint_id)?;
 
         let seed = URL_SAFE_NO_PAD.encode(&payload);
         let mnemonic = encode_connection_seed_mnemonic(&payload)?;
@@ -696,73 +656,19 @@ impl NexusGuiApp {
             |ui| {
                 ui.vertical(|ui| {
                     ui.horizontal(|ui| {
-                        ui.label("Port:");
-                        ui.add(
-                            egui::DragValue::new(&mut self.host_port)
-                                .clamp_range(0..=65535)
-                                .speed(1),
-                        );
-
-                        ui.add_space(20.0);
                         ui.label("Capture FPS:");
                         ui.add(egui::Slider::new(&mut self.host_fps, MIN_FPS..=MAX_FPS));
                     });
-
-                    ui.add_space(8.0);
-                    ui.checkbox(&mut self.host_inject_input, "Enable host input injection");
-
                     ui.add_space(8.0);
                     ui.horizontal(|ui| {
-                        ui.label("Transport Mode:");
-                        egui::ComboBox::from_id_source("host_transport_mode_combo")
-                            .selected_text(match self.host_transport_mode {
-                                TransportMode::AutoSelect => "Auto-Select",
-                                TransportMode::ForceQuicP2p => "Force QUIC Direct P2P",
-                                TransportMode::ForceHttpsTcp => "Force HTTPS-TCP Fallback (Port 443)",
-                            })
-                            .show_ui(ui, |ui| {
-                                ui.selectable_value(&mut self.host_transport_mode, TransportMode::AutoSelect, "Auto-Select");
-                                ui.selectable_value(&mut self.host_transport_mode, TransportMode::ForceQuicP2p, "Force QUIC Direct P2P");
-                                ui.selectable_value(&mut self.host_transport_mode, TransportMode::ForceHttpsTcp, "Force HTTPS-TCP Fallback (Port 443)");
-                            });
+                        ui.label("Video max width:");
+                        ui.add(egui::Slider::new(&mut self.host_max_width, 960..=1920).suffix(" px"));
                     });
-
+                    ui.label("Lower resolution reduces latency and bandwidth. 1280 px is the recommended support setting.");
+                    ui.checkbox(&mut self.host_inject_input, "Allow keyboard and mouse only after I approve the technician");
                     ui.add_space(8.0);
-                    ui.horizontal(|ui| {
-                        ui.label("Advertised Address:");
-                        ui.add_sized(
-                            [ui.available_width() - 160.0, 24.0],
-                            egui::TextEdit::singleline(&mut self.host_advertise_addr_input)
-                                .hint_text("e.g. 12.34.56.78:5000"),
-                        );
-
-                        let detect_btn_label = if self.detecting_public_ip.load(Ordering::Relaxed) {
-                            "Detecting..."
-                        } else {
-                            "Run Diagnostics"
-                        };
-
-                        if ui
-                            .add_enabled(
-                                !self.detecting_public_ip.load(Ordering::Relaxed),
-                                egui::Button::new(detect_btn_label),
-                            )
-                            .clicked()
-                        {
-                            self.detecting_public_ip.store(true, Ordering::Relaxed);
-                            let _ = self.runtime_cmd_tx.try_send(RuntimeCommand::RunDiagnostics);
-                        }
-                    });
-
-                    ui.add_space(8.0);
-                    ui.horizontal(|ui| {
-                        ui.label("Client Address (for Hole Punching):");
-                        ui.add_sized(
-                            [ui.available_width(), 24.0],
-                            egui::TextEdit::singleline(&mut self.client_punch_addr_input)
-                                .hint_text("e.g. 12.34.56.78:54321 (optional)"),
-                        );
-                    });
+                    ui.label("Transport: encrypted iroh QUIC (automatic direct P2P / relay fallback)");
+                    ui.label("Connection identity is generated after Start Hosting. No IP or port forwarding is normally required.");
 
                     ui.add_space(12.0);
 
@@ -779,9 +685,16 @@ impl NexusGuiApp {
                                 .rounding(Rounding::same(10.0))
                                 .fill(Color32::from_rgb(42, 132, 92)),
                         )
-                        .clicked()
+                        .clicked() && !self.host_running
                     {
                         self.start_hosting_clicked();
+                    }
+                    if self.host_running && ui.button("Stop hosting / Revoke control").clicked() {
+                        if let Err(error) = self.runtime_cmd_tx.try_send(RuntimeCommand::StopHosting) {
+                            self.push_log(format!("Failed to revoke hosting: {error}"));
+                        } else {
+                            self.set_status("Revoking host session...");
+                        }
                     }
                 });
             },
@@ -810,7 +723,7 @@ impl NexusGuiApp {
                     }
 
                     ui.vertical(|ui| {
-                        ui.label("Connection Seed (Base64):");
+                        ui.label("Public Access ID (share with technician):");
                         let mut seed_display = export_seed.clone();
                         ui.add(
                             egui::TextEdit::multiline(&mut seed_display)
@@ -821,7 +734,7 @@ impl NexusGuiApp {
 
                         if show_mnemonic {
                             ui.add_space(4.0);
-                            ui.label("Mnemonic Phrase (24 Words):");
+                            ui.label("Public ID as 24 words (optional):");
                             let mut mnem_display = mnemonic.clone();
                             ui.add(
                                 egui::TextEdit::multiline(&mut mnem_display)
@@ -836,7 +749,7 @@ impl NexusGuiApp {
                         ui.horizontal_wrapped(|ui| {
                             if ui
                                 .add(
-                                    egui::Button::new("Copy Seed")
+                                    egui::Button::new("Copy Access ID")
                                         .rounding(Rounding::same(10.0))
                                         .fill(Color32::from_rgb(60, 108, 171)),
                                 )
@@ -846,7 +759,7 @@ impl NexusGuiApp {
                                     Ok(()) => {
                                         self.copied_notice_until =
                                             Some(Instant::now() + Duration::from_secs(2));
-                                        self.set_status("Connection seed copied to clipboard");
+                                        self.set_status("Public Access ID copied to clipboard");
                                     }
                                     Err(error) => {
                                         self.push_log(format!("Clipboard copy failed: {error}"));
@@ -857,7 +770,7 @@ impl NexusGuiApp {
                             if show_mnemonic {
                                 if ui
                                     .add(
-                                        egui::Button::new("Copy Mnemonic")
+                                        egui::Button::new("Copy 24-word Public ID")
                                             .rounding(Rounding::same(10.0))
                                             .fill(Color32::from_rgb(48, 117, 173)),
                                     )
@@ -941,14 +854,14 @@ impl NexusGuiApp {
 
                         if let Some(texture) = &self.qr_code_texture {
                             ui.vertical_centered(|ui| {
-                                let side = 240.0;
+                                let side = ui.available_width().min(220.0).max(96.0);
                                 ui.image((texture.id(), egui::vec2(side, side)));
                             });
                         }
                     });
                 } else {
                     ui.label(
-                        RichText::new("Start hosting to generate credentials and QR code")
+                        RichText::new("Click Start Hosting to generate a shareable public Access ID and QR code")
                             .color(Color32::from_rgb(176, 190, 207)),
                     );
                 }
@@ -963,27 +876,12 @@ impl NexusGuiApp {
             "Import connection seed from text, file, or QR payload",
             |ui| {
                 ui.vertical(|ui| {
-                    ui.label("Connection Seed / Mnemonic Phrase / Deep Link:");
+                    ui.label("Remote Host public Access ID / mnemonic / link:");
                     ui.add_sized(
-                        [ui.available_width(), 80.0],
+                        [ui.available_width().max(100.0), 90.0],
                         egui::TextEdit::multiline(&mut self.access_id_input)
-                            .hint_text("Paste connection seed, mnemonic phrase, deep link, or legacy Access ID"),
+                            .hint_text("Paste the public Access ID copied from the remote Host"),
                     );
-
-                    if !self.client_public_addr_display.is_empty() {
-                        ui.add_space(4.0);
-                        ui.horizontal(|ui| {
-                            ui.label(RichText::new("My Public UDP Address (share this with Host):").color(Color32::from_rgb(140, 160, 190)));
-                            ui.label(RichText::new(&self.client_public_addr_display).strong().color(Color32::from_rgb(230, 239, 251)));
-                            if ui.button("Copy").clicked() {
-                                if let Err(e) = copy_text_to_clipboard(&self.client_public_addr_display) {
-                                    self.push_log(format!("Failed to copy public address: {}", e));
-                                } else {
-                                    self.set_status("Public UDP address copied to clipboard");
-                                }
-                            }
-                        });
-                    }
 
                     let suggestions = {
                         let current_text = &self.access_id_input;
@@ -1116,20 +1014,9 @@ impl NexusGuiApp {
                     });
 
                     ui.add_space(8.0);
-                    ui.horizontal(|ui| {
-                        ui.label("Transport Mode:");
-                        egui::ComboBox::from_id_source("client_transport_mode_combo")
-                            .selected_text(match self.host_transport_mode {
-                                TransportMode::AutoSelect => "Auto-Select",
-                                TransportMode::ForceQuicP2p => "Force QUIC Direct P2P",
-                                TransportMode::ForceHttpsTcp => "Force HTTPS-TCP Fallback (Port 443)",
-                            })
-                            .show_ui(ui, |ui| {
-                                ui.selectable_value(&mut self.host_transport_mode, TransportMode::AutoSelect, "Auto-Select");
-                                ui.selectable_value(&mut self.host_transport_mode, TransportMode::ForceQuicP2p, "Force QUIC Direct P2P");
-                                ui.selectable_value(&mut self.host_transport_mode, TransportMode::ForceHttpsTcp, "Force HTTPS-TCP Fallback (Port 443)");
-                            });
-                    });
+                    ui.label("Transport: iroh QUIC with automatic direct/relay negotiation");
+                    ui.label("Paste the public Access ID from the remote Host, then Connect.");
+                    ui.add_space(8.0);
 
                     ui.add_space(10.0);
 
@@ -1146,9 +1033,16 @@ impl NexusGuiApp {
                                 .rounding(Rounding::same(10.0))
                                 .fill(Color32::from_rgb(42, 132, 92)),
                         )
-                        .clicked()
+                        .clicked() && !self.client_running
                     {
                         self.connect_clicked();
+                    }
+                    if self.client_running && ui.button("Disconnect now").clicked() {
+                        if let Err(error) = self.runtime_cmd_tx.try_send(RuntimeCommand::DisconnectClient) {
+                            self.push_log(format!("Disconnect request failed: {error}"));
+                        } else {
+                            self.set_status("Disconnecting...");
+                        }
                     }
                 });
             },
@@ -1163,28 +1057,24 @@ impl NexusGuiApp {
             |ui| {
                 ui.vertical(|ui| {
                     ui.group(|ui| {
-                        ui.label(RichText::new("Active Connection Parameters").strong().size(13.0));
-                        ui.horizontal(|ui| {
-                            ui.label("Protocol:");
-                            ui.label(RichText::new(&self.telemetry_protocol).strong().color(Color32::from_rgb(95, 194, 242)));
-                            ui.add_space(15.0);
-                            ui.label("Local Socket:");
-                            ui.label(RichText::new(&self.telemetry_local_addr).strong().color(Color32::from_rgb(230, 239, 251)));
-                            ui.add_space(15.0);
-                            ui.label("Latency:");
+                        ui.label(RichText::new("Connection details").strong().size(13.0));
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label(format!("Protocol: {}", self.telemetry_protocol));
                             if let Some(latency) = self.telemetry_latency_ms {
-                                ui.label(RichText::new(format!("{} ms", latency)).strong().color(Color32::from_rgb(46, 125, 50)));
-                            } else {
-                                ui.label(RichText::new("N/A").strong().color(Color32::from_rgb(140, 160, 190)));
+                                ui.label(format!("QUIC handshake: {} ms (not screen latency)", latency));
                             }
                         });
+                        ui.label("Local endpoint identity:");
+                        ui.add(egui::Label::new(
+                            RichText::new(&self.telemetry_local_addr).monospace().size(11.0)
+                        ).wrap(true));
                     });
                     ui.add_space(6.0);
                     egui::ScrollArea::vertical()
                         .max_height(200.0)
                         .show(ui, |ui| {
                             for line in self.session_logs.iter().rev().take(max_lines) {
-                                ui.label(RichText::new(line).size(12.5));
+                                ui.add(egui::Label::new(RichText::new(line).size(12.5)).wrap(true));
                             }
                         });
                 });
@@ -1193,48 +1083,31 @@ impl NexusGuiApp {
     }
 
     fn draw_dashboard(&mut self, ui: &mut egui::Ui) {
-        let screen_width = ui.ctx().screen_rect().width();
-        if screen_width >= 1100.0 {
-            ui.columns(2, |columns| {
-                columns[0].vertical(|ui| {
-                    self.draw_host_controls_card(ui);
-                    ui.add_space(10.0);
-                    self.draw_oob_exchange_card(ui);
-                    ui.add_space(10.0);
-                    self.draw_telemetry_card(ui, "Host Live Telemetry", 35);
-                });
-
-                columns[1].vertical(|ui| {
-                    self.draw_client_request_card(ui);
-                    ui.add_space(10.0);
-                    self.draw_telemetry_card(ui, "Connection Telemetry", 35);
-                });
-            });
-        } else {
+        // The two tabs are alternative workflows. Never render both side by
+        // side: on 1080p screens this overflows horizontally and hides prompts.
+        ui.vertical(|ui| {
+            ui.set_width(ui.available_width());
             match self.active_tab {
                 ActiveTab::HostMode => {
-                    ui.vertical(|ui| {
-                        self.draw_host_controls_card(ui);
-                        ui.add_space(10.0);
-                        self.draw_oob_exchange_card(ui);
-                        ui.add_space(10.0);
-                        self.draw_telemetry_card(ui, "Live Telemetry", 35);
-                    });
+                    self.draw_host_controls_card(ui);
+                    ui.add_space(12.0);
+                    self.draw_oob_exchange_card(ui);
+                    ui.add_space(12.0);
+                    self.draw_telemetry_card(ui, "Host connection events", 35);
                 }
                 ActiveTab::ClientMode => {
-                    ui.vertical(|ui| {
-                        self.draw_client_request_card(ui);
-                        ui.add_space(10.0);
-                        self.draw_telemetry_card(ui, "Connection Telemetry", 50);
-                    });
+                    self.draw_client_request_card(ui);
+                    ui.add_space(12.0);
+                    self.draw_telemetry_card(ui, "Technician connection events", 35);
                 }
             }
-        }
+        });
     }
 
     fn start_hosting_clicked(&mut self) {
         let command = RuntimeCommand::StartHosting(HostRuntimeConfig {
             fps: self.host_fps,
+            max_width: self.host_max_width,
             inject_input: self.host_inject_input,
             seed: self.host_seed,
         });
@@ -1290,36 +1163,19 @@ impl NexusGuiApp {
 
     fn draw_status_bar(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
-            status_chip(
-                ui,
-                if self.host_running { "🟢 LIVE - AVAILABLE FOR INCOMING SESSIONS" } else { "⚪ STANDBY" },
-                if self.host_running {
-                    Color32::from_rgb(33, 115, 70)
-                } else {
-                    Color32::from_rgb(66, 84, 107)
-                },
-            );
-
-            status_chip(
-                ui,
-                if self.client_running {
-                    "CLIENT RUNNING"
-                } else {
-                    "CLIENT STANDBY"
-                },
-                if self.client_running {
-                    Color32::from_rgb(38, 123, 92)
-                } else {
-                    Color32::from_rgb(66, 84, 107)
-                },
-            );
-
-            ui.add_space(10.0);
-            ui.label(
-                RichText::new(&self.status_message)
-                    .color(Color32::from_rgb(230, 239, 251))
-                    .size(13.0),
-            );
+            let (label, fill) = match self.active_tab {
+                ActiveTab::HostMode if self.host_running =>
+                    ("HOST READY", Color32::from_rgb(33, 115, 70)),
+                ActiveTab::ClientMode if self.client_running =>
+                    ("CONNECTING / ACTIVE", Color32::from_rgb(38, 123, 92)),
+                _ => ("IDLE", Color32::from_rgb(59, 74, 96)),
+            };
+            status_chip(ui, label, fill);
+            ui.separator();
+            ui.add(egui::Label::new(
+                RichText::new(&self.status_message).size(12.0)
+            ).truncate(true).sense(egui::Sense::hover()))
+              .on_hover_text(&self.status_message);
         });
     }
 
@@ -1403,22 +1259,23 @@ impl NexusGuiApp {
             return;
         };
 
-        egui::Window::new("Host Consent Required")
+        egui::Window::new("Remote support: your approval is required")
             .collapsible(false)
             .resizable(false)
             .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
             .show(ctx, |ui| {
+                ui.set_max_width(440.0);
                 ui.label(
-                    RichText::new("Incoming Remote Session")
+                    RichText::new("Technician requests access to this computer")
                         .strong()
-                        .size(18.0),
+                        .size(19.0),
                 );
                 ui.add_space(6.0);
-                ui.label(format!("Requester: {}", prompt.requester_id));
-                ui.label(format!("Remote Address: {}", prompt.remote_addr));
-                ui.label(format!("Target Session: {}", prompt.target_session));
+                ui.add(egui::Label::new(format!("Technician: {}", prompt.requester_id)).wrap(true));
+                ui.add(egui::Label::new(format!("Peer identity: {}", prompt.remote_addr)).wrap(true));
+                ui.add(egui::Label::new(format!("Session: {}", prompt.target_session)).wrap(true));
                 ui.add_space(10.0);
-                ui.label("Approve to activate desktop stream and optional input control.");
+                ui.add(egui::Label::new("Allow screen viewing? Keyboard and mouse control only if explicitly enabled in Host settings. You may revoke at any time.").wrap(true));
                 ui.add_space(12.0);
 
                 ui.horizontal(|ui| {
@@ -1685,6 +1542,8 @@ async fn runtime_dispatch_loop(
 ) {
     let host_running = Arc::new(AtomicBool::new(false));
     let client_running = Arc::new(AtomicBool::new(false));
+    let mut host_task: Option<tokio::task::JoinHandle<()>> = None;
+    let mut client_task: Option<tokio::task::JoinHandle<()>> = None;
 
     // Spawn STUN network topology diagnostic immediately on startup
     let event_tx_clone = runtime_event_tx.clone();
@@ -1712,7 +1571,7 @@ async fn runtime_dispatch_loop(
                 let host_running_flag = Arc::clone(&host_running);
                 let bridge = Arc::clone(&ui_bridge);
 
-                tokio::spawn(async move {
+                host_task = Some(tokio::spawn(async move {
                     let _ = event_tx.send(RuntimeEvent::HostLifecycle { running: true }).await;
                     let _ = event_tx
                         .send(RuntimeEvent::SessionStatus(
@@ -1740,7 +1599,7 @@ async fn runtime_dispatch_loop(
                                 .await;
                         }
                     }
-                });
+                }));
             }
             RuntimeCommand::ConnectWithAccessId {
                 access_id,
@@ -1776,7 +1635,7 @@ async fn runtime_dispatch_loop(
                 let client_running_flag = Arc::clone(&client_running);
                 let bridge = Arc::clone(&ui_bridge);
 
-                tokio::spawn(async move {
+                client_task = Some(tokio::spawn(async move {
                     let _ = event_tx
                         .send(RuntimeEvent::ClientLifecycle { running: true })
                         .await;
@@ -1815,7 +1674,7 @@ async fn runtime_dispatch_loop(
                                 .await;
                         }
                     }
-                });
+                }));
             }
             RuntimeCommand::RunDiagnostics => {
                 let event_tx = runtime_event_tx.clone();
@@ -1823,6 +1682,26 @@ async fn runtime_dispatch_loop(
                     let (topology, public_addr) = run_diagnostics(0).await;
                     let _ = event_tx.send(RuntimeEvent::DiagnosticsCompleted { topology, public_addr }).await;
                 });
+            }
+            RuntimeCommand::StopHosting => {
+                if let Some(task) = host_task.take() {
+                    task.abort();
+                    let _ = task.await;
+                }
+                host_running.store(false, Ordering::Release);
+                ui_bridge.clear_host_consent_sender();
+                let _ = runtime_event_tx.send(RuntimeEvent::HostLifecycle { running: false }).await;
+                let _ = runtime_event_tx.send(RuntimeEvent::SessionStatus("Host session revoked".into())).await;
+            }
+            RuntimeCommand::DisconnectClient => {
+                if let Some(task) = client_task.take() {
+                    task.abort();
+                    let _ = task.await;
+                }
+                client_running.store(false, Ordering::Release);
+                ui_bridge.clear_client_permission_sender();
+                let _ = runtime_event_tx.send(RuntimeEvent::ClientLifecycle { running: false }).await;
+                let _ = runtime_event_tx.send(RuntimeEvent::SessionStatus("Client disconnected".into())).await;
             }
         }
     }
@@ -1834,7 +1713,7 @@ pub struct PacketSender(Arc<tokio::sync::Mutex<SendStream>>);
 impl PacketSender {
     pub async fn send_control(&self, msg: &ControlMessage) -> Result<()> {
         let mut guard = self.0.lock().await;
-        send_message(&mut *guard, msg).await
+        send_message_limited(&mut *guard, msg, MAX_CONTROL_MESSAGE_BYTES).await
     }
 }
 
@@ -1854,7 +1733,7 @@ pub struct PacketReceiver(Arc<tokio::sync::Mutex<RecvStream>>);
 impl PacketReceiver {
     pub async fn recv_control(&self) -> Result<ControlMessage> {
         let mut guard = self.0.lock().await;
-        recv_message::<ControlMessage>(&mut *guard).await
+        recv_message_limited::<ControlMessage>(&mut *guard, MAX_CONTROL_MESSAGE_BYTES).await
     }
 }
 
@@ -1878,8 +1757,6 @@ async fn run_server_session(
         warn!(requested_fps = config.fps, fps, "fps value clamped to supported range");
     }
 
-    let frame_interval_ms = (1000_u64 / fps as u64).max(1);
-
     // Derive SecretKey and session ID from the host seed
     let (secret_key, session_id) = derive_keys_from_seed(&config.seed);
     let credentials = SessionCredentials { session_id: session_id.clone() };
@@ -1898,7 +1775,7 @@ async fn run_server_session(
     runtime_event_tx
         .send(RuntimeEvent::HostReady {
             advertised_addr: format!("iroh:{}", node_id),
-            fingerprint: "iroh-identity".to_string(), // Dummy for iroh identity
+            fingerprint: node_id.to_string(), // Actual authenticated endpoint public identity
             session_id: credentials.session_id.clone(),
             access_id,
             fps,
@@ -1907,11 +1784,38 @@ async fn run_server_session(
         .await
         .ok();
 
+    loop {
+        let result = run_host_peer_session(
+            &endpoint, &config, &credentials, &runtime_event_tx, &ui_bridge, fps,
+        ).await;
+        if let Err(error) = result {
+            warn!(?error, "incoming session ended with error; listener remains available");
+            let _ = runtime_event_tx.send(RuntimeEvent::SessionStatus(
+                format!("Session ended: {error}; awaiting another connection")
+            )).await;
+            time::sleep(Duration::from_millis(250)).await;
+        } else {
+            let _ = runtime_event_tx.send(RuntimeEvent::SessionStatus(
+                "Session ended; awaiting another connection".to_string()
+            )).await;
+        }
+    }
+}
+
+async fn run_host_peer_session(
+    endpoint: &iroh::Endpoint,
+    config: &HostRuntimeConfig,
+    credentials: &SessionCredentials,
+    runtime_event_tx: &mpsc::Sender<RuntimeEvent>,
+    ui_bridge: &Arc<UiBridge>,
+    fps: u16,
+) -> Result<()> {
     let session_state = Arc::new(SessionStateMachine::new());
     session_state.transition(SessionState::Authenticating)?;
 
     // Accept QUIC connection via iroh
-    let connection = accept_connection(&endpoint).await?;
+    // Waiting for a user-initiated connection is normal idle time, not a timeout.
+    let connection = accept_connection(endpoint).await?;
     let remote_addr_str = format!("iroh:{}", connection.remote_id());
 
     let handshake_latency = 0u128; // iroh establishes connection in background
@@ -1923,9 +1827,8 @@ async fn run_server_session(
 
     let quic_conn_to_close = Some(connection.clone());
 
-    let (control_s, control_r) = connection
-        .accept_bi()
-        .await
+    let (control_s, control_r) = time::timeout(HANDSHAKE_TIMEOUT, connection.accept_bi())
+        .await.context("control stream handshake timed out")?
         .context("client did not open a control stream")?;
     let frame_s = connection
         .open_uni()
@@ -1936,7 +1839,8 @@ async fn run_server_session(
     let control_recv = PacketReceiver(Arc::new(tokio::sync::Mutex::new(control_r)));
     let frame_stream_send = FrameSender(Arc::new(tokio::sync::Mutex::new(frame_s)));
 
-    let incoming_auth = wait_for_auth_request(&control_recv).await?;
+    let incoming_auth = time::timeout(HANDSHAKE_TIMEOUT, wait_for_auth_request(&control_recv))
+        .await.context("authentication request timed out")??;
 
     runtime_event_tx
         .send(RuntimeEvent::IncomingSession {
@@ -1988,7 +1892,8 @@ async fn run_server_session(
     .await
     .context("failed to send access request to client")?;
 
-    let client_approved = wait_for_client_access_decision(&control_recv).await?;
+    let client_approved = time::timeout(Duration::from_secs(210), wait_for_client_access_decision(&control_recv))
+        .await.context("remote permission decision timed out")??;
     if !client_approved {
         let _ = session_state.transition(SessionState::Rejected);
         runtime_event_tx
@@ -2056,7 +1961,7 @@ async fn run_server_session(
     let input_for_control = Arc::clone(&input);
     let inject_input = config.inject_input;
     let control_send_clone = control_send.clone();
-    let control_task = tokio::spawn(async move {
+    let mut control_task = AbortOnDrop(tokio::spawn(async move {
         loop {
             match control_recv.recv_control().await {
                 Ok(ControlMessage::SimulatedMouseMove { x_norm, y_norm }) => {
@@ -2070,7 +1975,7 @@ async fn run_server_session(
 
                     match apply_mouse_event(&input_for_control, x_norm, y_norm, inject_input) {
                         Ok(preview) => {
-                            info!(
+                            tracing::debug!(
                                 x_norm,
                                 y_norm,
                                 absolute_x = preview.absolute_x,
@@ -2088,16 +1993,16 @@ async fn run_server_session(
                         }
                     }
 
-                    if let Err(error) = control_send_clone.send_control(
-                        &ControlMessage::Ack(format!(
-                            "{} move to ({x_norm:.3}, {y_norm:.3})",
-                            if inject_input { "injected" } else { "previewed" }
-                        )),
-                    )
-                    .await
-                    {
-                        error!(?error, "failed to send mouse acknowledgement");
-                        break;
+                    // Do not flood the control channel with acknowledgements for
+                    // every mouse movement. QUIC already provides reliable delivery.
+                }
+                Ok(ControlMessage::MouseButtonEvent { button, pressed }) => {
+                    if !session_state_for_control.is_active() || !inject_input {
+                        warn!(button, pressed, "blocked mouse click without active authorized control");
+                        continue;
+                    }
+                    if let Err(error) = input_for_control.inject_mouse_button(button, pressed) {
+                        warn!(?error, button, pressed, "mouse click injection failed");
                     }
                 }
                 Ok(ControlMessage::SimulatedKeyEvent {
@@ -2153,14 +2058,35 @@ async fn run_server_session(
                 }
             }
         }
-    });
+    }));
 
     let mut capturer = ScreenCapturer::new()?;
-    let mut ticker = time::interval(Duration::from_millis(frame_interval_ms));
+    let mut control_task_finished = false;
+    let mut capture_failures = 0u32;
+    let mut pacer = adaptive::AdaptiveFrameRate::new(fps);
+    let mut delta_encoder = delta::DeltaEncoder::new();
+    let mut video_sequence = 0u64;
+    let mut last_video_packet = Instant::now();
+    let mut stats_started = Instant::now();
+    let mut stats_full = 0u64;
+    let mut stats_rect = 0u64;
+    let mut stats_tiles = 0u64;
+    let mut stats_keepalive = 0u64;
+    let mut stats_idle_ticks = 0u64;
+    let mut stats_bytes = 0u64;
+    let mut stats_max_send_ms = 0u128;
+    let mut ticker = time::interval(pacer.interval());
     ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
     loop {
-        ticker.tick().await;
+        tokio::select! {
+            _ = ticker.tick() => {},
+            _ = &mut control_task.0 => {
+                control_task_finished = true;
+                info!("control stream ended; shutting down screen capture");
+                break;
+            }
+        }
 
         if !session_state.is_active() {
             error!(
@@ -2170,21 +2096,94 @@ async fn run_server_session(
             continue;
         }
 
-        let frame = capturer.capture_frame()?;
-        let packet = FramePacket {
-            sequence: frame.frame_index,
-            width: frame.width,
-            height: frame.height,
-            stride: frame.stride,
-            pixels: frame.pixels.to_vec(),
+        let started = Instant::now();
+        let frame = match capturer.capture_changed_frame() {
+            Ok(frame) => {
+                capture_failures = 0;
+                frame
+            }
+            Err(error) => {
+                capture_failures = capture_failures.saturating_add(1);
+                if capture_failures == 1 || capture_failures % 20 == 0 {
+                    warn!(?error, capture_failures, "desktop capture failed; attempting recovery");
+                }
+                if capture_failures % 3 == 0 {
+                    if let Ok(recreated) = ScreenCapturer::new() {
+                        capturer = recreated;
+                    }
+                }
+                if capture_failures >= 600 {
+                    return Err(anyhow!("desktop capture could not recover after 600 attempts"));
+                }
+                time::sleep(Duration::from_millis(200)).await;
+                continue;
+            }
         };
+        let maybe_packet = if let Some(frame) = frame {
+            // Stable size preserves spatial delta coordinates between captures.
+            let width_limit = (config.max_width as u32).clamp(960, 1920);
+            let mut frame = frame_codec::fit_desktop(frame, width_limit, width_limit * 5 / 8)?;
+            frame.frame_index = video_sequence;
+            delta_encoder.encode(frame)?
+        } else {
+            None
+        };
+        let packet = match maybe_packet {
+            Some(packet) => packet,
+            None if last_video_packet.elapsed() >= Duration::from_secs(10) => {
+                // No changed desktop pixels: keep QUIC alive with a tiny
+                // header rather than duplicating a full image.
+                delta::DeltaEncoder::heartbeat(video_sequence)
+            }
+            None => {
+                stats_idle_ticks += 1;
+                continue;
+            }
+        };
+        video_sequence = video_sequence.wrapping_add(1);
+        last_video_packet = Instant::now();
 
-        if let Err(error) = frame_stream_send.send_frame(&packet).await {
-            info!(?error, "frame stream ended");
-            break;
+        match time::timeout(Duration::from_secs(8), frame_stream_send.send_frame(&packet)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                info!(?error, "frame stream ended");
+                break;
+            }
+            Err(_) => {
+                warn!("frame send stalled for 8s; closing session instead of building infinite latency");
+                break;
+            }
         }
 
-        info!(sequence = packet.sequence, bytes = packet.pixels.len(), "sent frame");
+        match packet.stride {
+            1 => stats_rect += 1,
+            2 => stats_keepalive += 1,
+            3 => stats_tiles += 1,
+            _ => stats_full += 1,
+        }
+        stats_bytes += packet.pixels.len() as u64;
+        stats_max_send_ms = stats_max_send_ms.max(started.elapsed().as_millis());
+        if stats_started.elapsed() >= Duration::from_secs(5) {
+            let _ = runtime_event_tx.send(RuntimeEvent::SessionStatus(format!(
+                "Video {}fps: key={} patch={} tiles={} idle={} keepalive={} transmitted={} KiB peak-frame={}ms",
+                pacer.current(), stats_full, stats_rect, stats_tiles, stats_idle_ticks,
+                stats_keepalive, stats_bytes / 1024, stats_max_send_ms,
+            ))).await;
+            stats_started = Instant::now();
+            stats_full = 0;
+            stats_rect = 0;
+            stats_tiles = 0;
+            stats_keepalive = 0;
+            stats_idle_ticks = 0;
+            stats_bytes = 0;
+            stats_max_send_ms = 0;
+        }
+        if pacer.observe(started.elapsed()) {
+            info!(fps = pacer.current(), "adaptive frame pacing updated");
+            ticker = time::interval(pacer.interval());
+            ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        }
+        tracing::debug!(sequence = packet.sequence, bytes = packet.pixels.len(), "sent frame");
     }
 
     input.set_state(InputSessionState::Inactive);
@@ -2192,7 +2191,10 @@ async fn run_server_session(
     if let Some(ref c) = quic_conn_to_close {
         c.close(0u32.into(), b"server shutdown");
     }
-    let _ = control_task.await;
+    if !control_task_finished {
+        control_task.0.abort();
+        let _ = (&mut control_task.0).await;
+    }
     Ok(())
 }
 
@@ -2202,19 +2204,36 @@ async fn run_client_session(
     runtime_event_tx: mpsc::Sender<RuntimeEvent>,
     ui_bridge: Arc<UiBridge>,
 ) -> Result<()> {
-    let (secret_key, session_id) = derive_keys_from_seed(&parsed_access_id.seed);
-    let remote_id = secret_key.public();
+    let remote_id = iroh::PublicKey::from_bytes(&parsed_access_id.endpoint_id)
+        .context("connection ID is not a valid endpoint public key")?;
+    let session_id = derive_session_id(&parsed_access_id.endpoint_id);
 
     // Create client endpoint
     let endpoint = create_client_endpoint().await?;
 
-    let default_relay: iroh::RelayUrl = "https://use.iroh.link/".parse().context("invalid default relay URL")?;
-    let target_addr = EndpointAddr::new(remote_id).with_relay_url(default_relay);
-
+    // N0 provides endpoint discovery, NAT traversal and managed relay fallback.
+    // Avoid pinning a guessed relay hostname that may not be the host's actual home relay.
     let handshake_start = Instant::now();
-
-    // Connect to peer via iroh
-    let connection = connect_to_peer(&endpoint, target_addr).await?;
+    let mut last_connect_error = String::from("no connection attempt completed");
+    let mut connection = None;
+    for attempt in 0..3u32 {
+        let target_addr = EndpointAddr::new(remote_id.clone());
+        match time::timeout(HANDSHAKE_TIMEOUT, connect_to_peer(&endpoint, target_addr)).await {
+            Ok(Ok(connected)) => {
+                connection = Some(connected);
+                break;
+            }
+            Ok(Err(error)) => last_connect_error = error.to_string(),
+            Err(_) => last_connect_error = "P2P/relay connection timed out".to_string(),
+        }
+        warn!(attempt = attempt + 1, error = %last_connect_error, "peer connection attempt failed");
+        if attempt < 2 {
+            time::sleep(Duration::from_secs(1u64 << attempt)).await;
+        }
+    }
+    let connection = connection.ok_or_else(|| anyhow!(
+        "failed to establish P2P/relay connection after three attempts: {last_connect_error}"
+    ))?;
     let remote_addr_str = format!("iroh:{}", connection.remote_id());
 
     let handshake_latency = handshake_start.elapsed().as_millis();
@@ -2227,18 +2246,14 @@ async fn run_client_session(
     let quic_conn_to_close = Some(connection.clone());
 
     let run_result = async move {
-        let (control_s, control_r) = connection
-            .open_bi()
-            .await
+        let (control_s, control_r) = time::timeout(HANDSHAKE_TIMEOUT, connection.open_bi())
+            .await.context("opening control stream timed out")?
             .context("failed to open control stream")?;
-        let frame_r = connection
-            .accept_uni()
-            .await
-            .context("server did not open a frame stream")?;
-
+        // QUIC streams become visible to the peer only when data is sent.
+        // Do not wait for video before Hello/AuthRequest: the host awaits
+        // that control stream and will send video only after human consent.
         let control_send = PacketSender(Arc::new(tokio::sync::Mutex::new(control_s)));
         let control_recv = PacketReceiver(Arc::new(tokio::sync::Mutex::new(control_r)));
-        let frame_recv = FrameReceiver(Arc::new(tokio::sync::Mutex::new(frame_r)));
 
         let session_state = Arc::new(SessionStateMachine::new());
         session_state.transition(SessionState::Authenticating)?;
@@ -2266,46 +2281,44 @@ async fn run_client_session(
         )
         .await?;
 
-        wait_for_auth_result(&control_recv).await?;
+        time::timeout(HANDSHAKE_TIMEOUT, wait_for_auth_result(&control_recv))
+            .await.context("waiting for host authentication timed out")??;
 
-        let requested_session_id = wait_for_access_request(&control_recv).await?;
-        let client_approved = request_client_permission(
-            remote_addr_str.clone(),
-            &requested_session_id,
-            &runtime_event_tx,
-            &ui_bridge,
-        )
-        .await?;
-
-        control_send.send_control(
-            &ControlMessage::AccessDecision {
-                approved: client_approved,
-            },
-        )
-        .await
-        .context("failed to send client access decision")?;
-
-        if !client_approved {
-            let _ = session_state.transition(SessionState::Rejected);
-            info!("local client denied access request");
-            if let Some(ref c) = quic_conn_to_close {
-                c.close(3u32.into(), b"client denied access request");
-            }
-            let _ = session_state.transition(SessionState::Terminated);
-            return Ok(());
+        let requested_session_id = time::timeout(HANDSHAKE_TIMEOUT, wait_for_access_request(&control_recv))
+            .await.context("waiting for access request timed out")??;
+        if requested_session_id != session_id {
+            bail!("host requested an unexpected session identity");
         }
+
+        // The technician's explicit Connect click is the local permission
+        // to REQUEST service, not permission to control the remote machine.
+        // Requiring a second self-approval dialog here delays the real
+        // remote consent prompt and makes a healthy connection look hung.
+        // The remote Host MUST still grant on-screen SessionConsent.
+        control_send.send_control(&ControlMessage::AccessDecision { approved: true })
+            .await.context("failed to request remote host approval")?;
+        let _ = runtime_event_tx.send(RuntimeEvent::SessionStatus(
+            "Connected to Host; waiting for approval on the REMOTE computer".to_string()
+        )).await;
 
         session_state.transition(SessionState::PendingConsent)?;
 
-        wait_for_session_consent(&control_recv).await?;
+        time::timeout(Duration::from_secs(210), wait_for_session_consent(&control_recv))
+            .await.context("waiting for on-screen host consent timed out")??;
         session_state.transition(SessionState::Active)?;
+
+        // The server has received approval and can now start streaming video.
+        let frame_r = time::timeout(Duration::from_secs(45), connection.accept_uni())
+            .await.context("approved session did not start its video stream")?
+            .context("server failed to provide a video stream")?;
+        let frame_recv = FrameReceiver(Arc::new(tokio::sync::Mutex::new(frame_r)));
 
         let (viewer_frame_tx, mut viewer_input_rx) =
             spawn_remote_viewer("NexusP2P - Remote Session [Active]")?;
 
         let session_state_for_input = Arc::clone(&session_state);
         let control_send_clone = control_send.clone();
-        let input_task = tokio::spawn(async move {
+        let mut input_task = AbortOnDrop(tokio::spawn(async move {
             while let Some(event) = viewer_input_rx.recv().await {
                 if !session_state_for_input.is_active() {
                     error!(
@@ -2318,6 +2331,9 @@ async fn run_client_session(
                 let message = match event {
                     ViewerInputEvent::MouseMove { x_norm, y_norm } => {
                         ControlMessage::SimulatedMouseMove { x_norm, y_norm }
+                    }
+                    ViewerInputEvent::MouseButton { button, pressed } => {
+                        ControlMessage::MouseButtonEvent { button, pressed }
                     }
                     ViewerInputEvent::Keyboard {
                         virtual_key,
@@ -2333,10 +2349,10 @@ async fn run_client_session(
                     break;
                 }
             }
-        });
+        }));
 
         let control_recv_clone = control_recv.clone();
-        let ack_task = tokio::spawn(async move {
+        let mut ack_task = AbortOnDrop(tokio::spawn(async move {
             loop {
                 match control_recv_clone.recv_control().await {
                     Ok(ControlMessage::Ack(text)) => {
@@ -2351,11 +2367,27 @@ async fn run_client_session(
                     }
                 }
             }
-        });
+        }));
 
+        let mut input_task_finished = false;
+        let mut ack_task_finished = false;
+        let mut delta_decoder = delta::DeltaDecoder::new();
         loop {
-            match frame_recv.recv_frame().await {
-                Ok(packet) => {
+            let next_frame = tokio::select! {
+                frame = time::timeout(Duration::from_secs(45), frame_recv.recv_frame()) => {
+                    Some(frame.unwrap_or_else(|_| Err(anyhow!("video stream stalled for 45 seconds"))))
+                },
+                _ = &mut input_task.0 => {
+                    input_task_finished = true;
+                    None
+                },
+                _ = &mut ack_task.0 => {
+                    ack_task_finished = true;
+                    None
+                },
+            };
+            match next_frame {
+                Some(Ok(packet)) => {
                     if !session_state.is_active() {
                         error!(
                             state = ?session_state.state(),
@@ -2365,41 +2397,32 @@ async fn run_client_session(
                         continue;
                     }
 
-                    let Some(expected) = packet.checked_buffer_len() else {
-                        warn!(
-                            sequence = packet.sequence,
-                            width = packet.width,
-                            height = packet.height,
-                            stride = packet.stride,
-                            "dropping frame with overflowed buffer size"
-                        );
-                        continue;
+                    let frame = match delta_decoder.decode(packet) {
+                        Ok(Some(frame)) => frame,
+                        Ok(None) => continue, // heartbeat: no redraw and no pixels transferred
+                        Err(error) => {
+                            warn!(?error, "remote delta stream cannot be trusted; closing rather than showing corrupt output");
+                            break;
+                        }
                     };
 
-                    if packet.pixels.len() != expected {
-                        warn!(
-                            sequence = packet.sequence,
-                            bytes = packet.pixels.len(),
-                            expected,
-                            "dropping frame with invalid payload size"
-                        );
-                        continue;
-                    }
-
-                    let frame = ViewerFrame {
-                        width: packet.width,
-                        height: packet.height,
-                        stride: packet.stride,
-                        pixels: packet.pixels,
-                    };
-
-                    if viewer_frame_tx.send(frame).is_err() {
-                        info!("viewer closed, ending client frame loop");
-                        break;
+                    match viewer_frame_tx.try_send(frame) {
+                        Ok(()) => {}
+                        Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                            // Slow rendering must not accumulate full-screen frames in memory.
+                        }
+                        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                            info!("viewer closed, ending client frame loop");
+                            break;
+                        }
                     }
                 }
-                Err(error) => {
+                Some(Err(error)) => {
                     info!(?error, "frame stream ended");
+                    break;
+                }
+                None => {
+                    info!("remote viewer or control stream ended");
                     break;
                 }
             }
@@ -2409,10 +2432,14 @@ async fn run_client_session(
         if let Some(ref c) = quic_conn_to_close {
             c.close(0u32.into(), b"client shutdown");
         }
-        input_task.abort();
-        let _ = input_task.await;
-        ack_task.abort();
-        let _ = ack_task.await;
+        if !input_task_finished {
+            input_task.0.abort();
+            let _ = (&mut input_task.0).await;
+        }
+        if !ack_task_finished {
+            ack_task.0.abort();
+            let _ = (&mut ack_task.0).await;
+        }
         Ok(())
     }.await;
 
@@ -2428,8 +2455,7 @@ async fn request_client_permission(
     if let Ok(value) = std::env::var("NEXUS_AUTO_CLIENT_PERMISSION") {
         let normalized = value.trim().to_ascii_lowercase();
         if matches!(normalized.as_str(), "1" | "true" | "yes" | "y") {
-            warn!("NEXUS_AUTO_CLIENT_PERMISSION enabled: auto-approving client-side request");
-            return Ok(true);
+            warn!("NEXUS_AUTO_CLIENT_PERMISSION cannot bypass on-screen consent; ignoring auto-approval flag");
         }
         if matches!(normalized.as_str(), "0" | "false" | "no" | "n") {
             warn!("NEXUS_AUTO_CLIENT_PERMISSION enabled: auto-denying client-side request");
@@ -2467,8 +2493,7 @@ async fn request_host_consent(
     if let Ok(value) = std::env::var("NEXUS_AUTO_CONSENT") {
         let normalized = value.trim().to_ascii_lowercase();
         if matches!(normalized.as_str(), "1" | "true" | "yes" | "y") {
-            warn!("NEXUS_AUTO_CONSENT enabled: auto-approving consent for this session");
-            return Ok(true);
+            warn!("NEXUS_AUTO_CONSENT cannot bypass on-screen consent; ignoring auto-approval flag");
         }
         if matches!(normalized.as_str(), "0" | "false" | "no" | "n") {
             warn!("NEXUS_AUTO_CONSENT enabled: auto-denying consent for this session");
@@ -2508,12 +2533,8 @@ async fn wait_for_auth_request(control_recv: &PacketReceiver) -> Result<Incoming
                 protocol_version,
             }) => {
                 info!(%role, protocol_version, "received client hello");
-                if protocol_version != PROTOCOL_VERSION {
-                    warn!(
-                        protocol_version,
-                        expected = PROTOCOL_VERSION,
-                        "client protocol version mismatch"
-                    );
+                if protocol_version != PROTOCOL_VERSION || role != "client" {
+                    bail!("unsupported client protocol version or peer role");
                 }
                 saw_hello = true;
             }
@@ -2522,7 +2543,7 @@ async fn wait_for_auth_request(control_recv: &PacketReceiver) -> Result<Incoming
                 target_id,
             }) => {
                 if !saw_hello {
-                    warn!("client sent auth request before hello");
+                    bail!("client sent authentication request before protocol hello");
                 }
                 return Ok(IncomingAuth {
                     requester_id,
@@ -2637,12 +2658,16 @@ async fn wait_for_session_consent(control_recv: &PacketReceiver) -> Result<()> {
 }
 
 async fn send_message<T: Serialize>(stream: &mut SendStream, value: &T) -> Result<()> {
+    send_message_limited(stream, value, MAX_MESSAGE_BYTES).await
+}
+
+async fn send_message_limited<T: Serialize>(stream: &mut SendStream, value: &T, limit: usize) -> Result<()> {
     let payload = bincode::serialize(value).context("failed to encode message")?;
-    if payload.len() > MAX_MESSAGE_BYTES {
+    if payload.len() > limit {
         bail!(
             "encoded message exceeds max size: {} > {} bytes",
             payload.len(),
-            MAX_MESSAGE_BYTES
+            limit
         );
     }
 
@@ -2660,17 +2685,21 @@ async fn send_message<T: Serialize>(stream: &mut SendStream, value: &T) -> Resul
 }
 
 async fn recv_message<T: DeserializeOwned>(stream: &mut RecvStream) -> Result<T> {
+    recv_message_limited(stream, MAX_MESSAGE_BYTES).await
+}
+
+async fn recv_message_limited<T: DeserializeOwned>(stream: &mut RecvStream, limit: usize) -> Result<T> {
     let mut len_buf = [0_u8; 4];
     stream
         .read_exact(&mut len_buf)
         .await
         .context("failed to read message length")?;
     let len = u32::from_le_bytes(len_buf) as usize;
-    if len > MAX_MESSAGE_BYTES {
+    if len > limit {
         bail!(
             "incoming message exceeds max size: {} > {} bytes",
             len,
-            MAX_MESSAGE_BYTES
+            limit
         );
     }
 
@@ -2722,23 +2751,33 @@ fn detect_local_ip() -> Option<IpAddr> {
 
 
 async fn run_diagnostics(_port: u16) -> (NetworkTopology, Option<String>) {
-    (NetworkTopology::ConeNatFriendly, None)
+    // Do not report a fabricated NAT type or public address to technicians.
+    // P2P discovery is handled by iroh; this panel remains unknown until
+    // an actual topology probe is implemented and validated.
+    (NetworkTopology::Undetermined, None)
+}
+
+fn derive_session_id(endpoint_id: &[u8; 32]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(b"nexus-p2p-session-v2");
+    hasher.update(endpoint_id);
+    let hash = hasher.finalize();
+    hex::encode(&hash[..8])
 }
 
 fn derive_keys_from_seed(seed: &[u8; 32]) -> (SecretKey, String) {
     let secret_key = SecretKey::from_bytes(seed);
-    
-    use sha2::{Sha256, Digest};
-    let mut hasher = Sha256::new();
-    hasher.update(seed);
-    let hash = hasher.finalize();
-    let session_id = hex::encode(&hash[..8]); // 16-character hex string (8 bytes)
+    let session_id = derive_session_id(secret_key.public().as_bytes());
     (secret_key, session_id)
 }
 
 fn build_access_id(seed: &[u8; 32]) -> Result<String> {
+    // Share the public endpoint identity, NEVER the host's Ed25519 private seed.
+    let endpoint_id = *SecretKey::from_bytes(seed).public().as_bytes();
     let payload = AccessIdPayload {
-        seed: *seed,
+        protocol_version: 2,
+        endpoint_id,
     };
 
     let encoded = bincode::serialize(&payload).context("failed to serialize access ID payload")?;
@@ -2752,8 +2791,13 @@ fn parse_access_id(access_id: &str) -> Result<ParsedAccessId> {
     let payload: AccessIdPayload =
         bincode::deserialize(&decoded).context("failed to parse access ID payload")?;
 
+    if payload.protocol_version != 2 {
+        bail!("unsupported access code format; regenerate the code on the host");
+    }
+    iroh::PublicKey::from_bytes(&payload.endpoint_id)
+        .context("access code contains invalid public endpoint identity")?;
     Ok(ParsedAccessId {
-        seed: payload.seed,
+        endpoint_id: payload.endpoint_id,
     })
 }
 
@@ -2783,7 +2827,7 @@ fn save_connection_payload_file_from_seed(seed: &str) -> Result<PathBuf> {
         raw
     } else {
         let parsed = parse_connection_seed(seed)?;
-        build_connection_payload_bytes(&parsed.seed)?
+        build_connection_payload_bytes(&parsed.endpoint_id)?
     };
 
     let Some(path) = rfd::FileDialog::new()
@@ -2869,8 +2913,8 @@ fn load_connection_seed_from_file_path(path: &Path) -> Result<String> {
     }
 
     if bytes.len() == CONNECTION_PAYLOAD_BYTES {
-        let parsed = parse_connection_payload_bytes(&bytes)?;
-        return build_access_id(&parsed.seed);
+        parse_connection_payload_bytes(&bytes)?;
+        return Ok(URL_SAFE_NO_PAD.encode(&bytes));
     }
 
     if let Ok(text) = std::str::from_utf8(&bytes) {
@@ -3007,8 +3051,9 @@ fn parse_connection_seed(seed: &str) -> Result<ParsedAccessId> {
     bail!("unsupported connection seed format")
 }
 
-fn build_connection_payload_bytes(seed: &[u8; 32]) -> Result<Vec<u8>> {
-    Ok(seed.to_vec())
+fn build_connection_payload_bytes(endpoint_id: &[u8; 32]) -> Result<Vec<u8>> {
+    iroh::PublicKey::from_bytes(endpoint_id).context("invalid endpoint identity")?;
+    Ok(endpoint_id.to_vec())
 }
 
 fn parse_connection_payload_bytes(payload: &[u8]) -> Result<ParsedAccessId> {
@@ -3020,10 +3065,11 @@ fn parse_connection_payload_bytes(payload: &[u8]) -> Result<ParsedAccessId> {
         );
     }
 
-    let mut seed = [0_u8; 32];
-    seed.copy_from_slice(payload);
+    let mut endpoint_id = [0_u8; 32];
+    endpoint_id.copy_from_slice(payload);
+    iroh::PublicKey::from_bytes(&endpoint_id).context("invalid endpoint public key")?;
 
-    Ok(ParsedAccessId { seed })
+    Ok(ParsedAccessId { endpoint_id })
 }
 
 fn decode_connection_seed_base64(seed: &str) -> Result<Vec<u8>> {
@@ -3227,13 +3273,61 @@ mod tests {
     use base64::Engine as _;
 
     #[test]
+    fn ui_owned_runtime_keeps_command_dispatch_alive() {
+        use std::sync::Arc;
+        use std::time::Duration;
+        use tokio::runtime::Builder;
+        use tokio::sync::{mpsc, oneshot};
+
+        // Reproduces the previous lifecycle bug: a Handle alone does not own
+        // a Runtime. The GUI must hold an Arc<Runtime> after setup returns.
+        let runtime = Arc::new(Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .expect("Tokio runtime"));
+        let (commands_tx, mut commands_rx) = mpsc::channel::<u8>(1);
+        let (response_tx, response_rx) = oneshot::channel();
+        runtime.spawn(async move {
+            if let Some(value) = commands_rx.recv().await {
+                let _ = response_tx.send(value);
+            }
+        });
+
+        let gui_runtime_owner = Arc::clone(&runtime);
+        drop(runtime); // Simulate returning from the eframe creator closure.
+        assert!(commands_tx.blocking_send(7).is_ok(), "dispatch receiver died");
+        let received = gui_runtime_owner.block_on(async {
+            tokio::time::timeout(Duration::from_secs(2), response_rx).await
+        }).expect("runtime task timed out").expect("dispatcher response closed");
+        assert_eq!(received, 7);
+    }
+
+    #[test]
     fn access_id_roundtrip() {
         let seed = [42_u8; 32];
 
         let token = build_access_id(&seed).expect("build access ID");
         let parsed = parse_access_id(&token).expect("parse access ID");
 
-        assert_eq!(parsed.seed, seed);
+        assert_eq!(
+            parsed.endpoint_id,
+            *iroh::SecretKey::from_bytes(&seed).public().as_bytes()
+        );
+    }
+
+    #[test]
+    fn exported_codes_do_not_reveal_host_secret_seed() {
+        let secret = [42u8; 32];
+        let access = build_access_id(&secret).unwrap();
+        let decoded = URL_SAFE_NO_PAD.decode(&access).unwrap();
+        assert!(!decoded.windows(32).any(|window| window == secret));
+        let parsed = parse_connection_seed(&access).unwrap();
+        assert_ne!(parsed.endpoint_id, secret);
+        assert_eq!(
+            parsed.endpoint_id,
+            *iroh::SecretKey::from_bytes(&secret).public().as_bytes()
+        );
     }
 
     #[test]
@@ -3252,29 +3346,31 @@ mod tests {
     fn connection_seed_roundtrip_supports_base64_and_deep_link() {
         let seed = [7_u8; 32];
 
-        let payload = build_connection_payload_bytes(&seed)
+        let endpoint_id = *iroh::SecretKey::from_bytes(&seed).public().as_bytes();
+        let payload = build_connection_payload_bytes(&endpoint_id)
             .expect("build compact connection payload");
         let seed_b64 = URL_SAFE_NO_PAD.encode(&payload);
 
         let parsed = parse_connection_seed(&seed_b64).expect("parse base64 connection seed");
-        assert_eq!(parsed.seed, seed);
+        assert_eq!(parsed.endpoint_id, endpoint_id);
 
         let deep_link = format!("nexus://connect/{seed_b64}");
         let parsed_from_link =
             parse_connection_seed(&deep_link).expect("parse deep-link connection seed");
-        assert_eq!(parsed_from_link.seed, seed);
+        assert_eq!(parsed_from_link.endpoint_id, endpoint_id);
     }
 
     #[test]
     fn connection_seed_roundtrip_supports_mnemonic() {
         let seed = [255_u8; 32];
 
-        let payload = build_connection_payload_bytes(&seed)
+        let endpoint_id = *iroh::SecretKey::from_bytes(&seed).public().as_bytes();
+        let payload = build_connection_payload_bytes(&endpoint_id)
             .expect("build compact connection payload");
         let mnemonic =
             encode_connection_seed_mnemonic(&payload).expect("encode mnemonic connection seed");
 
         let parsed = parse_connection_seed(&mnemonic).expect("parse mnemonic connection seed");
-        assert_eq!(parsed.seed, seed);
+        assert_eq!(parsed.endpoint_id, endpoint_id);
     }
 }

@@ -177,6 +177,7 @@ pub enum ControlMessage {
     SessionConsent { approved: bool },
     SimulatedMouseMove { x_norm: f32, y_norm: f32 },
     SimulatedKeyEvent { virtual_key: u16, pressed: bool },
+    MouseButtonEvent { button: u8, pressed: bool },
     Ack(String),
 }
 

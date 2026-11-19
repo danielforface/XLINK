@@ -1,10 +1,14 @@
 use anyhow::{anyhow, Result};
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::Mutex;
 use windows::core::{Error as WindowsError, PCWSTR};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT, KEYEVENTF_KEYUP,
     KEYEVENTF_SCANCODE, MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_MOVE, MOUSEEVENTF_VIRTUALDESK,
-    MOUSEINPUT, VIRTUAL_KEY,
+    MOUSEINPUT, VIRTUAL_KEY, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP,
+    MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_MIDDLEDOWN,
+    MOUSEEVENTF_MIDDLEUP,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     GetSystemMetrics, MessageBoxW, IDNO, IDYES, MB_ICONQUESTION, MB_SETFOREGROUND, MB_TOPMOST,
@@ -45,6 +49,8 @@ pub struct InputController {
     desktop_width: i32,
     desktop_height: i32,
     state: AtomicU8,
+    pressed_keys: Mutex<HashSet<u16>>,
+    pressed_buttons: Mutex<HashSet<u8>>,
 }
 
 impl InputController {
@@ -56,11 +62,60 @@ impl InputController {
             desktop_width,
             desktop_height,
             state: AtomicU8::new(SESSION_INACTIVE),
+            pressed_keys: Mutex::new(HashSet::new()),
+            pressed_buttons: Mutex::new(HashSet::new()),
         })
     }
 
     pub fn set_state(&self, state: SessionState) {
         self.state.store(state_to_u8(state), Ordering::Release);
+        if state != SessionState::Active {
+            self.release_held_keys();
+            self.release_held_buttons();
+        }
+    }
+
+    fn release_held_keys(&self) {
+        if let Ok(mut keys) = self.pressed_keys.lock() {
+            for key in keys.drain() {
+                let input = INPUT {
+                    r#type: INPUT_KEYBOARD,
+                    Anonymous: INPUT_0 {
+                        ki: KEYBDINPUT {
+                            wVk: VIRTUAL_KEY(key),
+                            wScan: 0,
+                            dwFlags: KEYEVENTF_KEYUP,
+                            time: 0,
+                            dwExtraInfo: 0,
+                        },
+                    },
+                };
+                let _ = unsafe { SendInput(&[input], std::mem::size_of::<INPUT>() as i32) };
+            }
+        }
+    }
+
+    fn release_held_buttons(&self) {
+        if let Ok(mut buttons) = self.pressed_buttons.lock() {
+            for button in buttons.drain() {
+                let flags = match button {
+                    0 => MOUSEEVENTF_LEFTUP,
+                    1 => MOUSEEVENTF_RIGHTUP,
+                    2 => MOUSEEVENTF_MIDDLEUP,
+                    _ => continue,
+                };
+                let input = INPUT {
+                    r#type: INPUT_MOUSE,
+                    Anonymous: INPUT_0 {
+                        mi: MOUSEINPUT {
+                            dx: 0, dy: 0, mouseData: 0,
+                            dwFlags: flags, time: 0, dwExtraInfo: 0,
+                        },
+                    },
+                };
+                let _ = unsafe { SendInput(&[input], std::mem::size_of::<INPUT>() as i32) };
+            }
+        }
     }
 
     pub fn state(&self) -> SessionState {
@@ -102,6 +157,46 @@ impl InputController {
         }
 
         Ok(preview)
+    }
+
+    /// Inject button transitions only while the on-screen approved session is active.
+    /// button: 0 = left, 1 = right, 2 = middle.
+    pub fn inject_mouse_button(&self, button: u8, pressed: bool) -> Result<()> {
+        self.ensure_active()?;
+        let flags = match (button, pressed) {
+            (0, true) => MOUSEEVENTF_LEFTDOWN,
+            (0, false) => MOUSEEVENTF_LEFTUP,
+            (1, true) => MOUSEEVENTF_RIGHTDOWN,
+            (1, false) => MOUSEEVENTF_RIGHTUP,
+            (2, true) => MOUSEEVENTF_MIDDLEDOWN,
+            (2, false) => MOUSEEVENTF_MIDDLEUP,
+            _ => return Err(anyhow!("unsupported remote mouse button {button}")),
+        };
+        let input = INPUT {
+            r#type: INPUT_MOUSE,
+            Anonymous: INPUT_0 {
+                mi: MOUSEINPUT {
+                    dx: 0,
+                    dy: 0,
+                    mouseData: 0,
+                    dwFlags: flags,
+                    time: 0,
+                    dwExtraInfo: 0,
+                },
+            },
+        };
+        let sent = unsafe { SendInput(&[input], std::mem::size_of::<INPUT>() as i32) };
+        if sent != 1 {
+            return Err(anyhow!("SendInput mouse button failed: {}", WindowsError::from_win32()));
+        }
+        if let Ok(mut buttons) = self.pressed_buttons.lock() {
+            if pressed {
+                buttons.insert(button);
+            } else {
+                buttons.remove(&button);
+            }
+        }
+        Ok(())
     }
 
     pub fn preview_virtual_key_event(
@@ -151,6 +246,13 @@ impl InputController {
             ));
         }
 
+        if let Ok(mut keys) = self.pressed_keys.lock() {
+            if pressed {
+                keys.insert(virtual_key);
+            } else {
+                keys.remove(&virtual_key);
+            }
+        }
         Ok(preview)
     }
 
@@ -222,6 +324,13 @@ impl InputController {
                 self.state()
             ))
         }
+    }
+}
+
+impl Drop for InputController {
+    fn drop(&mut self) {
+        self.release_held_keys();
+        self.release_held_buttons();
     }
 }
 

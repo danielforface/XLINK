@@ -1,8 +1,8 @@
 use anyhow::{anyhow, Context, Result};
 use bytes::Bytes;
-use minifb::{Key, KeyRepeat, MouseMode, Window, WindowOptions};
+use minifb::{Key, KeyRepeat, MouseButton, MouseMode, Window, WindowOptions};
 use std::thread;
-use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
+use tokio::sync::mpsc::{self, Receiver, Sender};
 use windows::core::{ComInterface, Error as WindowsError};
 use windows::Win32::Foundation::E_FAIL;
 use windows::Win32::Graphics::Direct3D::{D3D_DRIVER_TYPE_HARDWARE, D3D_FEATURE_LEVEL};
@@ -51,6 +51,7 @@ pub struct ViewerFrame {
 #[derive(Debug, Clone)]
 pub enum ViewerInputEvent {
     MouseMove { x_norm: f32, y_norm: f32 },
+    MouseButton { button: u8, pressed: bool },
     Keyboard { virtual_key: u16, pressed: bool },
 }
 
@@ -74,6 +75,24 @@ impl ScreenCapturer {
             frame_index: 0,
             last_pixels: None,
         })
+    }
+
+    /// Capture only when DXGI reports desktop updates. Prevents repeated
+    /// full-buffer CPU reads, scaling and compression on an idle desktop.
+    pub fn capture_changed_frame(&mut self) -> Result<Option<CapturedFrame>> {
+        match self.try_capture_frame() {
+            Ok(frame) => Ok(Some(frame)),
+            Err(error) if error.code() == DXGI_ERROR_WAIT_TIMEOUT => Ok(None),
+            Err(error) if error.code() == DXGI_ERROR_ACCESS_LOST => {
+                self.duplication = create_output_duplication(&self.device)
+                    .context("failed to recover DXGI after desktop switch")?;
+                self.staging_texture = None;
+                Ok(None)
+            }
+            Err(error) => Err(anyhow!(
+                "desktop capture failed: {} ({:?})", error.message(), error.code()
+            )),
+        }
     }
 
     pub fn capture_frame(&mut self) -> Result<CapturedFrame> {
@@ -314,9 +333,9 @@ fn create_output_duplication(device: &ID3D11Device) -> Result<IDXGIOutputDuplica
 
 pub fn spawn_remote_viewer(
     title: &str,
-) -> Result<(UnboundedSender<ViewerFrame>, UnboundedReceiver<ViewerInputEvent>)> {
-    let (frame_tx, mut frame_rx) = mpsc::unbounded_channel::<ViewerFrame>();
-    let (input_tx, input_rx) = mpsc::unbounded_channel::<ViewerInputEvent>();
+) -> Result<(Sender<ViewerFrame>, Receiver<ViewerInputEvent>)> {
+    let (frame_tx, mut frame_rx) = mpsc::channel::<ViewerFrame>(2);
+    let (input_tx, input_rx) = mpsc::channel::<ViewerInputEvent>(256);
     let title = title.to_string();
 
     thread::Builder::new()
@@ -333,8 +352,8 @@ pub fn spawn_remote_viewer(
 
 fn run_remote_viewer(
     title: &str,
-    frame_rx: &mut UnboundedReceiver<ViewerFrame>,
-    input_tx: UnboundedSender<ViewerInputEvent>,
+    frame_rx: &mut Receiver<ViewerFrame>,
+    input_tx: Sender<ViewerInputEvent>,
 ) -> Result<()> {
     let Some(mut latest_frame) = frame_rx.blocking_recv() else {
         return Ok(());
@@ -348,14 +367,23 @@ fn run_remote_viewer(
 
     let mut pixel_buffer = vec![0_u32; width * height];
     let mut last_mouse_absolute: Option<(u16, u16)> = None;
+    let mut last_buttons = [false; 3];
 
     loop {
         if !window.is_open() {
             break;
         }
 
-        while let Ok(frame) = frame_rx.try_recv() {
-            latest_frame = frame;
+        loop {
+            match frame_rx.try_recv() {
+                Ok(frame) => latest_frame = frame,
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
+                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                    // A revoked/closed session must close its remote desktop window,
+                    // not leave a misleading frozen controllable viewer behind.
+                    return Ok(());
+                }
+            }
         }
 
         if latest_frame.width as usize != width || latest_frame.height as usize != height {
@@ -366,10 +394,11 @@ fn run_remote_viewer(
                 .map_err(|error| anyhow!("failed to rebuild remote viewer window: {error}"))?;
             window.set_target_fps(60);
             last_mouse_absolute = None;
+            last_buttons = [false; 3];
         }
 
         copy_bgra_into_u32(&latest_frame, &mut pixel_buffer)?;
-        capture_window_input(&window, width, height, &input_tx, &mut last_mouse_absolute);
+        capture_window_input(&window, width, height, &input_tx, &mut last_mouse_absolute, &mut last_buttons);
 
         window
             .update_with_buffer(&pixel_buffer, width, height)
@@ -423,8 +452,9 @@ fn capture_window_input(
     window: &Window,
     width: usize,
     height: usize,
-    input_tx: &UnboundedSender<ViewerInputEvent>,
+    input_tx: &Sender<ViewerInputEvent>,
     last_mouse_absolute: &mut Option<(u16, u16)>,
+    last_buttons: &mut [bool; 3],
 ) {
     if let Some((mouse_x, mouse_y)) = window.get_mouse_pos(MouseMode::Discard) {
         let x_norm = normalize_position(mouse_x, width);
@@ -435,14 +465,31 @@ fn capture_window_input(
         );
 
         if Some(absolute) != *last_mouse_absolute {
-            let _ = input_tx.send(ViewerInputEvent::MouseMove { x_norm, y_norm });
+            let _ = input_tx.try_send(ViewerInputEvent::MouseMove { x_norm, y_norm });
             *last_mouse_absolute = Some(absolute);
+        }
+    }
+
+    // Edge-triggered button events are required for click, double-click and drag.
+    // Never drop transitions on the floor just because mouse motion is congested.
+    for (idx, button) in [MouseButton::Left, MouseButton::Right, MouseButton::Middle]
+        .iter().enumerate()
+    {
+        let down = window.get_mouse_down(*button);
+        if down != last_buttons[idx] {
+            if input_tx.blocking_send(ViewerInputEvent::MouseButton {
+                button: idx as u8,
+                pressed: down,
+            }).is_err() {
+                return;
+            }
+            last_buttons[idx] = down;
         }
     }
 
     for key in window.get_keys_pressed(KeyRepeat::No) {
         if let Some(virtual_key) = minifb_key_to_virtual_key(key) {
-            let _ = input_tx.send(ViewerInputEvent::Keyboard {
+            let _ = input_tx.blocking_send(ViewerInputEvent::Keyboard {
                 virtual_key,
                 pressed: true,
             });
@@ -451,7 +498,7 @@ fn capture_window_input(
 
     for key in window.get_keys_released() {
         if let Some(virtual_key) = minifb_key_to_virtual_key(key) {
-            let _ = input_tx.send(ViewerInputEvent::Keyboard {
+            let _ = input_tx.blocking_send(ViewerInputEvent::Keyboard {
                 virtual_key,
                 pressed: false,
             });

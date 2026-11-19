@@ -1,0 +1,41 @@
+name: Windows production gate
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    runs-on: windows-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+      - uses: Swatinem/rust-cache@v2
+      - name: Validate pinned dependency graph
+        run: cargo metadata --locked --format-version 1 --no-deps
+      - name: Check entire workspace
+        run: cargo check --workspace --locked
+      - name: Run workspace tests
+        run: cargo test --workspace --locked
+      - name: Build release executable
+        run: cargo build --release --locked
+      - name: Upload executable for manual Windows field validation
+        uses: actions/upload-artifact@v4
+        with:
+          name: nexus-p2p-windows-x64
+          path: target/release/nexus-p2p.exe
+          if-no-files-found: error
+          retention-days: 7

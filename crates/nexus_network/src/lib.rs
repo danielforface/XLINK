@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use tracing::info;
 
 /// ALPN protocol identifier for NexusP2P sessions.
-pub const NEXUS_ALPN: &[u8] = b"nexus-p2p/2";
+pub const NEXUS_ALPN: &[u8] = b"nexus-p2p/4";
 
 /// Re-export iroh types used by the application layer.
 pub use iroh::endpoint::{Connection, RecvStream, SendStream, VarInt};
@@ -109,5 +109,52 @@ mod tests {
     fn alpn_is_valid() {
         assert!(!NEXUS_ALPN.is_empty());
         assert!(NEXUS_ALPN.len() < 256);
+    }
+
+    /// Explicit two-endpoint QUIC smoke test. Ignored in regular CI because
+    /// relay discovery and local UDP policy depend on the environment.
+    /// Run with: cargo test -p nexus_network -- --ignored --nocapture
+    #[tokio::test]
+    #[ignore = "requires local UDP and functional iroh relay/discovery"]
+    async fn two_endpoints_exchange_bidirectional_data() {
+        use super::{accept_connection, connect_to_peer, create_client_endpoint, create_endpoint};
+        use tokio::time::{timeout, Duration};
+
+        let server = create_endpoint().await.expect("server endpoint");
+        let client = create_client_endpoint().await.expect("client endpoint");
+        let address = server.addr();
+        let server_task = tokio::spawn(async move {
+            let connection = timeout(Duration::from_secs(20), accept_connection(&server))
+                .await.expect("server accept deadline").expect("accepted");
+            let (mut tx, mut rx) = connection.accept_bi().await.expect("control stream");
+            let mut received = [0_u8; 4];
+            rx.read_exact(&mut received).await.expect("read request");
+            assert_eq!(&received, b"ping");
+            tx.write_all(b"pong").await.expect("auth response");
+            // This simulates remote human approval. Only after control consent
+            // does the server publish its video stream.
+            let mut video = connection.open_uni().await.expect("open video");
+            video.write_all(b"frame").await.expect("send video");
+            video.finish().expect("finish video");
+            tx.finish().expect("finish response");
+            let _ = timeout(Duration::from_secs(2), connection.closed()).await;
+        });
+
+        let connection = timeout(Duration::from_secs(20), connect_to_peer(&client, address))
+            .await.expect("client deadline").expect("connected");
+        let (mut tx, mut rx) = connection.open_bi().await.expect("client stream");
+        tx.write_all(b"ping").await.expect("send");
+        let mut received = [0_u8; 4];
+        rx.read_exact(&mut received).await.expect("response");
+        assert_eq!(&received, b"pong");
+        // Waiting for the video BEFORE writing ping would deadlock.
+        let mut video = timeout(Duration::from_secs(20), connection.accept_uni())
+            .await.expect("video deadline").expect("video stream");
+        let mut frame = [0_u8; 5];
+        video.read_exact(&mut frame).await.expect("video payload");
+        assert_eq!(&frame, b"frame");
+        connection.close(0u32.into(), b"test complete");
+        server_task.await.expect("server task");
+        client.close().await;
     }
 }
