@@ -2,7 +2,7 @@ name: Windows production gate
 
 on:
   push:
-    branches: [main, "hardening/**"]
+    branches: [main]
   pull_request:
     branches: [main]
   workflow_dispatch:
