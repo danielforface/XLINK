@@ -2559,12 +2559,8 @@ async fn wait_for_auth_request(control_recv: &PacketReceiver) -> Result<Incoming
                 protocol_version,
             }) => {
                 info!(%role, protocol_version, "received client hello");
-                if protocol_version != PROTOCOL_VERSION {
-                    warn!(
-                        protocol_version,
-                        expected = PROTOCOL_VERSION,
-                        "client protocol version mismatch"
-                    );
+                if protocol_version != PROTOCOL_VERSION || role != "client" {
+                    bail!("unsupported client protocol version or peer role");
                 }
                 saw_hello = true;
             }
@@ -2573,7 +2569,7 @@ async fn wait_for_auth_request(control_recv: &PacketReceiver) -> Result<Incoming
                 target_id,
             }) => {
                 if !saw_hello {
-                    warn!("client sent auth request before hello");
+                    bail!("client sent authentication request before protocol hello");
                 }
                 return Ok(IncomingAuth {
                     requester_id,
