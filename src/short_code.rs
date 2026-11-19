@@ -150,6 +150,25 @@ mod tests {
         }
     }
 
+    /// Opt-in real pairing check using the PUBLIC Magic Wormhole mailbox.
+    /// Does not expose screen data or access the local desktop.
+    #[tokio::test]
+    #[ignore = "uses publicly operated mailbox and external networking"]
+    async fn public_mailbox_pairing_roundtrip() {
+        let identity = *iroh::SecretKey::generate(&mut rand::rngs::OsRng).public().as_bytes();
+        let (tx, mut rx) = mpsc::channel(1);
+        let host = tokio::spawn(async move {
+            advertise_and_pair(identity, &tx).await.expect("public pairing host")
+        });
+        let code = time::timeout(Duration::from_secs(30), rx.recv())
+            .await.expect("server did not allocate code").expect("server closed");
+        let client = resolve(&code).await.expect("public pairing client");
+        let remote = host.await.expect("host task crashed");
+        assert_eq!(remote.endpoint_id, client.endpoint_id);
+        assert_eq!(remote.ticket, client.ticket);
+        assert!((8..=10).contains(&code.len()));
+    }
+
     #[test]
     fn mailbox_format_roundtrip() {
         for raw in ["1-000001", "27-192837", "123-456789", "9876-012345"] {
