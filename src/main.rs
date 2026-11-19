@@ -1182,7 +1182,10 @@ impl NexusGuiApp {
         ui.add_space(if compact { 13.0 } else { 26.0 });
 
         ui.vertical_centered(|ui| {
-            ui.add_sized([card_width, 0.0], |ui: &mut egui::Ui| {
+            ui.allocate_ui_with_layout(
+                egui::vec2(card_width, 0.0),
+                egui::Layout::top_down(egui::Align::Center),
+                |ui| {
                 egui::Frame::none()
                     .fill(Color32::WHITE)
                     .stroke(Stroke::new(1.0, Color32::from_rgb(224, 232, 244)))
@@ -1656,37 +1659,85 @@ impl eframe::App for NexusGuiApp {
         // digit keypad pairing is the only interaction path.
 
         // XLINK v5: a single clear home screen, not Host and Client settings pages.
+        let window_focused = ctx.input(|input| input.focused);
+        if window_focused && !self.window_was_focused
+            && !self.show_logs && !self.show_preferences {
+            self.refocus_number_input = true;
+        }
+        self.window_was_focused = window_focused;
+
+        if self.code_ready_at.is_some_and(|when| when.elapsed() >= Duration::from_secs(180))
+            && self.generated_access_id.is_some() {
+            // Prevent copying an expired public mailbox nameplate.
+            self.generated_access_id = None;
+            self.code_ready_at = None;
+            self.set_status("Refreshing your temporary ID...");
+        }
+
         egui::TopBottomPanel::top("home_navigation")
             .frame(egui::Frame::none()
                 .fill(Color32::WHITE)
-                .inner_margin(egui::Margin::symmetric(24.0, 17.0)))
+                .inner_margin(egui::Margin::symmetric(20.0, 14.0)))
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
-                    ui.label(RichText::new("XLINK").size(26.0)
-                        .strong().color(Color32::from_rgb(28, 64, 119)));
-                    ui.add_space(10.0);
-                    ui.label(RichText::new("Secure remote support").size(13.0)
-                        .color(Color32::from_rgb(105, 122, 140)));
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center),
-                        |ui| {
-                            let status = if self.generated_access_id.is_some() {
-                                "READY TO HELP"
-                            } else if self.host_running {
-                                "PAIRING..."
-                            } else {
-                                "DISCOVERY UNAVAILABLE"
-                            };
-                            ui.label(RichText::new(status).size(11.0).strong()
-                                .color(Color32::from_rgb(41, 128, 89)));
+                    if ui.add(
+                        egui::Button::new(RichText::new("XLINK")
+                            .size(24.0).strong().color(Color32::from_rgb(28, 64, 119)))
+                            .frame(false)
+                    ).on_hover_text("Home").clicked() {
+                        self.show_logs = false;
+                        self.show_preferences = false;
+                        self.refocus_number_input = true;
+                    }
+                    if ui.available_width() > 430.0 {
+                        ui.label(RichText::new("Remote support")
+                            .size(12.0).color(Color32::from_rgb(106, 123, 142)));
+                    }
+                    ui.with_layout(
+                        egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            let logs = egui::Button::new(
+                                RichText::new("☷  Logs").size(12.0)
+                            ).rounding(Rounding::same(10.0))
+                                .fill(if self.show_logs {
+                                    Color32::from_rgb(218, 231, 252)
+                                } else { Color32::from_rgb(245, 248, 252) });
+                            if ui.add(logs).clicked() {
+                                self.show_logs = !self.show_logs;
+                                self.show_preferences = false;
+                                if !self.show_logs { self.refocus_number_input = true; }
+                            }
+                            let settings = egui::Button::new(
+                                RichText::new("⚙  Settings").size(12.0)
+                            ).rounding(Rounding::same(10.0))
+                                .fill(if self.show_preferences {
+                                    Color32::from_rgb(218, 231, 252)
+                                } else { Color32::from_rgb(245, 248, 252) });
+                            if ui.add(settings).clicked() {
+                                self.show_preferences = !self.show_preferences;
+                                self.show_logs = false;
+                                if !self.show_preferences { self.refocus_number_input = true; }
+                            }
                         });
                 });
             });
         egui::CentralPanel::default()
             .frame(egui::Frame::none()
                 .fill(Color32::from_rgb(248, 250, 253))
-                .inner_margin(egui::Margin::symmetric(26.0, 19.0)))
+                .inner_margin(egui::Margin::symmetric(
+                    if ctx.available_rect().width() < 580.0 { 10.0 } else { 24.0 },
+                    16.0,
+                )))
             .show(ctx, |ui| {
-                egui::ScrollArea::vertical().show(ui, |ui| self.draw_numeric_home(ui));
+                egui::ScrollArea::vertical().auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        if self.show_preferences {
+                            self.draw_preferences_screen(ui);
+                        } else if self.show_logs {
+                            self.draw_logs_screen(ui);
+                        } else {
+                            self.draw_numeric_home(ui);
+                        }
+                    });
             });
 
         self.draw_copy_notice(ctx);
