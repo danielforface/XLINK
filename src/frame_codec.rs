@@ -93,7 +93,6 @@ pub fn decode(packet: FramePacket) -> Result<ViewerFrame> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bytes::Bytes;
 
     fn captured(width: u32, height: u32) -> CapturedFrame {
         let mut pixels = Vec::new();
@@ -101,7 +100,7 @@ mod tests {
             pixels.extend_from_slice(&[22, 60, 180, 255]);
         }
         CapturedFrame {
-            width, height, stride: width * 4, frame_index: 7, pixels: Bytes::from(pixels),
+            width, height, stride: width * 4, frame_index: 7, pixels: pixels.into(),
         }
     }
 
