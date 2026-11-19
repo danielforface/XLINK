@@ -1,6 +1,7 @@
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 
 mod adaptive;
+mod delta;
 mod frame_codec;
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -2054,6 +2055,7 @@ async fn run_host_peer_session(
     let mut control_task_finished = false;
     let mut capture_failures = 0u32;
     let mut pacer = adaptive::AdaptiveFrameRate::new(fps);
+    let mut delta_encoder = delta::DeltaEncoder::new();
     let mut ticker = time::interval(pacer.interval());
     ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
@@ -2098,16 +2100,20 @@ async fn run_host_peer_session(
                 continue;
             }
         };
-        let packet = frame_codec::encode(frame)?;
+        let Some(packet) = delta_encoder.encode(frame)? else {
+            // No pixels changed: never send a redundant full-screen JPEG.
+            // A periodic keyframe is automatically emitted by DeltaEncoder.
+            continue;
+        };
 
-        match time::timeout(Duration::from_secs(30), frame_stream_send.send_frame(&packet)).await {
+        match time::timeout(Duration::from_secs(8), frame_stream_send.send_frame(&packet)).await {
             Ok(Ok(())) => {}
             Ok(Err(error)) => {
                 info!(?error, "frame stream ended");
                 break;
             }
             Err(_) => {
-                warn!("frame send stalled for 30s; closing session");
+                warn!("frame send stalled for 8s; closing session instead of building infinite latency");
                 break;
             }
         }
@@ -2305,6 +2311,7 @@ async fn run_client_session(
 
         let mut input_task_finished = false;
         let mut ack_task_finished = false;
+        let mut delta_decoder = delta::DeltaDecoder::new();
         loop {
             let next_frame = tokio::select! {
                 frame = time::timeout(Duration::from_secs(45), frame_recv.recv_frame()) => {
@@ -2330,11 +2337,11 @@ async fn run_client_session(
                         continue;
                     }
 
-                    let frame = match frame_codec::decode(packet) {
+                    let frame = match delta_decoder.decode(packet) {
                         Ok(frame) => frame,
                         Err(error) => {
-                            warn!(?error, "dropping malformed remote video frame");
-                            continue;
+                            warn!(?error, "remote delta stream cannot be trusted; closing rather than showing corrupt output");
+                            break;
                         }
                     };
 
