@@ -33,8 +33,8 @@ extern "system" {
         result: *mut DataBlob,
     ) -> i32;
     fn CryptUnprotectData(
-        description: *mut *mut u16,
         data: *const DataBlob,
+        description: *mut *mut u16,
         entropy: *const DataBlob,
         reserved: *mut c_void,
         prompt: *const c_void,
@@ -62,7 +62,7 @@ fn dpapi(input: &[u8], encrypt: bool) -> Result<Vec<u8>> {
             )
         } else {
             CryptUnprotectData(
-                std::ptr::null_mut(), &blob, std::ptr::null(),
+                &blob, std::ptr::null_mut(), std::ptr::null(),
                 std::ptr::null_mut(), std::ptr::null(),
                 CRYPTPROTECT_UI_FORBIDDEN, &mut output,
             )
