@@ -77,6 +77,24 @@ impl ScreenCapturer {
         })
     }
 
+    /// Capture only when DXGI reports desktop updates. Prevents repeated
+    /// full-buffer CPU reads, scaling and compression on an idle desktop.
+    pub fn capture_changed_frame(&mut self) -> Result<Option<CapturedFrame>> {
+        match self.try_capture_frame() {
+            Ok(frame) => Ok(Some(frame)),
+            Err(error) if error.code() == DXGI_ERROR_WAIT_TIMEOUT => Ok(None),
+            Err(error) if error.code() == DXGI_ERROR_ACCESS_LOST => {
+                self.duplication = create_output_duplication(&self.device)
+                    .context("failed to recover DXGI after desktop switch")?;
+                self.staging_texture = None;
+                Ok(None)
+            }
+            Err(error) => Err(anyhow!(
+                "desktop capture failed: {} ({:?})", error.message(), error.code()
+            )),
+        }
+    }
+
     pub fn capture_frame(&mut self) -> Result<CapturedFrame> {
         for _ in 0..3 {
             match self.try_capture_frame() {
