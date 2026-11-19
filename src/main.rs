@@ -59,6 +59,16 @@ const MAX_FPS: u16 = 60;
 const CONNECTION_PAYLOAD_BYTES: usize = 32;
 const UI_REPAINT_MS: u64 = 16;
 const DEEP_LINK_PREFIX: &str = "nexus://connect";
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(25);
+
+/// Child tasks must not outlive a revoked remote-control session.
+struct AbortOnDrop<T>(tokio::task::JoinHandle<T>);
+impl<T> Drop for AbortOnDrop<T> {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 
 fn main() -> Result<()> {
     init_tracing();
@@ -1952,7 +1962,8 @@ async fn run_server_session(
     session_state.transition(SessionState::Authenticating)?;
 
     // Accept QUIC connection via iroh
-    let connection = accept_connection(&endpoint).await?;
+    let connection = time::timeout(HANDSHAKE_TIMEOUT, accept_connection(&endpoint))
+        .await.context("waiting for a remote connection timed out")??;
     let remote_addr_str = format!("iroh:{}", connection.remote_id());
 
     let handshake_latency = 0u128; // iroh establishes connection in background
@@ -1964,9 +1975,8 @@ async fn run_server_session(
 
     let quic_conn_to_close = Some(connection.clone());
 
-    let (control_s, control_r) = connection
-        .accept_bi()
-        .await
+    let (control_s, control_r) = time::timeout(HANDSHAKE_TIMEOUT, connection.accept_bi())
+        .await.context("control stream handshake timed out")?
         .context("client did not open a control stream")?;
     let frame_s = connection
         .open_uni()
@@ -1977,7 +1987,8 @@ async fn run_server_session(
     let control_recv = PacketReceiver(Arc::new(tokio::sync::Mutex::new(control_r)));
     let frame_stream_send = FrameSender(Arc::new(tokio::sync::Mutex::new(frame_s)));
 
-    let incoming_auth = wait_for_auth_request(&control_recv).await?;
+    let incoming_auth = time::timeout(HANDSHAKE_TIMEOUT, wait_for_auth_request(&control_recv))
+        .await.context("authentication request timed out")??;
 
     runtime_event_tx
         .send(RuntimeEvent::IncomingSession {
@@ -2029,7 +2040,8 @@ async fn run_server_session(
     .await
     .context("failed to send access request to client")?;
 
-    let client_approved = wait_for_client_access_decision(&control_recv).await?;
+    let client_approved = time::timeout(Duration::from_secs(210), wait_for_client_access_decision(&control_recv))
+        .await.context("remote permission decision timed out")??;
     if !client_approved {
         let _ = session_state.transition(SessionState::Rejected);
         runtime_event_tx
@@ -2097,7 +2109,7 @@ async fn run_server_session(
     let input_for_control = Arc::clone(&input);
     let inject_input = config.inject_input;
     let control_send_clone = control_send.clone();
-    let control_task = tokio::spawn(async move {
+    let mut control_task = AbortOnDrop(tokio::spawn(async move {
         loop {
             match control_recv.recv_control().await {
                 Ok(ControlMessage::SimulatedMouseMove { x_norm, y_norm }) => {
@@ -2194,14 +2206,20 @@ async fn run_server_session(
                 }
             }
         }
-    });
+    }));
 
     let mut capturer = ScreenCapturer::new()?;
     let mut ticker = time::interval(Duration::from_millis(frame_interval_ms));
     ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
     loop {
-        ticker.tick().await;
+        tokio::select! {
+            _ = ticker.tick() => {},
+            _ = &mut control_task.0 => {
+                info!("control stream ended; shutting down screen capture");
+                break;
+            }
+        }
 
         if !session_state.is_active() {
             error!(
@@ -2233,7 +2251,8 @@ async fn run_server_session(
     if let Some(ref c) = quic_conn_to_close {
         c.close(0u32.into(), b"server shutdown");
     }
-    let _ = control_task.await;
+    control_task.0.abort();
+    let _ = (&mut control_task.0).await;
     Ok(())
 }
 
@@ -2255,7 +2274,8 @@ async fn run_client_session(
     let handshake_start = Instant::now();
 
     // Connect to peer via iroh
-    let connection = connect_to_peer(&endpoint, target_addr).await?;
+    let connection = time::timeout(HANDSHAKE_TIMEOUT, connect_to_peer(&endpoint, target_addr))
+        .await.context("P2P/relay connection timed out")??;
     let remote_addr_str = format!("iroh:{}", connection.remote_id());
 
     let handshake_latency = handshake_start.elapsed().as_millis();
@@ -2268,13 +2288,11 @@ async fn run_client_session(
     let quic_conn_to_close = Some(connection.clone());
 
     let run_result = async move {
-        let (control_s, control_r) = connection
-            .open_bi()
-            .await
+        let (control_s, control_r) = time::timeout(HANDSHAKE_TIMEOUT, connection.open_bi())
+            .await.context("opening control stream timed out")?
             .context("failed to open control stream")?;
-        let frame_r = connection
-            .accept_uni()
-            .await
+        let frame_r = time::timeout(HANDSHAKE_TIMEOUT, connection.accept_uni())
+            .await.context("waiting for remote video stream timed out")?
             .context("server did not open a frame stream")?;
 
         let control_send = PacketSender(Arc::new(tokio::sync::Mutex::new(control_s)));
@@ -2307,9 +2325,11 @@ async fn run_client_session(
         )
         .await?;
 
-        wait_for_auth_result(&control_recv).await?;
+        time::timeout(HANDSHAKE_TIMEOUT, wait_for_auth_result(&control_recv))
+            .await.context("waiting for host authentication timed out")??;
 
-        let requested_session_id = wait_for_access_request(&control_recv).await?;
+        let requested_session_id = time::timeout(HANDSHAKE_TIMEOUT, wait_for_access_request(&control_recv))
+            .await.context("waiting for access request timed out")??;
         let client_approved = request_client_permission(
             remote_addr_str.clone(),
             &requested_session_id,
@@ -2338,7 +2358,8 @@ async fn run_client_session(
 
         session_state.transition(SessionState::PendingConsent)?;
 
-        wait_for_session_consent(&control_recv).await?;
+        time::timeout(Duration::from_secs(210), wait_for_session_consent(&control_recv))
+            .await.context("waiting for on-screen host consent timed out")??;
         session_state.transition(SessionState::Active)?;
 
         let (viewer_frame_tx, mut viewer_input_rx) =
@@ -2346,7 +2367,7 @@ async fn run_client_session(
 
         let session_state_for_input = Arc::clone(&session_state);
         let control_send_clone = control_send.clone();
-        let input_task = tokio::spawn(async move {
+        let mut input_task = AbortOnDrop(tokio::spawn(async move {
             while let Some(event) = viewer_input_rx.recv().await {
                 if !session_state_for_input.is_active() {
                     error!(
@@ -2374,10 +2395,10 @@ async fn run_client_session(
                     break;
                 }
             }
-        });
+        }));
 
         let control_recv_clone = control_recv.clone();
-        let ack_task = tokio::spawn(async move {
+        let mut ack_task = AbortOnDrop(tokio::spawn(async move {
             loop {
                 match control_recv_clone.recv_control().await {
                     Ok(ControlMessage::Ack(text)) => {
@@ -2392,11 +2413,16 @@ async fn run_client_session(
                     }
                 }
             }
-        });
+        }));
 
         loop {
-            match frame_recv.recv_frame().await {
-                Ok(packet) => {
+            let next_frame = tokio::select! {
+                frame = frame_recv.recv_frame() => Some(frame),
+                _ = &mut input_task.0 => None,
+                _ = &mut ack_task.0 => None,
+            };
+            match next_frame {
+                Some(Ok(packet)) => {
                     if !session_state.is_active() {
                         error!(
                             state = ?session_state.state(),
@@ -2453,8 +2479,12 @@ async fn run_client_session(
                         }
                     }
                 }
-                Err(error) => {
+                Some(Err(error)) => {
                     info!(?error, "frame stream ended");
+                    break;
+                }
+                None => {
+                    info!("remote viewer or control stream ended");
                     break;
                 }
             }
@@ -2464,10 +2494,10 @@ async fn run_client_session(
         if let Some(ref c) = quic_conn_to_close {
             c.close(0u32.into(), b"client shutdown");
         }
-        input_task.abort();
-        let _ = input_task.await;
-        ack_task.abort();
-        let _ = ack_task.await;
+        input_task.0.abort();
+        let _ = (&mut input_task.0).await;
+        ack_task.0.abort();
+        let _ = (&mut ack_task.0).await;
         Ok(())
     }.await;
 
