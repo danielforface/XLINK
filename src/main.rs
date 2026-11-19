@@ -1643,14 +1643,6 @@ impl NexusGuiApp {
                 ui.add_space(6.0);
                 ui.label(format!("Server: {}", prompt.server_addr));
                 ui.label(format!("Session ID: {}", prompt.session_id));
-                ui.add_space(10.0);
-                if prompt.remember_requested {
-                    ui.checkbox(&mut self.trust_current_technician,
-                        "Remember this technician for future access without approval");
-                    ui.add(egui::Label::new(
-                        "Optional: this authenticated computer can reconnect while XLINK is running.                          You can revoke it any time in Settings."
-                    ).wrap(true));
-                }
                 ui.add_space(12.0);
 
                 ui.horizontal(|ui| {
@@ -1709,6 +1701,14 @@ impl NexusGuiApp {
                 ui.add(egui::Label::new(format!("Session: {}", prompt.target_session)).wrap(true));
                 ui.add_space(10.0);
                 ui.add(egui::Label::new("Allow screen viewing? Keyboard and mouse control only if explicitly enabled in Host settings. You may revoke at any time.").wrap(true));
+                if prompt.remember_requested {
+                    ui.add_space(10.0);
+                    ui.checkbox(&mut self.trust_current_technician,
+                        "Trust this technician for future connections without approval");
+                    ui.add(egui::Label::new(
+                        "This permits the technician's authenticated computer to reconnect                          while XLINK is running. Disable or revoke in Settings."
+                    ).wrap(true));
+                }
                 ui.add_space(12.0);
 
                 ui.horizontal(|ui| {
