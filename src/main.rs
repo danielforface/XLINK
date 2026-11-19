@@ -21,7 +21,7 @@ use nexus_input::{
     InputController, KeyboardPreview, MousePreview, SessionState as InputSessionState,
 };
 use nexus_network::{
-    accept_connection, connect_to_peer, create_client_endpoint, EndpointAddr, RecvStream,
+    accept_connection, connect_to_peer, create_client_endpoint_with_secret, EndpointAddr, RecvStream,
     SendStream, SecretKey,
 };
 use qrcode_generator::QrCodeEcc;
@@ -1444,6 +1444,7 @@ impl NexusGuiApp {
             } else {
                 Some(display_name)
             },
+            remember_host: self.remember_this_computer,
             _transport_mode: self.host_transport_mode,
         };
 
@@ -1899,7 +1900,9 @@ async fn runtime_dispatch_loop(
 
                 let event_tx = runtime_event_tx.clone();
                 let host_running_flag = Arc::clone(&host_running);
+                let registry = trust_registry.clone();
                 let bridge = Arc::clone(&ui_bridge);
+                let registry = trust_registry.clone();
 
                 host_task = Some(tokio::spawn(async move {
                     let _ = event_tx.send(RuntimeEvent::HostLifecycle { running: true }).await;
@@ -1910,7 +1913,7 @@ async fn runtime_dispatch_loop(
                         .await;
 
                     let run_result =
-                        run_server_session(config, event_tx.clone(), bridge).await;
+                        run_server_session(config, event_tx.clone(), bridge, registry).await;
 
                     host_running_flag.store(false, Ordering::Release);
                     let _ = event_tx.send(RuntimeEvent::HostLifecycle { running: false }).await;
@@ -1934,6 +1937,7 @@ async fn runtime_dispatch_loop(
             RuntimeCommand::ConnectWithAccessId {
                 access_id,
                 display_name,
+                remember_host,
                 _transport_mode: _,
             } => {
                 if client_running
@@ -1984,7 +1988,10 @@ async fn runtime_dispatch_loop(
                         let _ = event_tx.send(RuntimeEvent::SessionStatus(
                             "Identity verified; starting encrypted QUIC connection".to_string()
                         )).await;
-                        run_client_session(invitation, display_name, event_tx.clone(), bridge).await
+                        run_client_session(
+                            invitation, display_name, event_tx.clone(), bridge,
+                            registry, remember_host,
+                        ).await
                     }.await;
 
                     client_running_flag.store(false, Ordering::Release);
@@ -2561,13 +2568,17 @@ async fn run_client_session(
     display_name: Option<String>,
     runtime_event_tx: mpsc::Sender<RuntimeEvent>,
     ui_bridge: Arc<UiBridge>,
+    trust_registry: trusted::TrustRegistry,
+    remember_host: bool,
 ) -> Result<()> {
     let remote_id = iroh::PublicKey::from_bytes(&invitation.endpoint_id)
         .context("connection ID is not a valid endpoint public key")?;
     let session_id = invitation.ticket;
 
     // Create client endpoint
-    let endpoint = create_client_endpoint().await?;
+    let endpoint = create_client_endpoint_with_secret(
+        SecretKey::from_bytes(&trust_registry.technician_seed()?),
+    ).await?;
 
     // N0 provides endpoint discovery, NAT traversal and managed relay fallback.
     // Avoid pinning a guessed relay hostname that may not be the host's actual home relay.
@@ -2635,6 +2646,7 @@ async fn run_client_session(
             &ControlMessage::AuthRequest {
                 requester_id,
                 target_id: session_id.clone(),
+                remember_device: remember_host,
             },
         )
         .await?;
@@ -2899,6 +2911,7 @@ async fn wait_for_auth_request(control_recv: &PacketReceiver) -> Result<Incoming
             Ok(ControlMessage::AuthRequest {
                 requester_id,
                 target_id,
+                remember_device,
             }) => {
                 if !saw_hello {
                     bail!("client sent authentication request before protocol hello");
@@ -2906,6 +2919,7 @@ async fn wait_for_auth_request(control_recv: &PacketReceiver) -> Result<Incoming
                 return Ok(IncomingAuth {
                     requester_id,
                     target_id,
+                    remember_device,
                 });
             }
             Ok(other) => {
