@@ -106,8 +106,8 @@ fn main() -> Result<()> {
 
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1200.0, 760.0])
-            .with_min_inner_size([980.0, 640.0]),
+            .with_inner_size([920.0, 740.0])
+            .with_min_inner_size([680.0, 580.0]),
         ..Default::default()
     };
 
@@ -1548,9 +1548,7 @@ impl NexusGuiApp {
 
 impl eframe::App for NexusGuiApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        if self.detecting_public_ip.load(Ordering::Relaxed) {
-            ctx.request_repaint_after(Duration::from_millis(100));
-        }
+        // Paint while pairing is pending; no external IP detection is needed.
 
         let detected_addr = {
             if let Ok(mut guard) = self.detected_public_addr.lock() {
@@ -1569,7 +1567,6 @@ impl eframe::App for NexusGuiApp {
 
 
 
-        let ip_detection_finished = !self.detecting_public_ip.load(Ordering::Relaxed);
         if !self.has_auto_hosted && !self.host_running {
             self.has_auto_hosted = true;
             self.start_hosting_clicked();
@@ -1579,34 +1576,38 @@ impl eframe::App for NexusGuiApp {
         // No file/QR/mnemonic import or implicit connection. Six-to-ten
         // digit keypad pairing is the only interaction path.
 
-        paint_app_background(ctx);
-
-        egui::TopBottomPanel::top("top_bar")
-            .frame(
-                egui::Frame::none()
-                    .fill(Color32::from_rgba_unmultiplied(13, 20, 31, 236))
-                    .inner_margin(egui::Margin::symmetric(18.0, 14.0)),
-            )
+        // XLINK v5: a single clear home screen, not Host and Client settings pages.
+        egui::TopBottomPanel::top("home_navigation")
+            .frame(egui::Frame::none()
+                .fill(Color32::WHITE)
+                .inner_margin(egui::Margin::symmetric(24.0, 17.0)))
             .show(ctx, |ui| {
-                self.draw_header(ui);
-            });
-
-        egui::CentralPanel::default()
-            .frame(egui::Frame::none().inner_margin(egui::Margin::symmetric(14.0, 14.0)))
-            .show(ctx, |ui| {
-                egui::ScrollArea::vertical().show(ui, |ui| {
-                    self.draw_dashboard(ui);
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("XLINK").size(26.0)
+                        .strong().color(Color32::from_rgb(28, 64, 119)));
+                    ui.add_space(10.0);
+                    ui.label(RichText::new("Secure remote support").size(13.0)
+                        .color(Color32::from_rgb(105, 122, 140)));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center),
+                        |ui| {
+                            let status = if self.generated_access_id.is_some() {
+                                "READY TO HELP"
+                            } else if self.host_running {
+                                "PAIRING..."
+                            } else {
+                                "DISCOVERY UNAVAILABLE"
+                            };
+                            ui.label(RichText::new(status).size(11.0).strong()
+                                .color(Color32::from_rgb(41, 128, 89)));
+                        });
                 });
             });
-
-        egui::TopBottomPanel::bottom("status_bar")
-            .frame(
-                egui::Frame::none()
-                    .fill(Color32::from_rgba_unmultiplied(11, 16, 24, 228))
-                    .inner_margin(egui::Margin::symmetric(16.0, 10.0)),
-            )
+        egui::CentralPanel::default()
+            .frame(egui::Frame::none()
+                .fill(Color32::from_rgb(248, 250, 253))
+                .inner_margin(egui::Margin::symmetric(26.0, 19.0)))
             .show(ctx, |ui| {
-                self.draw_status_bar(ui);
+                egui::ScrollArea::vertical().show(ui, |ui| self.draw_numeric_home(ui));
             });
 
         self.draw_copy_notice(ctx);
@@ -1618,37 +1619,20 @@ impl eframe::App for NexusGuiApp {
 }
 
 fn apply_modern_theme(ctx: &egui::Context) {
-    let mut visuals = egui::Visuals::dark();
-    visuals.window_fill = Color32::from_rgb(9, 13, 20);
-    visuals.panel_fill = Color32::from_rgb(9, 13, 20);
-    visuals.faint_bg_color = Color32::from_rgb(16, 24, 38);
-    visuals.extreme_bg_color = Color32::from_rgb(7, 10, 16);
-    visuals.code_bg_color = Color32::from_rgb(11, 18, 30);
-    visuals.hyperlink_color = Color32::from_rgb(95, 194, 242);
-    visuals.selection.bg_fill = Color32::from_rgb(57, 118, 168);
-    visuals.widgets.active.bg_fill = Color32::from_rgb(52, 115, 161);
-    visuals.widgets.hovered.bg_fill = Color32::from_rgb(38, 81, 113);
-    visuals.widgets.inactive.bg_fill = Color32::from_rgb(24, 37, 56);
-    visuals.window_rounding = Rounding::same(14.0);
-    visuals.override_text_color = Some(Color32::from_rgb(225, 236, 248));
-
+    let mut visuals = egui::Visuals::light();
+    visuals.window_fill = Color32::WHITE;
+    visuals.panel_fill = Color32::from_rgb(248, 250, 253);
+    visuals.faint_bg_color = Color32::from_rgb(245, 248, 252);
+    visuals.extreme_bg_color = Color32::WHITE;
+    visuals.hyperlink_color = Color32::from_rgb(39, 104, 218);
+    visuals.selection.bg_fill = Color32::from_rgb(198, 221, 255);
+    visuals.widgets.active.bg_fill = Color32::from_rgb(222, 235, 254);
+    visuals.widgets.hovered.bg_fill = Color32::from_rgb(237, 244, 255);
+    ctx.set_visuals(visuals);
     let mut style = (*ctx.style()).clone();
-    style.visuals = visuals;
-    style.spacing.item_spacing = egui::vec2(10.0, 11.0);
-    style.spacing.button_padding = egui::vec2(14.0, 9.0);
-    style.spacing.window_margin = egui::Margin::same(12.0);
-    style.text_styles.insert(
-        egui::TextStyle::Heading,
-        egui::FontId::new(28.0, egui::FontFamily::Proportional),
-    );
-    style.text_styles.insert(
-        egui::TextStyle::Body,
-        egui::FontId::new(15.5, egui::FontFamily::Proportional),
-    );
-    style.text_styles.insert(
-        egui::TextStyle::Monospace,
-        egui::FontId::new(13.0, egui::FontFamily::Monospace),
-    );
+    style.spacing.item_spacing = egui::vec2(10.0, 8.0);
+    style.spacing.button_padding = egui::vec2(11.0, 8.0);
+    style.visuals.window_rounding = Rounding::same(16.0);
     ctx.set_style(style);
 }
 
