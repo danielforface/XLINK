@@ -26,6 +26,41 @@ fn dimensions_valid(width: u32, height: u32) -> Result<usize> {
     Ok(bytes)
 }
 
+/// Bound the number of pixels transmitted before JPEG compression.
+/// Keep aspect ratio to preserve normalized pointer coordinates.
+/// Triangle filtering keeps desktop text more legible than nearest-neighbor.
+pub fn fit_desktop(frame: CapturedFrame, max_width: u32, max_height: u32) -> Result<CapturedFrame> {
+    let _ = dimensions_valid(frame.width, frame.height)?;
+    if frame.stride != frame.width.saturating_mul(4)
+        || frame.pixels.len() != frame.width as usize * frame.height as usize * 4 {
+        bail!("invalid BGRA source for resizing");
+    }
+    if max_width == 0 || max_height == 0 {
+        bail!("invalid resize ceiling");
+    }
+    if frame.width <= max_width && frame.height <= max_height {
+        return Ok(frame);
+    }
+    let scale = (max_width as f64 / frame.width as f64)
+        .min(max_height as f64 / frame.height as f64);
+    let dst_width = ((frame.width as f64 * scale).floor() as u32).max(1);
+    let dst_height = ((frame.height as f64 * scale).floor() as u32).max(1);
+    let original = image::RgbaImage::from_raw(
+        frame.width, frame.height, frame.pixels.to_vec(),
+    ).context("unable to interpret BGRA desktop buffer as four channels")?;
+    // Channel order remains BGRA throughout; the resampler is channel-agnostic.
+    let resized = image::imageops::resize(
+        &original, dst_width, dst_height, image::imageops::FilterType::Triangle,
+    );
+    Ok(CapturedFrame {
+        width: dst_width,
+        height: dst_height,
+        stride: dst_width * 4,
+        frame_index: frame.frame_index,
+        pixels: resized.into_raw().into(),
+    })
+}
+
 pub fn encode(frame: CapturedFrame) -> Result<FramePacket> {
     let required = dimensions_valid(frame.width, frame.height)?;
     if frame.stride != frame.width * 4 || frame.pixels.len() != required {
@@ -101,6 +136,16 @@ mod tests {
         CapturedFrame {
             width, height, stride: width * 4, frame_index: 7, pixels: pixels.into(),
         }
+    }
+
+    #[test]
+    fn fit_desktop_preserves_aspect_and_small_originals() {
+        let small = captured(64, 64);
+        assert_eq!(fit_desktop(small, 1280, 800).unwrap().width, 64);
+        let large = captured(1920, 1080);
+        let reduced = fit_desktop(large, 1280, 800).unwrap();
+        assert_eq!((reduced.width, reduced.height), (1280, 720));
+        assert_eq!(reduced.pixels.len(), 1280 * 720 * 4);
     }
 
     #[test]
