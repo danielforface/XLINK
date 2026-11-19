@@ -1516,6 +1516,14 @@ impl NexusGuiApp {
                 ui.add_space(6.0);
                 ui.label(format!("Server: {}", prompt.server_addr));
                 ui.label(format!("Session ID: {}", prompt.session_id));
+                ui.add_space(10.0);
+                if prompt.remember_requested {
+                    ui.checkbox(&mut self.trust_current_technician,
+                        "Remember this technician for future access without approval");
+                    ui.add(egui::Label::new(
+                        "Optional: this authenticated computer can reconnect while XLINK is running.                          You can revoke it any time in Settings."
+                    ).wrap(true));
+                }
                 ui.add_space(12.0);
 
                 ui.horizontal(|ui| {
@@ -1581,7 +1589,9 @@ impl NexusGuiApp {
                         .add(egui::Button::new("Deny").fill(Color32::from_rgb(128, 46, 57)))
                         .clicked()
                     {
-                        match self.ui_bridge.respond_host_consent(false) {
+                        match self.ui_bridge.respond_host_consent(HostConsentDecision {
+                            approved: false, remember_technician: false,
+                        }) {
                             Ok(()) => {
                                 self.pending_host_consent = None;
                                 self.set_status("Host denied local consent");
@@ -1596,7 +1606,11 @@ impl NexusGuiApp {
                         .add(egui::Button::new("Approve").fill(Color32::from_rgb(44, 125, 83)))
                         .clicked()
                     {
-                        match self.ui_bridge.respond_host_consent(true) {
+                        match self.ui_bridge.respond_host_consent(HostConsentDecision {
+                            approved: true,
+                            remember_technician: prompt.remember_requested
+                                && self.trust_current_technician,
+                        }) {
                             Ok(()) => {
                                 self.pending_host_consent = None;
                                 self.set_status("Host approved local consent");
@@ -2212,6 +2226,7 @@ async fn run_host_peer_session(
             remote_addr: remote_addr_str.clone(),
             requester_id: incoming_auth.requester_id.clone(),
             target_session: incoming_auth.target_id.clone(),
+            remember_requested: incoming_auth.remember_device,
         })
         .await
         .ok();
@@ -2859,7 +2874,7 @@ async fn request_host_consent(
     incoming_auth: &IncomingAuth,
     runtime_event_tx: &mpsc::Sender<RuntimeEvent>,
     ui_bridge: &Arc<UiBridge>,
-) -> Result<bool> {
+) -> Result<HostConsentDecision> {
     if let Ok(value) = std::env::var("NEXUS_AUTO_CONSENT") {
         let normalized = value.trim().to_ascii_lowercase();
         if matches!(normalized.as_str(), "1" | "true" | "yes" | "y") {
@@ -2867,7 +2882,7 @@ async fn request_host_consent(
         }
         if matches!(normalized.as_str(), "0" | "false" | "no" | "n") {
             warn!("NEXUS_AUTO_CONSENT enabled: auto-denying consent for this session");
-            return Ok(false);
+            return Ok(HostConsentDecision { approved: false, remember_technician: false });
         }
     }
 
@@ -2884,7 +2899,7 @@ async fn request_host_consent(
         .ok();
 
     match time::timeout(Duration::from_secs(180), decision_rx).await {
-        Ok(Ok(approved)) => Ok(approved),
+        Ok(Ok(decision)) => Ok(decision),
         Ok(Err(_)) => Err(anyhow!("host consent response channel was closed")),
         Err(_) => {
             ui_bridge.clear_host_consent_sender();
