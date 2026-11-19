@@ -2557,7 +2557,9 @@ async fn run_host_peer_session(
         && decision.remember_technician {
         // Both sides opted in; the peer identity is authenticated by QUIC.
         // Only successful persistence can enable future unattended access.
-        match trust_registry.add_technician(remote_id, &incoming_auth.requester_id)
+        let display_label: String = incoming_auth.requester_id.chars()
+            .take(40).collect();
+        match trust_registry.add_technician(remote_id, &display_label)
             .and_then(|_| trust_registry.set_unattended_enabled(true)) {
             Ok(()) => {
                 control_send.send_control(&ControlMessage::Ack(
@@ -2961,8 +2963,11 @@ async fn run_client_session(
         if enrollment_confirmed && remember_host {
             // A successful encrypted QUIC session AND an explicit Host
             // enrollment acknowledgement are required before saving a device.
+            let friendly_label = format!(
+                "Computer {}", hex::encode(&invitation.endpoint_id[..3])
+            );
             match trust_registry.remember_computer(
-                invitation.endpoint_id, &remote_addr_str,
+                invitation.endpoint_id, &friendly_label,
             ) {
                 Ok(()) => {
                     let _ = runtime_event_tx.send(RuntimeEvent::SessionStatus(
