@@ -74,7 +74,7 @@ pub async fn advertise_and_pair(
     let secret = format!("{:06}", u32::from_be_bytes(random) % 1_000_000);
     let mailbox = time::timeout(Duration::from_secs(20),
         MailboxConnection::create_with_password(
-            app_config(), secret.parse().context("invalid numeric password")?,
+            app_config(), secret.as_str(),
         ))
         .await.context("public mailbox allocation timed out")?
         .context("public mailbox rejected connection")?;
