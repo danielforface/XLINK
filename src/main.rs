@@ -51,7 +51,7 @@ use winreg::enums::HKEY_CURRENT_USER;
 #[cfg(target_os = "windows")]
 use winreg::RegKey;
 
-const PROTOCOL_VERSION: u16 = 3;
+const PROTOCOL_VERSION: u16 = 4;
 const MAX_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
 const MAX_CONTROL_MESSAGE_BYTES: usize = 64 * 1024;
 const MAX_FRAME_WIDTH: u32 = 16_384;
