@@ -1981,8 +1981,8 @@ async fn run_host_peer_session(
     session_state.transition(SessionState::Authenticating)?;
 
     // Accept QUIC connection via iroh
-    let connection = time::timeout(HANDSHAKE_TIMEOUT, accept_connection(&endpoint))
-        .await.context("waiting for a remote connection timed out")??;
+    // Waiting for a user-initiated connection is normal idle time, not a timeout.
+    let connection = accept_connection(endpoint).await?;
     let remote_addr_str = format!("iroh:{}", connection.remote_id());
 
     let handshake_latency = 0u128; // iroh establishes connection in background
