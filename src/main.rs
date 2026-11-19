@@ -49,6 +49,9 @@ use winreg::RegKey;
 
 const PROTOCOL_VERSION: u16 = 1;
 const MAX_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
+const MAX_CONTROL_MESSAGE_BYTES: usize = 64 * 1024;
+const MAX_FRAME_WIDTH: u32 = 16_384;
+const MAX_FRAME_HEIGHT: u32 = 16_384;
 const DEFAULT_PORT: u16 = 0;
 const DEFAULT_FPS: u16 = 30;
 const MIN_FPS: u16 = 1;
@@ -1834,7 +1837,7 @@ pub struct PacketSender(Arc<tokio::sync::Mutex<SendStream>>);
 impl PacketSender {
     pub async fn send_control(&self, msg: &ControlMessage) -> Result<()> {
         let mut guard = self.0.lock().await;
-        send_message(&mut *guard, msg).await
+        send_message_limited(&mut *guard, msg, MAX_CONTROL_MESSAGE_BYTES).await
     }
 }
 
@@ -1854,7 +1857,7 @@ pub struct PacketReceiver(Arc<tokio::sync::Mutex<RecvStream>>);
 impl PacketReceiver {
     pub async fn recv_control(&self) -> Result<ControlMessage> {
         let mut guard = self.0.lock().await;
-        recv_message::<ControlMessage>(&mut *guard).await
+        recv_message_limited::<ControlMessage>(&mut *guard, MAX_CONTROL_MESSAGE_BYTES).await
     }
 }
 
@@ -2376,6 +2379,14 @@ async fn run_client_session(
                         continue;
                     };
 
+                    if packet.width == 0 || packet.height == 0
+                        || packet.width > MAX_FRAME_WIDTH || packet.height > MAX_FRAME_HEIGHT
+                        || packet.stride < packet.width.saturating_mul(4)
+                    {
+                        warn!(sequence = packet.sequence, "dropping frame with invalid dimensions");
+                        continue;
+                    }
+
                     if packet.pixels.len() != expected {
                         warn!(
                             sequence = packet.sequence,
@@ -2393,9 +2404,15 @@ async fn run_client_session(
                         pixels: packet.pixels,
                     };
 
-                    if viewer_frame_tx.send(frame).is_err() {
-                        info!("viewer closed, ending client frame loop");
-                        break;
+                    match viewer_frame_tx.try_send(frame) {
+                        Ok(()) => {}
+                        Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                            // Slow rendering must not accumulate full-screen frames in memory.
+                        }
+                        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                            info!("viewer closed, ending client frame loop");
+                            break;
+                        }
                     }
                 }
                 Err(error) => {
@@ -2428,8 +2445,7 @@ async fn request_client_permission(
     if let Ok(value) = std::env::var("NEXUS_AUTO_CLIENT_PERMISSION") {
         let normalized = value.trim().to_ascii_lowercase();
         if matches!(normalized.as_str(), "1" | "true" | "yes" | "y") {
-            warn!("NEXUS_AUTO_CLIENT_PERMISSION enabled: auto-approving client-side request");
-            return Ok(true);
+            warn!("NEXUS_AUTO_CLIENT_PERMISSION cannot bypass on-screen consent; ignoring auto-approval flag");
         }
         if matches!(normalized.as_str(), "0" | "false" | "no" | "n") {
             warn!("NEXUS_AUTO_CLIENT_PERMISSION enabled: auto-denying client-side request");
@@ -2467,8 +2483,7 @@ async fn request_host_consent(
     if let Ok(value) = std::env::var("NEXUS_AUTO_CONSENT") {
         let normalized = value.trim().to_ascii_lowercase();
         if matches!(normalized.as_str(), "1" | "true" | "yes" | "y") {
-            warn!("NEXUS_AUTO_CONSENT enabled: auto-approving consent for this session");
-            return Ok(true);
+            warn!("NEXUS_AUTO_CONSENT cannot bypass on-screen consent; ignoring auto-approval flag");
         }
         if matches!(normalized.as_str(), "0" | "false" | "no" | "n") {
             warn!("NEXUS_AUTO_CONSENT enabled: auto-denying consent for this session");
@@ -2637,12 +2652,16 @@ async fn wait_for_session_consent(control_recv: &PacketReceiver) -> Result<()> {
 }
 
 async fn send_message<T: Serialize>(stream: &mut SendStream, value: &T) -> Result<()> {
+    send_message_limited(stream, value, MAX_MESSAGE_BYTES).await
+}
+
+async fn send_message_limited<T: Serialize>(stream: &mut SendStream, value: &T, limit: usize) -> Result<()> {
     let payload = bincode::serialize(value).context("failed to encode message")?;
-    if payload.len() > MAX_MESSAGE_BYTES {
+    if payload.len() > limit {
         bail!(
             "encoded message exceeds max size: {} > {} bytes",
             payload.len(),
-            MAX_MESSAGE_BYTES
+            limit
         );
     }
 
@@ -2660,17 +2679,21 @@ async fn send_message<T: Serialize>(stream: &mut SendStream, value: &T) -> Resul
 }
 
 async fn recv_message<T: DeserializeOwned>(stream: &mut RecvStream) -> Result<T> {
+    recv_message_limited(stream, MAX_MESSAGE_BYTES).await
+}
+
+async fn recv_message_limited<T: DeserializeOwned>(stream: &mut RecvStream, limit: usize) -> Result<T> {
     let mut len_buf = [0_u8; 4];
     stream
         .read_exact(&mut len_buf)
         .await
         .context("failed to read message length")?;
     let len = u32::from_le_bytes(len_buf) as usize;
-    if len > MAX_MESSAGE_BYTES {
+    if len > limit {
         bail!(
             "incoming message exceeds max size: {} > {} bytes",
             len,
-            MAX_MESSAGE_BYTES
+            limit
         );
     }
 
