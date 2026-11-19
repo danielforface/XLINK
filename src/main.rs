@@ -499,7 +499,11 @@ impl NexusGuiApp {
                     if !running {
                         self.pending_host_consent = None;
                         self.ui_bridge.clear_host_consent_sender();
-                        self.push_log("Host task finished".to_string());
+                        // Revocation invalidates previously shared endpoint codes.
+                        // A subsequent hosting session uses a fresh private identity.
+                        self.host_seed = rand::random::<[u8; 32]>();
+                        self.generated_access_id = None;
+                        self.push_log("Host stopped; old access code invalidated".to_string());
                     }
                 }
                 RuntimeEvent::ClientLifecycle { running } => {
