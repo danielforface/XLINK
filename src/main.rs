@@ -3,6 +3,7 @@
 mod adaptive;
 mod delta;
 mod frame_codec;
+mod short_code;
 
 use anyhow::{anyhow, bail, Context, Result};
 use arboard::Clipboard;
@@ -1130,8 +1131,8 @@ impl NexusGuiApp {
             return;
         }
 
-        if let Err(error) = parse_connection_seed(access_id) {
-            self.push_log(format!("Connection seed validation failed: {error}"));
+        if let Err(error) = short_code::parse_code(access_id) {
+            self.push_log(format!("Invalid numeric code: {error}"));
             return;
         }
 
@@ -1618,13 +1619,13 @@ async fn runtime_dispatch_loop(
                     continue;
                 }
 
-                let parsed_access_id = match parse_connection_seed(&access_id) {
+                let _validated_code = match short_code::parse_code(&access_id) {
                     Ok(parsed) => parsed,
                     Err(error) => {
                         client_running.store(false, Ordering::Release);
                         let _ = runtime_event_tx
                             .send(RuntimeEvent::Error(format!(
-                                "invalid connection seed supplied by UI: {error}"
+                                "invalid short pairing code: {error}"
                             )))
                             .await;
                         continue;
@@ -1645,13 +1646,17 @@ async fn runtime_dispatch_loop(
                         ))
                         .await;
 
-                    let run_result = run_client_session(
-                        parsed_access_id,
-                        display_name,
-                        event_tx.clone(),
-                        bridge,
-                    )
-                    .await;
+                    let run_result = async {
+                        let _ = event_tx.send(RuntimeEvent::SessionStatus(
+                            "Authenticating short code through public mailbox...".to_string()
+                        )).await;
+                        let invitation = short_code::resolve(&access_id).await
+                            .context("public pairing failed")?;
+                        let _ = event_tx.send(RuntimeEvent::SessionStatus(
+                            "Identity verified; starting encrypted QUIC connection".to_string()
+                        )).await;
+                        run_client_session(invitation, display_name, event_tx.clone(), bridge).await
+                    }.await;
 
                     client_running_flag.store(false, Ordering::Release);
                     let _ = event_tx
@@ -1757,47 +1762,71 @@ async fn run_server_session(
         warn!(requested_fps = config.fps, fps, "fps value clamped to supported range");
     }
 
-    // Derive SecretKey and session ID from the host seed
-    let (secret_key, session_id) = derive_keys_from_seed(&config.seed);
-    let credentials = SessionCredentials { session_id: session_id.clone() };
-
-    // Build and bind the iroh endpoint with the derived secret key
+    // The private endpoint identity stays local; only its PUBLIC part is
+    // exchanged in an authenticated Magic Wormhole pairing.
+    let (secret_key, _) = derive_keys_from_seed(&config.seed);
     let endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::N0)
         .secret_key(secret_key)
         .alpns(vec![nexus_network::NEXUS_ALPN.to_vec()])
         .bind()
-        .await
-        .context("failed to create iroh endpoint")?;
-
+        .await.context("failed to bind encrypted iroh endpoint")?;
     let node_id = endpoint.id();
-    let access_id = build_access_id(&config.seed)?;
-
-    runtime_event_tx
-        .send(RuntimeEvent::HostReady {
-            advertised_addr: format!("iroh:{}", node_id),
-            fingerprint: node_id.to_string(), // Actual authenticated endpoint public identity
-            session_id: credentials.session_id.clone(),
-            access_id,
-            fps,
-            inject_input: config.inject_input,
-        })
-        .await
-        .ok();
 
     loop {
+        let (ready_tx, mut ready_rx) = mpsc::channel(1);
+        let pairing = short_code::advertise_and_pair(
+            *node_id.as_bytes(), &ready_tx,
+        );
+        tokio::pin!(pairing);
+        // Never display a randomly fabricated local code: wait for the
+        // publicly operated mailbox to confirm a real allocated nameplate.
+        let code = tokio::select! {
+            value = ready_rx.recv() => value.context("public mailbox closed before allocation")?,
+            outcome = &mut pairing => {
+                outcome?;
+                bail!("public pairing ended without publishing a code")
+            }
+        };
+
+        let _ = runtime_event_tx.send(RuntimeEvent::HostReady {
+            advertised_addr: format!("iroh:{}", node_id),
+            fingerprint: node_id.to_string(),
+            session_id: "one-time-secret".to_string(),
+            access_id: code,
+            fps,
+            inject_input: config.inject_input,
+        }).await;
+
+        let invitation = match pairing.await {
+            Ok(invitation) => invitation,
+            Err(error) => {
+                warn!(?error, "public mailbox pairing failed; retrying with new code");
+                let _ = runtime_event_tx.send(RuntimeEvent::SessionStatus(
+                    format!("Pairing unavailable: {error}; refreshing code")
+                )).await;
+                time::sleep(Duration::from_secs(3)).await;
+                continue;
+            }
+        };
+        let credentials = SessionCredentials { session_id: invitation.ticket };
+        let _ = runtime_event_tx.send(RuntimeEvent::SessionStatus(
+            "Short code authenticated; waiting for technician QUIC handshake".to_string()
+        )).await;
         let result = run_host_peer_session(
             &endpoint, &config, &credentials, &runtime_event_tx, &ui_bridge, fps,
         ).await;
-        if let Err(error) = result {
-            warn!(?error, "incoming session ended with error; listener remains available");
-            let _ = runtime_event_tx.send(RuntimeEvent::SessionStatus(
-                format!("Session ended: {error}; awaiting another connection")
-            )).await;
-            time::sleep(Duration::from_millis(250)).await;
-        } else {
-            let _ = runtime_event_tx.send(RuntimeEvent::SessionStatus(
-                "Session ended; awaiting another connection".to_string()
-            )).await;
+        match result {
+            Ok(()) => {
+                let _ = runtime_event_tx.send(RuntimeEvent::SessionStatus(
+                    "Support session ended; generating fresh short code".to_string()
+                )).await;
+            }
+            Err(error) => {
+                warn!(?error, "support session ended with error");
+                let _ = runtime_event_tx.send(RuntimeEvent::SessionStatus(
+                    format!("Session ended: {error}; refreshing short code")
+                )).await;
+            }
         }
     }
 }
@@ -2199,14 +2228,14 @@ async fn run_host_peer_session(
 }
 
 async fn run_client_session(
-    parsed_access_id: ParsedAccessId,
+    invitation: short_code::Invitation,
     display_name: Option<String>,
     runtime_event_tx: mpsc::Sender<RuntimeEvent>,
     ui_bridge: Arc<UiBridge>,
 ) -> Result<()> {
-    let remote_id = iroh::PublicKey::from_bytes(&parsed_access_id.endpoint_id)
+    let remote_id = iroh::PublicKey::from_bytes(&invitation.endpoint_id)
         .context("connection ID is not a valid endpoint public key")?;
-    let session_id = derive_session_id(&parsed_access_id.endpoint_id);
+    let session_id = invitation.ticket;
 
     // Create client endpoint
     let endpoint = create_client_endpoint().await?;
