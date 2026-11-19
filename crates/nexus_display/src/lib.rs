@@ -354,8 +354,16 @@ fn run_remote_viewer(
             break;
         }
 
-        while let Ok(frame) = frame_rx.try_recv() {
-            latest_frame = frame;
+        loop {
+            match frame_rx.try_recv() {
+                Ok(frame) => latest_frame = frame,
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
+                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                    // A revoked/closed session must close its remote desktop window,
+                    // not leave a misleading frozen controllable viewer behind.
+                    return Ok(());
+                }
+            }
         }
 
         if latest_frame.width as usize != width || latest_frame.height as usize != height {
