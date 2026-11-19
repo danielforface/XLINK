@@ -772,7 +772,7 @@ impl NexusGuiApp {
                     }
 
                     ui.vertical(|ui| {
-                        ui.label("Connection Seed (Base64):");
+                        ui.label("Public Access ID (share with technician):");
                         let mut seed_display = export_seed.clone();
                         ui.add(
                             egui::TextEdit::multiline(&mut seed_display)
@@ -783,7 +783,7 @@ impl NexusGuiApp {
 
                         if show_mnemonic {
                             ui.add_space(4.0);
-                            ui.label("Mnemonic Phrase (24 Words):");
+                            ui.label("Public ID as 24 words (optional):");
                             let mut mnem_display = mnemonic.clone();
                             ui.add(
                                 egui::TextEdit::multiline(&mut mnem_display)
@@ -798,7 +798,7 @@ impl NexusGuiApp {
                         ui.horizontal_wrapped(|ui| {
                             if ui
                                 .add(
-                                    egui::Button::new("Copy Seed")
+                                    egui::Button::new("Copy Access ID")
                                         .rounding(Rounding::same(10.0))
                                         .fill(Color32::from_rgb(60, 108, 171)),
                                 )
@@ -808,7 +808,7 @@ impl NexusGuiApp {
                                     Ok(()) => {
                                         self.copied_notice_until =
                                             Some(Instant::now() + Duration::from_secs(2));
-                                        self.set_status("Connection seed copied to clipboard");
+                                        self.set_status("Public Access ID copied to clipboard");
                                     }
                                     Err(error) => {
                                         self.push_log(format!("Clipboard copy failed: {error}"));
@@ -819,7 +819,7 @@ impl NexusGuiApp {
                             if show_mnemonic {
                                 if ui
                                     .add(
-                                        egui::Button::new("Copy Mnemonic")
+                                        egui::Button::new("Copy 24-word Public ID")
                                             .rounding(Rounding::same(10.0))
                                             .fill(Color32::from_rgb(48, 117, 173)),
                                     )
@@ -910,7 +910,7 @@ impl NexusGuiApp {
                     });
                 } else {
                     ui.label(
-                        RichText::new("Start hosting to generate credentials and QR code")
+                        RichText::new("Click Start Hosting to generate a shareable public Access ID and QR code")
                             .color(Color32::from_rgb(176, 190, 207)),
                     );
                 }
@@ -929,7 +929,7 @@ impl NexusGuiApp {
                     ui.add_sized(
                         [ui.available_width(), 80.0],
                         egui::TextEdit::multiline(&mut self.access_id_input)
-                            .hint_text("Paste connection seed, mnemonic phrase, deep link, or legacy Access ID"),
+                            .hint_text("Paste the public Access ID copied from the remote Host"),
                     );
 
                     if !self.client_public_addr_display.is_empty() {
