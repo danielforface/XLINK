@@ -2080,8 +2080,6 @@ async fn runtime_dispatch_loop(
 
                 let event_tx = runtime_event_tx.clone();
                 let host_running_flag = Arc::clone(&host_running);
-                let registry = trust_registry.clone();
-                let registry = trust_registry.clone();
                 let bridge = Arc::clone(&ui_bridge);
                 let registry = trust_registry.clone();
 
@@ -2148,6 +2146,7 @@ async fn runtime_dispatch_loop(
 
                 let event_tx = runtime_event_tx.clone();
                 let client_running_flag = Arc::clone(&client_running);
+                let registry = trust_registry.clone();
                 let bridge = Arc::clone(&ui_bridge);
 
                 client_task = Some(tokio::spawn(async move {
