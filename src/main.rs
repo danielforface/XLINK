@@ -710,73 +710,14 @@ impl NexusGuiApp {
             |ui| {
                 ui.vertical(|ui| {
                     ui.horizontal(|ui| {
-                        ui.label("Port:");
-                        ui.add(
-                            egui::DragValue::new(&mut self.host_port)
-                                .clamp_range(0..=65535)
-                                .speed(1),
-                        );
-
-                        ui.add_space(20.0);
                         ui.label("Capture FPS:");
                         ui.add(egui::Slider::new(&mut self.host_fps, MIN_FPS..=MAX_FPS));
                     });
-
                     ui.add_space(8.0);
-                    ui.checkbox(&mut self.host_inject_input, "Enable host input injection");
-
+                    ui.checkbox(&mut self.host_inject_input, "Allow remote input after local approval");
                     ui.add_space(8.0);
-                    ui.horizontal(|ui| {
-                        ui.label("Transport Mode:");
-                        egui::ComboBox::from_id_source("host_transport_mode_combo")
-                            .selected_text(match self.host_transport_mode {
-                                TransportMode::AutoSelect => "Auto-Select",
-                                TransportMode::ForceQuicP2p => "Force QUIC Direct P2P",
-                                TransportMode::ForceHttpsTcp => "Force HTTPS-TCP Fallback (Port 443)",
-                            })
-                            .show_ui(ui, |ui| {
-                                ui.selectable_value(&mut self.host_transport_mode, TransportMode::AutoSelect, "Auto-Select");
-                                ui.selectable_value(&mut self.host_transport_mode, TransportMode::ForceQuicP2p, "Force QUIC Direct P2P");
-                                ui.selectable_value(&mut self.host_transport_mode, TransportMode::ForceHttpsTcp, "Force HTTPS-TCP Fallback (Port 443)");
-                            });
-                    });
-
-                    ui.add_space(8.0);
-                    ui.horizontal(|ui| {
-                        ui.label("Advertised Address:");
-                        ui.add_sized(
-                            [ui.available_width() - 160.0, 24.0],
-                            egui::TextEdit::singleline(&mut self.host_advertise_addr_input)
-                                .hint_text("e.g. 12.34.56.78:5000"),
-                        );
-
-                        let detect_btn_label = if self.detecting_public_ip.load(Ordering::Relaxed) {
-                            "Detecting..."
-                        } else {
-                            "Run Diagnostics"
-                        };
-
-                        if ui
-                            .add_enabled(
-                                !self.detecting_public_ip.load(Ordering::Relaxed),
-                                egui::Button::new(detect_btn_label),
-                            )
-                            .clicked()
-                        {
-                            self.detecting_public_ip.store(true, Ordering::Relaxed);
-                            let _ = self.runtime_cmd_tx.try_send(RuntimeCommand::RunDiagnostics);
-                        }
-                    });
-
-                    ui.add_space(8.0);
-                    ui.horizontal(|ui| {
-                        ui.label("Client Address (for Hole Punching):");
-                        ui.add_sized(
-                            [ui.available_width(), 24.0],
-                            egui::TextEdit::singleline(&mut self.client_punch_addr_input)
-                                .hint_text("e.g. 12.34.56.78:54321 (optional)"),
-                        );
-                    });
+                    ui.label("Transport: encrypted iroh QUIC (automatic direct P2P / relay fallback)");
+                    ui.label("Connection identity is generated after Start Hosting. No IP or port forwarding is normally required.");
 
                     ui.add_space(12.0);
 
@@ -1137,20 +1078,9 @@ impl NexusGuiApp {
                     });
 
                     ui.add_space(8.0);
-                    ui.horizontal(|ui| {
-                        ui.label("Transport Mode:");
-                        egui::ComboBox::from_id_source("client_transport_mode_combo")
-                            .selected_text(match self.host_transport_mode {
-                                TransportMode::AutoSelect => "Auto-Select",
-                                TransportMode::ForceQuicP2p => "Force QUIC Direct P2P",
-                                TransportMode::ForceHttpsTcp => "Force HTTPS-TCP Fallback (Port 443)",
-                            })
-                            .show_ui(ui, |ui| {
-                                ui.selectable_value(&mut self.host_transport_mode, TransportMode::AutoSelect, "Auto-Select");
-                                ui.selectable_value(&mut self.host_transport_mode, TransportMode::ForceQuicP2p, "Force QUIC Direct P2P");
-                                ui.selectable_value(&mut self.host_transport_mode, TransportMode::ForceHttpsTcp, "Force HTTPS-TCP Fallback (Port 443)");
-                            });
-                    });
+                    ui.label("Transport: iroh QUIC with automatic direct/relay negotiation");
+                    ui.label("Paste the public Access ID from the remote Host, then Connect.");
+                    ui.add_space(8.0);
 
                     ui.add_space(10.0);
 
