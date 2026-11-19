@@ -1873,6 +1873,26 @@ impl eframe::App for NexusGuiApp {
                     }
                     ui.with_layout(
                         egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if self.host_running {
+                                if ui.add(egui::Button::new(
+                                    RichText::new("■ Stop sharing").size(11.5)
+                                        .color(Color32::from_rgb(176, 55, 64))
+                                ).fill(Color32::from_rgb(255, 237, 240))
+                                    .rounding(Rounding::same(10.0))).clicked() {
+                                    if self.runtime_cmd_tx.try_send(
+                                        RuntimeCommand::StopHosting
+                                    ).is_ok() {
+                                        self.generated_access_id = None;
+                                        self.code_ready_at = None;
+                                        self.set_status("Stopping all remote sessions...");
+                                    }
+                                }
+                            } else if ui.add(
+                                egui::Button::new("Start hosting")
+                                    .rounding(Rounding::same(10.0))
+                            ).clicked() {
+                                self.start_hosting_clicked();
+                            }
                             let logs = egui::Button::new(
                                 RichText::new("☷  Logs").size(12.0)
                             ).rounding(Rounding::same(10.0))
