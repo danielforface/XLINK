@@ -120,13 +120,32 @@ impl DeltaEncoder {
             payload.extend_from_slice(&(dirty_tile_count as u32).to_le_bytes());
             for (i, dirty) in dirty_tiles.iter().copied().enumerate() {
                 if !dirty { continue; }
-                let x = (i % tile_columns) * TILE_SIZE;
-                let y = (i / tile_columns) * TILE_SIZE;
-                let patch_w = TILE_SIZE.min(width - x);
-                let patch_h = TILE_SIZE.min(height - y);
-                let patch = encode_crop(&frame, x, y, patch_w, patch_h)?;
+                let tile_x = (i % tile_columns) * TILE_SIZE;
+                let tile_y = (i / tile_columns) * TILE_SIZE;
+                let tile_right = (tile_x + TILE_SIZE).min(width);
+                let tile_bottom = (tile_y + TILE_SIZE).min(height);
+                let mut min_tx = tile_right;
+                let mut min_ty = tile_bottom;
+                let mut max_tx = tile_x;
+                let mut max_ty = tile_y;
+                for y in tile_y..tile_bottom {
+                    for x in tile_x..tile_right {
+                        let offset = (y * width + x) * 4;
+                        if self.previous[offset..offset + 4] != frame.pixels[offset..offset + 4] {
+                            min_tx = min_tx.min(x);
+                            min_ty = min_ty.min(y);
+                            max_tx = max_tx.max(x);
+                            max_ty = max_ty.max(y);
+                        }
+                    }
+                }
+                // Preserve tiny cursor/caret pixels instead of diluting them
+                // inside a large, lossy 128x128 JPEG.
+                let patch_w = max_tx - min_tx + 1;
+                let patch_h = max_ty - min_ty + 1;
+                let patch = encode_crop(&frame, min_tx, min_ty, patch_w, patch_h)?;
                 let len = u32::try_from(patch.pixels.len()).context("tile payload too large")?;
-                for v in [x as u32, y as u32, patch.width, patch.height, patch.stride, len] {
+                for v in [min_tx as u32, min_ty as u32, patch.width, patch.height, patch.stride, len] {
                     payload.extend_from_slice(&v.to_le_bytes());
                 }
                 payload.extend_from_slice(&patch.pixels);
