@@ -310,59 +310,56 @@ pub fn code_slots(
         }
     }
 
-    // Visual slots deliberately show ten positions: the public mailbox
-    // allocates variable-width nameplates, yielding 8, 9 or 10 digits.
-    // The last two slots are visibly optional, rather than asserting that
-    // every public code always has eight characters.
+    // Ten unboxed, underline-only positions. Public mailbox nameplate length
+    // varies, so the final two positions are visually optional (8–10 digits).
+    // All lines share one baseline; the focused line brightens and thickens
+    // without shifting layout or showing a visually noisy input rectangle.
     for i in 0..numeric_entry::MAX_CODE_DIGITS {
         let left = rect.left() + i as f32 * (m.slot_width + m.gap);
-        let slot = Rect::from_min_size(
-            egui::pos2(left, rect.top() + 3.0),
-            Vec2::new(m.slot_width, 48.0),
-        );
+        let right = left + m.slot_width;
+        let center_x = left + m.slot_width / 2.0;
+        let baseline = rect.bottom() - 6.0;
         let is_current = focused && *cursor == i;
         let is_optional = i >= numeric_entry::MIN_CODE_DIGITS;
-        let color = if is_current {
-            Color32::from_rgb(235, 244, 255)
-        } else if is_optional {
-            Color32::from_rgb(250, 251, 254)
-        } else {
-            Color32::from_rgb(246, 249, 254)
-        };
-        let outline = if is_current {
+        let has_digit = code.as_bytes().get(i).is_some();
+
+        let underline = if is_current {
             BLUE
+        } else if has_digit {
+            Color32::from_rgb(116, 150, 200)
         } else if is_optional {
-            Color32::from_rgb(230, 235, 245)
+            Color32::from_rgb(223, 230, 240)
         } else {
-            OUTLINE
+            Color32::from_rgb(197, 211, 229)
         };
-        ui.painter().rect_filled(slot, Rounding::same(9.0), color);
-        ui.painter().rect_stroke(
-            slot, Rounding::same(9.0),
-            Stroke::new(if is_current { 1.7 } else { 1.0 }, outline),
+        // Eased transition driven by focus/selection, independently for each
+        // position: no emoji, no font-specific border glyphs.
+        let emphasis = ui.ctx().animate_bool(
+            response.id.with(("slot", i)), is_current,
         );
+        let stroke = Stroke::new(1.45 + emphasis * 1.55, underline);
+        ui.painter().line_segment([
+            egui::pos2(left + 2.0, baseline),
+            egui::pos2(right - 2.0, baseline),
+        ], stroke);
+        if is_current {
+            // Restrained active marker: a small blue caret above the line.
+            let blink = ui.input(|input| (input.time * 2.25).sin() > -0.15);
+            if blink && !has_digit {
+                ui.painter().line_segment([
+                    egui::pos2(center_x, baseline - 28.0),
+                    egui::pos2(center_x, baseline - 8.0),
+                ], Stroke::new(1.55, BLUE));
+            }
+        }
         if let Some(digit) = code.as_bytes().get(i) {
             ui.painter().text(
-                slot.center(), Align2::CENTER_CENTER, (*digit as char).to_string(),
-                FontId::proportional(22.0), INK,
+                egui::pos2(center_x, baseline - 22.0),
+                Align2::CENTER_CENTER,
+                (*digit as char).to_string(),
+                FontId::proportional(23.0),
+                if is_current { BLUE } else { INK },
             );
-        } else if is_current {
-            let blink = ui.input(|input| (input.time * 2.4).sin() > -0.15);
-            if blink {
-                ui.painter().line_segment([
-                    slot.center() - egui::vec2(0.0, 9.0),
-                    slot.center() + egui::vec2(0.0, 9.0),
-                ], Stroke::new(1.8, BLUE));
-            }
-        } else {
-            ui.painter().line_segment([
-                slot.center() + egui::vec2(-5.0, 6.0),
-                slot.center() + egui::vec2(5.0, 6.0),
-            ], Stroke::new(1.2, if is_optional {
-                Color32::from_rgb(219, 225, 236)
-            } else {
-                Color32::from_rgb(194, 207, 226)
-            }));
         }
     }
     SlotResult { submit }
