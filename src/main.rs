@@ -1,5 +1,6 @@
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 
+mod adaptive;
 mod frame_codec;
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -2204,7 +2205,9 @@ async fn run_server_session(
 
     let mut capturer = ScreenCapturer::new()?;
     let mut control_task_finished = false;
-    let mut ticker = time::interval(Duration::from_millis(frame_interval_ms));
+    let mut capture_failures = 0u32;
+    let mut pacer = adaptive::AdaptiveFrameRate::new(fps);
+    let mut ticker = time::interval(pacer.interval());
     ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
     loop {
@@ -2225,15 +2228,49 @@ async fn run_server_session(
             continue;
         }
 
-        let frame = capturer.capture_frame()?;
+        let started = Instant::now();
+        let frame = match capturer.capture_frame() {
+            Ok(frame) => {
+                capture_failures = 0;
+                frame
+            }
+            Err(error) => {
+                capture_failures = capture_failures.saturating_add(1);
+                if capture_failures == 1 || capture_failures % 20 == 0 {
+                    warn!(?error, capture_failures, "desktop capture failed; attempting recovery");
+                }
+                if capture_failures % 3 == 0 {
+                    if let Ok(recreated) = ScreenCapturer::new() {
+                        capturer = recreated;
+                    }
+                }
+                if capture_failures >= 600 {
+                    return Err(anyhow!("desktop capture could not recover after 600 attempts"));
+                }
+                time::sleep(Duration::from_millis(200)).await;
+                continue;
+            }
+        };
         let packet = frame_codec::encode(frame)?;
 
-        if let Err(error) = frame_stream_send.send_frame(&packet).await {
-            info!(?error, "frame stream ended");
-            break;
+        match time::timeout(Duration::from_secs(30), frame_stream_send.send_frame(&packet)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                info!(?error, "frame stream ended");
+                break;
+            }
+            Err(_) => {
+                warn!("frame send stalled for 30s; closing session");
+                break;
+            }
         }
 
-        info!(sequence = packet.sequence, bytes = packet.pixels.len(), "sent frame");
+        if pacer.observe(started.elapsed()) {
+            info!(fps = pacer.current(), "adaptive frame pacing updated");
+            ticker = time::interval(pacer.interval());
+            ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        }
+        tracing::debug!(sequence = packet.sequence, bytes = packet.pixels.len(), "sent frame");
     }
 
     input.set_state(InputSessionState::Inactive);
