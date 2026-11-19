@@ -4,6 +4,7 @@ mod adaptive;
 mod delta;
 mod frame_codec;
 mod short_code;
+mod trusted;
 
 use anyhow::{anyhow, bail, Context, Result};
 use arboard::Clipboard;
@@ -52,7 +53,8 @@ use winreg::enums::HKEY_CURRENT_USER;
 #[cfg(target_os = "windows")]
 use winreg::RegKey;
 
-const PROTOCOL_VERSION: u16 = 4;
+const PROTOCOL_VERSION: u16 = 5;
+const TRUSTED_SESSION_MARKER: &str = "xlink-authenticated-trusted-device-v1";
 const MAX_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
 const MAX_CONTROL_MESSAGE_BYTES: usize = 64 * 1024;
 const MAX_FRAME_WIDTH: u32 = 16_384;
@@ -77,6 +79,8 @@ impl<T> Drop for AbortOnDrop<T> {
 
 fn main() -> Result<()> {
     init_tracing();
+    let trust_registry = trusted::TrustRegistry::load_or_create()
+        .context("cannot load Windows-protected device identity")?;
 
     if let Err(error) = register_nexus_protocol_handler() {
         warn!(?error, "failed to register nexus protocol handler");
@@ -98,6 +102,7 @@ fn main() -> Result<()> {
         runtime_cmd_rx,
         runtime_event_tx,
         Arc::clone(&ui_bridge),
+        trust_registry.clone(),
     ));
 
     let mut runtime_event_rx_slot = Some(runtime_event_rx);
@@ -124,6 +129,7 @@ fn main() -> Result<()> {
                 ui_bridge_slot.take().expect("UI bridge missing"),
                 launch_connection_seed.clone(),
                 Arc::clone(&runtime),
+                trust_registry.clone(),
             );
             Box::new(app)
         }),
@@ -153,6 +159,7 @@ struct ParsedAccessId {
 struct IncomingAuth {
     requester_id: String,
     target_id: String,
+    remember_device: bool,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -177,7 +184,12 @@ enum RuntimeCommand {
     ConnectWithAccessId {
         access_id: String,
         display_name: Option<String>,
+        remember_host: bool,
         _transport_mode: TransportMode,
+    },
+    ConnectTrusted {
+        endpoint_id: [u8; 32],
+        display_name: Option<String>,
     },
     RunDiagnostics,
     StopHosting,
@@ -207,7 +219,9 @@ enum RuntimeEvent {
         requester_id: String,
         remote_addr: String,
         target_session: String,
+        remember_requested: bool,
     },
+    PairingCodeRevoked,
     HostLifecycle {
         running: bool,
     },
@@ -227,10 +241,16 @@ enum RuntimeEvent {
     Error(String),
 }
 
+#[derive(Debug, Clone, Copy)]
+struct HostConsentDecision {
+    approved: bool,
+    remember_technician: bool,
+}
+
 #[derive(Default)]
 struct UiBridge {
     pending_client_permission_sender: Mutex<Option<oneshot::Sender<bool>>>,
-    pending_host_consent_sender: Mutex<Option<oneshot::Sender<bool>>>,
+    pending_host_consent_sender: Mutex<Option<oneshot::Sender<HostConsentDecision>>>,
 }
 
 impl UiBridge {
@@ -268,7 +288,7 @@ impl UiBridge {
         }
     }
 
-    fn install_host_consent_sender(&self, sender: oneshot::Sender<bool>) -> Result<()> {
+    fn install_host_consent_sender(&self, sender: oneshot::Sender<HostConsentDecision>) -> Result<()> {
         let mut guard = self
             .pending_host_consent_sender
             .lock()
@@ -282,7 +302,7 @@ impl UiBridge {
         Ok(())
     }
 
-    fn respond_host_consent(&self, approved: bool) -> Result<()> {
+    fn respond_host_consent(&self, decision: HostConsentDecision) -> Result<()> {
         let mut guard = self
             .pending_host_consent_sender
             .lock()
@@ -290,7 +310,7 @@ impl UiBridge {
 
         match guard.take() {
             Some(sender) => sender
-                .send(approved)
+                .send(decision)
                 .map_err(|_| anyhow!("failed to send host consent decision")),
             None => Err(anyhow!("no pending host consent request")),
         }
@@ -320,6 +340,7 @@ struct HostConsentPrompt {
     requester_id: String,
     remote_addr: String,
     target_session: String,
+    remember_requested: bool,
 }
 
 struct NexusGuiApp {
@@ -339,6 +360,9 @@ struct NexusGuiApp {
     code_ready_at: Option<Instant>,
     refocus_number_input: bool,
     window_was_focused: bool,
+    remember_this_computer: bool,
+    trust_current_technician: bool,
+    trust_registry: trusted::TrustRegistry,
     host_advertise_addr_input: String,
 
     client_display_name: String,
@@ -376,6 +400,7 @@ impl NexusGuiApp {
         ui_bridge: Arc<UiBridge>,
         launch_connection_seed: Option<String>,
         runtime: Arc<Runtime>,
+        trust_registry: trusted::TrustRegistry,
     ) -> Self {
         apply_modern_theme(&cc.egui_ctx);
 
@@ -386,7 +411,10 @@ impl NexusGuiApp {
             .map(|seed| parse_connection_seed(seed).is_ok())
             .unwrap_or(false);
 
-        let host_seed = rand::random::<[u8; 32]>();
+        // Keep an encrypted, per-Windows-user private device identity across
+        // restarts so explicitly trusted peers can recognize this machine.
+        let host_seed = trust_registry.host_seed()
+            .expect("validated DPAPI-backed local identity");
 
         // Hosting is opt-in. Opening the application must not expose a listener automatically.
         let detected_public_addr = Arc::new(Mutex::new(None));
@@ -415,6 +443,9 @@ impl NexusGuiApp {
             code_ready_at: None,
             refocus_number_input: true,
             window_was_focused: false,
+            remember_this_computer: false,
+            trust_current_technician: false,
+            trust_registry,
             host_advertise_addr_input: default_advertise,
             client_display_name: String::new(),
             pending_client_permission: None,
@@ -503,11 +534,14 @@ impl NexusGuiApp {
                     requester_id,
                     remote_addr,
                     target_session,
+                    remember_requested,
                 } => {
+                    self.trust_current_technician = false;
                     self.pending_host_consent = Some(HostConsentPrompt {
                         requester_id,
                         remote_addr,
                         target_session,
+                        remember_requested,
                     });
                     self.active_tab = ActiveTab::HostMode;
                     self.set_status("ACTION REQUIRED: approve or deny the technician on this computer");
@@ -517,13 +551,16 @@ impl NexusGuiApp {
                     if !running {
                         self.pending_host_consent = None;
                         self.ui_bridge.clear_host_consent_sender();
-                        // Revocation invalidates previously shared endpoint codes.
-                        // A subsequent hosting session uses a fresh private identity.
-                        self.host_seed = rand::random::<[u8; 32]>();
+                        // The temporary pairing code is revoked, while the
+                        // stable device identity remains protected by DPAPI.
                         self.generated_access_id = None;
                         self.code_ready_at = None;
                         self.push_log("Host stopped; old access code invalidated".to_string());
                     }
+                }
+                RuntimeEvent::PairingCodeRevoked => {
+                    self.generated_access_id = None;
+                    self.code_ready_at = None;
                 }
                 RuntimeEvent::ClientLifecycle { running } => {
                     self.client_running = running;
@@ -1831,6 +1868,7 @@ async fn runtime_dispatch_loop(
     mut runtime_cmd_rx: mpsc::Receiver<RuntimeCommand>,
     runtime_event_tx: mpsc::Sender<RuntimeEvent>,
     ui_bridge: Arc<UiBridge>,
+    trust_registry: trusted::TrustRegistry,
 ) {
     let host_running = Arc::new(AtomicBool::new(false));
     let client_running = Arc::new(AtomicBool::new(false));
