@@ -2867,7 +2867,7 @@ fn save_connection_payload_file_from_seed(seed: &str) -> Result<PathBuf> {
         raw
     } else {
         let parsed = parse_connection_seed(seed)?;
-        build_connection_payload_bytes(&parsed.seed)?
+        build_connection_payload_bytes(&parsed.endpoint_id)?
     };
 
     let Some(path) = rfd::FileDialog::new()
@@ -3322,6 +3322,20 @@ mod tests {
         assert_eq!(
             parsed.endpoint_id,
             *iroh::SecretKey::from_bytes(&seed).public().as_bytes()
+        );
+    }
+
+    #[test]
+    fn exported_codes_do_not_reveal_host_secret_seed() {
+        let secret = [42u8; 32];
+        let access = build_access_id(&secret).unwrap();
+        let decoded = URL_SAFE_NO_PAD.decode(&access).unwrap();
+        assert!(!decoded.windows(32).any(|window| window == secret));
+        let parsed = parse_connection_seed(&access).unwrap();
+        assert_ne!(parsed.endpoint_id, secret);
+        assert_eq!(
+            parsed.endpoint_id,
+            *iroh::SecretKey::from_bytes(&secret).public().as_bytes()
         );
     }
 
