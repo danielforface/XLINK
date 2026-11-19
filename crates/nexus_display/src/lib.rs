@@ -2,7 +2,7 @@ use anyhow::{anyhow, Context, Result};
 use bytes::Bytes;
 use minifb::{Key, KeyRepeat, MouseMode, Window, WindowOptions};
 use std::thread;
-use tokio::sync::mpsc::{self, Receiver, Sender, UnboundedSender};
+use tokio::sync::mpsc::{self, Receiver, Sender, UnboundedReceiver, UnboundedSender};
 use windows::core::{ComInterface, Error as WindowsError};
 use windows::Win32::Foundation::E_FAIL;
 use windows::Win32::Graphics::Direct3D::{D3D_DRIVER_TYPE_HARDWARE, D3D_FEATURE_LEVEL};
@@ -314,7 +314,7 @@ fn create_output_duplication(device: &ID3D11Device) -> Result<IDXGIOutputDuplica
 
 pub fn spawn_remote_viewer(
     title: &str,
-) -> Result<(Sender<ViewerFrame>, Receiver<ViewerInputEvent>)> {
+) -> Result<(Sender<ViewerFrame>, UnboundedReceiver<ViewerInputEvent>)> {
     let (frame_tx, mut frame_rx) = mpsc::channel::<ViewerFrame>(2);
     let (input_tx, input_rx) = mpsc::unbounded_channel::<ViewerInputEvent>();
     let title = title.to_string();
