@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use tracing::info;
 
 /// ALPN protocol identifier for NexusP2P sessions.
-pub const NEXUS_ALPN: &[u8] = b"nexus-p2p/2";
+pub const NEXUS_ALPN: &[u8] = b"nexus-p2p/4";
 
 /// Re-export iroh types used by the application layer.
 pub use iroh::endpoint::{Connection, RecvStream, SendStream, VarInt};
