@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use tracing::info;
 
 /// ALPN protocol identifier for NexusP2P sessions.
-pub const NEXUS_ALPN: &[u8] = b"nexus-p2p/4";
+pub const NEXUS_ALPN: &[u8] = b"nexus-p2p/5";
 
 /// Re-export iroh types used by the application layer.
 pub use iroh::endpoint::{Connection, RecvStream, SendStream, VarInt};
@@ -59,6 +59,18 @@ pub async fn create_client_endpoint() -> Result<Endpoint> {
     let node_id = endpoint.id();
     info!(%node_id, "iroh client endpoint created");
 
+    Ok(endpoint)
+}
+
+/// A stable client key permits future connections to be authorized by the
+/// remote computer's explicit public-key allowlist.
+pub async fn create_client_endpoint_with_secret(secret: SecretKey) -> Result<Endpoint> {
+    let endpoint = Endpoint::builder(iroh::endpoint::presets::N0)
+        .secret_key(secret)
+        .bind()
+        .await
+        .context("failed to create stable authenticated technician endpoint")?;
+    info!(identity = %endpoint.id(), "stable technician QUIC endpoint created");
     Ok(endpoint)
 }
 
