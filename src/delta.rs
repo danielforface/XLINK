@@ -334,7 +334,7 @@ mod tests {
         assert_eq!(patch.stride, 1);
         let output = decoder.decode(patch).unwrap().unwrap();
         assert_eq!(&output.pixels[(11 * 64 + 11)*4..(11 * 64 + 11)*4+3], &[255,255,255]);
-        assert_eq!(&output.pixels[0..3], &[0,0,0]);
+        assert!(output.pixels[0..3].iter().all(|value| *value <= 5), "JPEG should preserve an unchanged black area within quantization tolerance");
     }
 
     #[test]
@@ -380,7 +380,7 @@ mod tests {
         let canvas = decoder.decode(packet).unwrap().unwrap();
         assert_eq!(&canvas.pixels[0..3], &[255,255,255]);
         assert_eq!(&canvas.pixels[offset..offset+3], &[255,255,255]);
-        assert_eq!(&canvas.pixels[4..7], &[0,0,0]);
+        assert!(canvas.pixels[4..7].iter().all(|value| *value <= 5));
     }
 
     #[test]
