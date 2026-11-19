@@ -137,12 +137,13 @@ fn init_tracing() {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct AccessIdPayload {
-    seed: [u8; 32],
+    protocol_version: u8,
+    endpoint_id: [u8; 32],
 }
 
 #[derive(Debug, Clone)]
 struct ParsedAccessId {
-    seed: [u8; 32],
+    endpoint_id: [u8; 32],
 }
 
 #[derive(Debug, Clone)]
@@ -696,7 +697,7 @@ impl NexusGuiApp {
 
         let parsed = parse_connection_seed(access_id)
             .context("failed to parse generated access ID as connection seed")?;
-        let payload = build_connection_payload_bytes(&parsed.seed)?;
+        let payload = build_connection_payload_bytes(&parsed.endpoint_id)?;
 
         let seed = URL_SAFE_NO_PAD.encode(&payload);
         let mnemonic = encode_connection_seed_mnemonic(&payload)?;
@@ -2258,8 +2259,9 @@ async fn run_client_session(
     runtime_event_tx: mpsc::Sender<RuntimeEvent>,
     ui_bridge: Arc<UiBridge>,
 ) -> Result<()> {
-    let (secret_key, session_id) = derive_keys_from_seed(&parsed_access_id.seed);
-    let remote_id = secret_key.public();
+    let remote_id = iroh::PublicKey::from_bytes(&parsed_access_id.endpoint_id)
+        .context("connection ID is not a valid endpoint public key")?;
+    let session_id = derive_session_id(&parsed_access_id.endpoint_id);
 
     // Create client endpoint
     let endpoint = create_client_endpoint().await?;
@@ -2795,20 +2797,27 @@ async fn run_diagnostics(_port: u16) -> (NetworkTopology, Option<String>) {
     (NetworkTopology::ConeNatFriendly, None)
 }
 
+fn derive_session_id(endpoint_id: &[u8; 32]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(b"nexus-p2p-session-v2");
+    hasher.update(endpoint_id);
+    let hash = hasher.finalize();
+    hex::encode(&hash[..8])
+}
+
 fn derive_keys_from_seed(seed: &[u8; 32]) -> (SecretKey, String) {
     let secret_key = SecretKey::from_bytes(seed);
-    
-    use sha2::{Sha256, Digest};
-    let mut hasher = Sha256::new();
-    hasher.update(seed);
-    let hash = hasher.finalize();
-    let session_id = hex::encode(&hash[..8]); // 16-character hex string (8 bytes)
+    let session_id = derive_session_id(secret_key.public().as_bytes());
     (secret_key, session_id)
 }
 
 fn build_access_id(seed: &[u8; 32]) -> Result<String> {
+    // Share the public endpoint identity, NEVER the host's Ed25519 private seed.
+    let endpoint_id = *SecretKey::from_bytes(seed).public().as_bytes();
     let payload = AccessIdPayload {
-        seed: *seed,
+        protocol_version: 2,
+        endpoint_id,
     };
 
     let encoded = bincode::serialize(&payload).context("failed to serialize access ID payload")?;
@@ -2822,8 +2831,13 @@ fn parse_access_id(access_id: &str) -> Result<ParsedAccessId> {
     let payload: AccessIdPayload =
         bincode::deserialize(&decoded).context("failed to parse access ID payload")?;
 
+    if payload.protocol_version != 2 {
+        bail!("unsupported access code format; regenerate the code on the host");
+    }
+    iroh::PublicKey::from_bytes(&payload.endpoint_id)
+        .context("access code contains invalid public endpoint identity")?;
     Ok(ParsedAccessId {
-        seed: payload.seed,
+        endpoint_id: payload.endpoint_id,
     })
 }
 
@@ -2940,7 +2954,7 @@ fn load_connection_seed_from_file_path(path: &Path) -> Result<String> {
 
     if bytes.len() == CONNECTION_PAYLOAD_BYTES {
         let parsed = parse_connection_payload_bytes(&bytes)?;
-        return build_access_id(&parsed.seed);
+        return Ok(URL_SAFE_NO_PAD.encode(&bytes));
     }
 
     if let Ok(text) = std::str::from_utf8(&bytes) {
@@ -3077,8 +3091,9 @@ fn parse_connection_seed(seed: &str) -> Result<ParsedAccessId> {
     bail!("unsupported connection seed format")
 }
 
-fn build_connection_payload_bytes(seed: &[u8; 32]) -> Result<Vec<u8>> {
-    Ok(seed.to_vec())
+fn build_connection_payload_bytes(endpoint_id: &[u8; 32]) -> Result<Vec<u8>> {
+    iroh::PublicKey::from_bytes(endpoint_id).context("invalid endpoint identity")?;
+    Ok(endpoint_id.to_vec())
 }
 
 fn parse_connection_payload_bytes(payload: &[u8]) -> Result<ParsedAccessId> {
@@ -3090,10 +3105,11 @@ fn parse_connection_payload_bytes(payload: &[u8]) -> Result<ParsedAccessId> {
         );
     }
 
-    let mut seed = [0_u8; 32];
-    seed.copy_from_slice(payload);
+    let mut endpoint_id = [0_u8; 32];
+    endpoint_id.copy_from_slice(payload);
+    iroh::PublicKey::from_bytes(&endpoint_id).context("invalid endpoint public key")?;
 
-    Ok(ParsedAccessId { seed })
+    Ok(ParsedAccessId { endpoint_id })
 }
 
 fn decode_connection_seed_base64(seed: &str) -> Result<Vec<u8>> {
@@ -3303,7 +3319,10 @@ mod tests {
         let token = build_access_id(&seed).expect("build access ID");
         let parsed = parse_access_id(&token).expect("parse access ID");
 
-        assert_eq!(parsed.seed, seed);
+        assert_eq!(
+            parsed.endpoint_id,
+            *iroh::SecretKey::from_bytes(&seed).public().as_bytes()
+        );
     }
 
     #[test]
@@ -3322,29 +3341,31 @@ mod tests {
     fn connection_seed_roundtrip_supports_base64_and_deep_link() {
         let seed = [7_u8; 32];
 
-        let payload = build_connection_payload_bytes(&seed)
+        let endpoint_id = *iroh::SecretKey::from_bytes(&seed).public().as_bytes();
+        let payload = build_connection_payload_bytes(&endpoint_id)
             .expect("build compact connection payload");
         let seed_b64 = URL_SAFE_NO_PAD.encode(&payload);
 
         let parsed = parse_connection_seed(&seed_b64).expect("parse base64 connection seed");
-        assert_eq!(parsed.seed, seed);
+        assert_eq!(parsed.endpoint_id, endpoint_id);
 
         let deep_link = format!("nexus://connect/{seed_b64}");
         let parsed_from_link =
             parse_connection_seed(&deep_link).expect("parse deep-link connection seed");
-        assert_eq!(parsed_from_link.seed, seed);
+        assert_eq!(parsed_from_link.endpoint_id, endpoint_id);
     }
 
     #[test]
     fn connection_seed_roundtrip_supports_mnemonic() {
         let seed = [255_u8; 32];
 
-        let payload = build_connection_payload_bytes(&seed)
+        let endpoint_id = *iroh::SecretKey::from_bytes(&seed).public().as_bytes();
+        let payload = build_connection_payload_bytes(&endpoint_id)
             .expect("build compact connection payload");
         let mnemonic =
             encode_connection_seed_mnemonic(&payload).expect("encode mnemonic connection seed");
 
         let parsed = parse_connection_seed(&mnemonic).expect("parse mnemonic connection seed");
-        assert_eq!(parsed.seed, seed);
+        assert_eq!(parsed.endpoint_id, endpoint_id);
     }
 }
