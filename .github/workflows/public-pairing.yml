@@ -1,0 +1,23 @@
+name: Public mailbox pairing acceptance
+on:
+  push:
+    branches: ["feature/public-numeric-pairing-v5"]
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: public-pairing-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  live-mailbox:
+    runs-on: windows-latest
+    timeout-minutes: 18
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Public SPAKE2 nameplate allocation and encrypted endpoint exchange
+        shell: pwsh
+        run: |
+          cargo test --locked public_mailbox_pairing_roundtrip -- --ignored --nocapture
+          if ($LASTEXITCODE -ne 0) { throw "Public short-code pairing failed" }
