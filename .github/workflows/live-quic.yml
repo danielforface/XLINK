@@ -1,0 +1,29 @@
+name: Live QUIC handshake smoke
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: live-quic-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  control-before-video:
+    runs-on: windows-latest
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Real iroh QUIC two-endpoint handshake
+        shell: pwsh
+        run: |
+          cargo test -p nexus_network --locked two_endpoints_exchange_bidirectional_data -- --ignored --nocapture
+          if ($LASTEXITCODE -ne 0) { throw "QUIC peer-to-peer handshake test failed" }
