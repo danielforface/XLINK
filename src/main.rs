@@ -2308,7 +2308,7 @@ async fn run_server_session(
         .await.context("failed to bind encrypted iroh endpoint")?;
     let node_id = endpoint.id();
 
-    loop {
+    'host_pairing: loop {
         let (ready_tx, mut ready_rx) = mpsc::channel(1);
         let pairing = short_code::advertise_and_pair(
             *node_id.as_bytes(), &ready_tx,
@@ -2340,10 +2340,11 @@ async fn run_server_session(
             OneTime(short_code::Invitation),
             Trusted(nexus_network::Connection),
         }
-        let route = tokio::select! {
+        let route = loop {
+            tokio::select! {
             pairing_result = &mut pairing => {
                 match pairing_result {
-                    Ok(invitation) => Route::OneTime(invitation),
+                    Ok(invitation) => break Route::OneTime(invitation),
                     Err(error) => {
                         warn!(?error, "public mailbox pairing failed; requesting fresh code");
                         let _ = runtime_event_tx.send(RuntimeEvent::PairingCodeRevoked).await;
@@ -2351,7 +2352,7 @@ async fn run_server_session(
                             format!("Pairing unavailable: {error}; refreshing code")
                         )).await;
                         time::sleep(Duration::from_secs(3)).await;
-                        continue;
+                        continue 'host_pairing;
                     }
                 }
             }
@@ -2367,7 +2368,7 @@ async fn run_server_session(
                             // or share its screen by exploiting the numeric mailbox.
                             continue;
                         }
-                        Route::Trusted(connection)
+                        break Route::Trusted(connection)
                     }
                     Err(error) => {
                         warn!(?error, "incoming QUIC handshake rejected");
@@ -2375,6 +2376,7 @@ async fn run_server_session(
                     }
                 }
             }
+        }
         };
 
         let _ = runtime_event_tx.send(RuntimeEvent::PairingCodeRevoked).await;
