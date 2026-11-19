@@ -165,6 +165,7 @@ enum TransportMode {
 #[derive(Debug, Clone)]
 struct HostRuntimeConfig {
     fps: u16,
+    max_width: u16,
     inject_input: bool,
     seed: [u8; 32],
 }
@@ -330,6 +331,7 @@ struct NexusGuiApp {
 
     host_port: u16,
     host_fps: u16,
+    host_max_width: u16,
     host_inject_input: bool,
     host_advertise_addr_input: String,
 
@@ -397,6 +399,7 @@ impl NexusGuiApp {
             pending_auto_connect,
             host_port,
             host_fps: DEFAULT_FPS,
+            host_max_width: 1280,
             host_inject_input: true,
             host_advertise_addr_input: default_advertise,
             client_display_name: String::new(),
@@ -657,6 +660,11 @@ impl NexusGuiApp {
                         ui.add(egui::Slider::new(&mut self.host_fps, MIN_FPS..=MAX_FPS));
                     });
                     ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        ui.label("Video max width:");
+                        ui.add(egui::Slider::new(&mut self.host_max_width, 960..=1920).suffix(" px"));
+                    });
+                    ui.label("Lower resolution reduces latency and bandwidth. 1280 px is the recommended support setting.");
                     ui.checkbox(&mut self.host_inject_input, "Allow keyboard and mouse only after I approve the technician");
                     ui.add_space(8.0);
                     ui.label("Transport: encrypted iroh QUIC (automatic direct P2P / relay fallback)");
@@ -1099,6 +1107,7 @@ impl NexusGuiApp {
     fn start_hosting_clicked(&mut self) {
         let command = RuntimeCommand::StartHosting(HostRuntimeConfig {
             fps: self.host_fps,
+            max_width: self.host_max_width,
             inject_input: self.host_inject_input,
             seed: self.host_seed,
         });
@@ -2104,7 +2113,8 @@ async fn run_host_peer_session(
         };
         let maybe_packet = if let Some(frame) = frame {
             // Stable size preserves spatial delta coordinates between captures.
-            let mut frame = frame_codec::fit_desktop(frame, 1280, 800)?;
+            let width_limit = (config.max_width as u32).clamp(960, 1920);
+            let mut frame = frame_codec::fit_desktop(frame, width_limit, width_limit * 5 / 8)?;
             frame.frame_index = video_sequence;
             delta_encoder.encode(frame)?
         } else {
