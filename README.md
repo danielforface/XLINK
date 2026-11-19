@@ -117,3 +117,33 @@ not a BitTorrent tracker or torrent file transfer protocol.
 The first resilience release must satisfy [the Windows/field validation matrix](docs/VALIDATION.md).
 Successful Cargo tests do not replace two-machine consent/revocation and network-impairment tests.
 For repeatable local validation run `./scripts/soak-validation.ps1 -Cycles 20`.
+
+## Windows connection troubleshooting (2026-11-19 incident)
+
+If the status bar displays `Failed to start host runtime: channel closed`,
+this is a local application-lifecycle failure, **not** a NAT or relay failure.
+Earlier builds allowed the Tokio runtime to be dropped while the eframe UI
+remained open. The fixed UI now holds an `Arc<Runtime>` for its entire lifetime.
+Always test with the Windows executable from the most recent successful
+workflow associated with the exact branch HEAD. Exit older processes first.
+
+**Host:** open the Host tab, click **Start Hosting**, and wait for a public
+Access ID in the Out-of-Band Access Exchange card. Share it with the technician
+through a trusted channel using Copy, QR, or the connection file. The Access ID
+contains only the Host's public endpoint identity; do not share the Host's
+private runtime seed. The Host must approve the connection on-screen.
+
+**Technician:** launch the same build of XLINK, paste the Host's Access ID in
+Client Mode, click **Connect**, and respond to the prompts. The iroh/N0 service
+resolves the peer's network path and can use QUIC relay fallback; this is not
+BitTorrent and a successful connection depends on an operational discovery and
+relay service and permitted outbound traffic. 
+
+The transport selector, advertised IP, and hole-punch address controls from
+older GUI builds were misleading because those values were unused by the
+actual iroh connection implementation; they have been removed from the UI.
+
+If you see `Host runtime failed: ...`, copy the full message; a bind or
+network discovery failure must be distinguished from the previously fixed
+closed-command-channel failure. The UI should show STANDBY before hosting and
+Host Ready with an Access ID only after the iroh endpoint binds successfully.
