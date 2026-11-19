@@ -2031,6 +2031,44 @@ async fn runtime_dispatch_loop(
                     }
                 }));
             }
+            RuntimeCommand::ConnectTrusted { endpoint_id, display_name } => {
+                if client_running.compare_exchange(
+                    false, true, Ordering::AcqRel, Ordering::Acquire
+                ).is_err() {
+                    let _ = runtime_event_tx.send(RuntimeEvent::Error(
+                        "A client session is already running".to_string()
+                    )).await;
+                    continue;
+                }
+                let event_tx = runtime_event_tx.clone();
+                let running_flag = Arc::clone(&client_running);
+                let bridge = Arc::clone(&ui_bridge);
+                let registry = trust_registry.clone();
+                client_task = Some(tokio::spawn(async move {
+                    let _ = event_tx.send(RuntimeEvent::ClientLifecycle {
+                        running: true
+                    }).await;
+                    let _ = event_tx.send(RuntimeEvent::SessionStatus(
+                        "Authenticating remembered computer via stable QUIC identity".into()
+                    )).await;
+                    let invitation = short_code::Invitation {
+                        endpoint_id,
+                        ticket: TRUSTED_SESSION_MARKER.to_string(),
+                    };
+                    let result = run_client_session(
+                        invitation, display_name, event_tx.clone(), bridge, registry, false
+                    ).await;
+                    running_flag.store(false, Ordering::Release);
+                    let _ = event_tx.send(RuntimeEvent::ClientLifecycle {
+                        running: false
+                    }).await;
+                    if let Err(error) = result {
+                        let _ = event_tx.send(RuntimeEvent::Error(
+                            format!("Trusted connection failed: {error}")
+                        )).await;
+                    }
+                }));
+            }
             RuntimeCommand::RunDiagnostics => {
                 let event_tx = runtime_event_tx.clone();
                 tokio::spawn(async move {
@@ -2767,9 +2805,24 @@ async fn run_client_session(
 
         session_state.transition(SessionState::PendingConsent)?;
 
-        time::timeout(Duration::from_secs(210), wait_for_session_consent(&control_recv))
-            .await.context("waiting for on-screen host consent timed out")??;
+        let enrollment_confirmed = time::timeout(
+            Duration::from_secs(210), wait_for_session_consent(&control_recv)
+        ).await.context("waiting for host consent timed out")??;
         session_state.transition(SessionState::Active)?;
+        if enrollment_confirmed && remember_host {
+            // A successful encrypted QUIC session AND an explicit Host
+            // enrollment acknowledgement are required before saving a device.
+            match trust_registry.remember_computer(
+                invitation.endpoint_id, &remote_addr_str,
+            ) {
+                Ok(()) => {
+                    let _ = runtime_event_tx.send(RuntimeEvent::SessionStatus(
+                        "This Host is now saved as a trusted computer".to_string()
+                    )).await;
+                }
+                Err(error) => warn!(?error, "failed to remember this Host securely"),
+            }
+        }
 
         // The server has received approval and can now start streaming video.
         let frame_r = time::timeout(Duration::from_secs(45), connection.accept_uni())
@@ -3097,24 +3150,27 @@ async fn wait_for_client_access_decision(control_recv: &PacketReceiver) -> Resul
     }
 }
 
-async fn wait_for_session_consent(control_recv: &PacketReceiver) -> Result<()> {
+async fn wait_for_session_consent(control_recv: &PacketReceiver) -> Result<bool> {
+    let mut enrollment_confirmed = false;
     loop {
         match control_recv.recv_control().await {
             Ok(ControlMessage::SessionConsent { approved }) => {
                 if approved {
-                    info!("host approved session request");
-                    return Ok(());
+                    info!(enrollment_confirmed, "host approved session request");
+                    return Ok(enrollment_confirmed);
                 }
-                return Err(SecurityError::UserConsentDenied).context("host denied user consent");
+                return Err(SecurityError::UserConsentDenied)
+                    .context("host denied user consent");
             }
             Ok(ControlMessage::Ack(text)) => {
-                info!(%text, "received server acknowledgement while waiting for consent");
+                if text == "xlink-trusted-enrollment-confirmed-v1" {
+                    enrollment_confirmed = true;
+                } else {
+                    info!(%text, "host acknowledgement while waiting for consent");
+                }
             }
             Ok(other) => {
-                error!(
-                    ?other,
-                    "SECURITY: blocked unexpected packet while waiting for consent"
-                );
+                warn!(?other, "unexpected packet while waiting for consent");
             }
             Err(error) => {
                 return Err(error).context("failed while waiting for session consent");
