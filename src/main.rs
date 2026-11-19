@@ -2264,14 +2264,29 @@ async fn run_client_session(
     // Create client endpoint
     let endpoint = create_client_endpoint().await?;
 
-    let default_relay: iroh::RelayUrl = "https://use.iroh.link/".parse().context("invalid default relay URL")?;
-    let target_addr = EndpointAddr::new(remote_id).with_relay_url(default_relay);
-
+    // N0 provides endpoint discovery, NAT traversal and managed relay fallback.
+    // Avoid pinning a guessed relay hostname that may not be the host's actual home relay.
     let handshake_start = Instant::now();
-
-    // Connect to peer via iroh
-    let connection = time::timeout(HANDSHAKE_TIMEOUT, connect_to_peer(&endpoint, target_addr))
-        .await.context("P2P/relay connection timed out")??;
+    let mut last_connect_error = String::from("no connection attempt completed");
+    let mut connection = None;
+    for attempt in 0..3u32 {
+        let target_addr = EndpointAddr::new(remote_id.clone());
+        match time::timeout(HANDSHAKE_TIMEOUT, connect_to_peer(&endpoint, target_addr)).await {
+            Ok(Ok(connected)) => {
+                connection = Some(connected);
+                break;
+            }
+            Ok(Err(error)) => last_connect_error = error.to_string(),
+            Err(_) => last_connect_error = "P2P/relay connection timed out".to_string(),
+        }
+        warn!(attempt = attempt + 1, error = %last_connect_error, "peer connection attempt failed");
+        if attempt < 2 {
+            time::sleep(Duration::from_secs(1u64 << attempt)).await;
+        }
+    }
+    let connection = connection.ok_or_else(|| anyhow!(
+        "failed to establish P2P/relay connection after three attempts: {last_connect_error}"
+    ))?;
     let remote_addr_str = format!("iroh:{}", connection.remote_id());
 
     let handshake_latency = handshake_start.elapsed().as_millis();
