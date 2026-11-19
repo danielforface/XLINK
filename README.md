@@ -1,149 +1,142 @@
-# NexusP2P
+# XLINK — Private, simple remote support
 
-NexusP2P is a Windows-focused remote support engine written in Rust, now powered by a modern desktop GUI built with `eframe` + `egui`.
+XLINK is a native Windows remote-support app built in Rust. Its goal is
+deliberately simple: **open XLINK, tell a technician your temporary numeric
+code, approve the request, and get help.**
 
-## Features
+> **Development status:** This is an active Draft PR, not a production-certified
+> release. Automated Windows checks and physical two-machine validation are
+> separate release gates.
 
-- Modern native desktop GUI (no command prompt workflow)
-- Host/Client tabbed control surface with live session telemetry
-- Client Session Index history with one-click reconnect from successful sessions
-- Out-of-band Access ID exchange:
-  - Copy to clipboard
-  - Save/load `.nexus` connection files
-  - QR code generation, QR PNG export, and QR image/clipboard decoding
-- Encrypted authenticated iroh/QUIC transport with public-key endpoint identification
-- Public-key-only Access ID (the Host private identity seed is never exported)
-- Explicit multi-gate permission flow:
-  - Server requests client permission
-  - Client approves/denies in GUI
-  - Host user gives final local consent in GUI modal
-- DXGI Desktop Duplication host capture with JPEG compression and adaptive FPS
-- Session-gated Win32 `SendInput` support with held-key release on revoke
+## What users see
 
-## Prerequisites
+The light, responsive interface has one primary screen:
 
-- Windows 10/11 x64
-- Rust toolchain: `stable-x86_64-pc-windows-msvc`
+- A compact **Your ID** line with a copy icon and a fading circular countdown.
+- One focused **8–10-digit numeric connection field** and large on-screen keypad.
+- A clear **Connect securely** action.
+- Optional saved computers for explicitly approved repeat access.
+- **Settings** and **Logs** as top-navigation toggle views, not stacked cards.
+- A permanently accessible **Stop sharing** control while listening.
 
-## Development Validation
+The temporary code expires after approximately 180 seconds and is replaced
+through a fresh public mailbox registration. Expired codes are never shown
+as valid. Returning from Settings or Logs, or refocusing the window while on
+Home, places keyboard focus back in the numeric entry field.
+
+Layout keeps the keypad centered and bounds its maximum width so resizing
+the window does not distort or move controls unpredictably.
+
+## One-time connection
+
+1. Both people open the **same XLINK version**.
+2. The person receiving help reads the compact numeric code, or copies it.
+3. The technician enters the digits and presses **Connect securely**.
+4. The two devices authenticate the short code using the publicly operated
+   Magic Wormhole mailbox/PAKE protocol and exchange ephemeral session
+   credentials and the public iroh identity.
+5. iroh establishes an encrypted QUIC connection, direct where possible
+   or through public relay infrastructure.
+6. The person receiving help **explicitly approves** screen/control access
+   on that computer. No short code grants authorization by itself.
+
+**XLINK does not operate its own rendezvous, relay, or identity server.**
+An external publicly operated service may be unavailable or rate-limited;
+there is no guarantee of uninterrupted service.
+
+## Optional remembered computers
+
+For repeat support, **both people must opt in on the initial approved
+connection**:
+
+- The technician selects **Remember this computer if its owner also agrees**.
+- The recipient can additionally select **Trust this technician for future
+  connections without approval** in the actual on-screen Host approval dialog.
+- The application confirms enrollment over its authenticated QUIC control
+  stream. Only then does the technician store the Host's permanent public
+  endpoint identity.
+- Future connections from that trusted technician may skip the per-session
+  approval **only while the recipient is running XLINK and has enabled
+  unattended access for trusted devices**.
+- Settings lists enrolled technicians and saved computers, with **Revoke**,
+  **Forget**, and a global toggle. Revocation stops an active Host session.
+  **Stop sharing** is also available in the top navigation.
+
+The long-lived Host and technician private identities and trust registry are
+encrypted for the current Windows user with **DPAPI** and stored under
+`%LOCALAPPDATA%\XLINK\trusted-v1.dpapi`. The temporary 8–10 digit pairing
+code is never saved as an unattended-access credential.
+
+A technician cannot authorize itself: enrollment requires the recipient's
+explicit original approval and public-key trust decision. A remembered device
+is authenticated by its cryptographic iroh identity, not by a self-reported
+machine name.
+
+If the protected identity file becomes unreadable, fail closed rather than
+silently discarding the previously trusted identities. Copying the DPAPI file
+to another Windows account does not transfer the private identity.
+
+## Technical architecture
+
+| Component | Technology |
+| --- | --- |
+| Native UI | Rust, eframe/egui, light responsive single-screen UI |
+| Short-code pairing | Public Magic Wormhole Mailbox, SPAKE2 |
+| Persistent secrets | Windows DPAPI, local per-user trust registry |
+| Transport | iroh 0.98, QUIC, N0 direct discovery / relay |
+| Desktop capture | Windows DXGI Desktop Duplication |
+| Video | Change detection, dirty rectangles/tiles, JPEG fallback, adaptive FPS |
+| Remote input | Session-gated Win32 SendInput with key/button release |
+| Consent | Remote-user permission or explicitly enrolled/allowed public-key trust |
+| Diagnostics | Dedicated full-screen log view with copy action |
+
+**Protocol compatibility:** Numeric pairing plus trusted-device signaling uses
+the v5 control protocol. Both peers must run the matching build. Historic
+QR / mnemonic / long-code entry flows are not exposed in this UI.
+
+## Developer setup
+
+Prerequisites: Windows 10/11 x64 and the current stable MSVC Rust toolchain.
 
 ```powershell
-cargo check --workspace
-cargo test --workspace
+cargo check --workspace --locked
+cargo test --workspace --locked
+cargo run --locked
+cargo build --release --locked
 ```
 
-## Run The GUI App
+The release binary is `target/release/nexus-p2p.exe`. CI uploads it as
+the `nexus-p2p-windows-x64` artifact on successful Windows release builds.
+
+For optional network validation:
 
 ```powershell
-cargo run
+cargo test -p nexus_network --locked two_endpoints_exchange_bidirectional_data -- --ignored --nocapture
+cargo test --locked public_mailbox_pairing_roundtrip -- --ignored --nocapture
 ```
 
-or with packaged binary:
+The second test interacts with the **actual external public mailbox service**.
+Run it sparingly and do not depend on it being permanently available.
 
-```powershell
-./dist/nexus-p2p.exe
-```
+## Physical acceptance and security gates
 
-The app opens directly in the desktop GUI (no CLI prompts).
+Before release, validate on at least two Windows computers on separate
+networks: code rotation, wrong/expired code, direct and relay QUIC,
+request approval/denial, copy and keypad entry, complete desktop viewer
+and mouse/keyboard input, stop-sharing, trusted enrollment, restart,
+trusted reconnect, global disable, revocation of active access, failed DPAPI
+decryption, long-running sessions and UI resizing.
 
-## Host Workflow
+The initial consent test must remain the default route. No unattended
+authorization can be granted merely by possession of the 8–10-digit code.
 
-1. Open `Host Mode` and explicitly start hosting.
-2. Set port/FPS/advertise address and click `Start Hosting`.
-3. Share generated Access ID out-of-band using one of:
-   - `Copy Access ID`
-   - `Save Connection File`
-  - `Export QR PNG`
-  - QR shown in host dashboard
-4. Wait for incoming session request panel; approve the technician locally in the Host GUI.\n5. Use **Stop Hosting / Revoke control** to immediately revoke access. Hosting otherwise remains available after the technician disconnects.
+See [the comprehensive validation plan](docs/VALIDATION.md) and
+[the v4 delta-video architecture](docs/PERFORMANCE_V4.md).
 
-## Client Workflow
+## Notes
 
-1. Open `Client Mode`.
-2. Provide Access ID by one of:
-   - Paste text
-   - Load connection file
-   - Load QR image
-   - Decode QR from clipboard image
-3. Click `Connect`.
-4. Approve or deny server access request in GUI prompt.
-5. Use **Disconnect now** to end the active session. Reconnection must obtain fresh consent on the Host.\n6. Historical connection codes only remain valid while the original Host endpoint identity is active.
-
-## Consent and security
-
-Every control session requires interactive approval on the remote computer.
-Environment flags cannot auto-approve access or bypass on-screen consent.
-`NEXUS_AUTO_CLIENT_PERMISSION=0` and `NEXUS_AUTO_CONSENT=0` can
-explicitly deny requests in negative-path tests, but positive approval is
-always a user action.
-
-The first hardening pass bounds the viewer's frame handoff queue to two frames,
-drops excess frames instead of accumulating memory, validates incoming frame
-dimensions, and caps control messages independently of video frames.
-
-**Important:** The Windows CI build gate is a prerequisite, not a substitute
-for exercising two actual Windows machines across direct and relay connections.
-Do not deploy as production remote-support software until consent revocation,
-viewer lifecycle, reconnection, network loss, and input release tests pass.
-
-## Production Build
-
-```powershell
-./scripts/build-release.ps1
-```
-
-Artifacts:
-
-- `dist/nexus-p2p.exe`
-- `dist/README.md`
-
-## Production Validation Script
-
-```powershell
-./scripts/test-production.ps1
-```
-
-This runs `cargo check`, `cargo test`, and `cargo build --release`.
-
-## Compatibility and release gate
-
-This branch introduces protocol v2. **Previously exported connection seeds/files/QR and
-older client versions are not compatible. Regenerate access codes with the updated Host.**
-Connection codes now carry the Host public identity only, never its private key.
-
-The live transport uses iroh endpoint discovery (direct UDP with relay fallback),
-not a BitTorrent tracker or torrent file transfer protocol.
-
-The first resilience release must satisfy [the Windows/field validation matrix](docs/VALIDATION.md).
-Successful Cargo tests do not replace two-machine consent/revocation and network-impairment tests.
-For repeatable local validation run `./scripts/soak-validation.ps1 -Cycles 20`.
-
-## Windows connection troubleshooting (2026-11-19 incident)
-
-If the status bar displays `Failed to start host runtime: channel closed`,
-this is a local application-lifecycle failure, **not** a NAT or relay failure.
-Earlier builds allowed the Tokio runtime to be dropped while the eframe UI
-remained open. The fixed UI now holds an `Arc<Runtime>` for its entire lifetime.
-Always test with the Windows executable from the most recent successful
-workflow associated with the exact branch HEAD. Exit older processes first.
-
-**Host:** open the Host tab, click **Start Hosting**, and wait for a public
-Access ID in the Out-of-Band Access Exchange card. Share it with the technician
-through a trusted channel using Copy, QR, or the connection file. The Access ID
-contains only the Host's public endpoint identity; do not share the Host's
-private runtime seed. The Host must approve the connection on-screen.
-
-**Technician:** launch the same build of XLINK, paste the Host's Access ID in
-Client Mode, click **Connect**, and respond to the prompts. The iroh/N0 service
-resolves the peer's network path and can use QUIC relay fallback; this is not
-BitTorrent and a successful connection depends on an operational discovery and
-relay service and permitted outbound traffic. 
-
-The transport selector, advertised IP, and hole-punch address controls from
-older GUI builds were misleading because those values were unused by the
-actual iroh connection implementation; they have been removed from the UI.
-
-If you see `Host runtime failed: ...`, copy the full message; a bind or
-network discovery failure must be distinguished from the previously fixed
-closed-command-channel failure. The UI should show STANDBY before hosting and
-Host Ready with an Access ID only after the iroh endpoint binds successfully.
+- No XLINK-operated servers, tracking infrastructure or relay nodes.
+- No environment variable may auto-approve ordinary one-time support.
+- Optional remote audio is not implemented yet.
+- The software is **not a background service**: the person receiving help
+  must have XLINK running for trusted repeat connections.
