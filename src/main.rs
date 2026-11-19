@@ -2203,6 +2203,7 @@ async fn run_server_session(
     }));
 
     let mut capturer = ScreenCapturer::new()?;
+    let mut control_task_finished = false;
     let mut ticker = time::interval(Duration::from_millis(frame_interval_ms));
     ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
@@ -2210,6 +2211,7 @@ async fn run_server_session(
         tokio::select! {
             _ = ticker.tick() => {},
             _ = &mut control_task.0 => {
+                control_task_finished = true;
                 info!("control stream ended; shutting down screen capture");
                 break;
             }
@@ -2239,8 +2241,10 @@ async fn run_server_session(
     if let Some(ref c) = quic_conn_to_close {
         c.close(0u32.into(), b"server shutdown");
     }
-    control_task.0.abort();
-    let _ = (&mut control_task.0).await;
+    if !control_task_finished {
+        control_task.0.abort();
+        let _ = (&mut control_task.0).await;
+    }
     Ok(())
 }
 
@@ -2419,11 +2423,19 @@ async fn run_client_session(
             }
         }));
 
+        let mut input_task_finished = false;
+        let mut ack_task_finished = false;
         loop {
             let next_frame = tokio::select! {
                 frame = frame_recv.recv_frame() => Some(frame),
-                _ = &mut input_task.0 => None,
-                _ = &mut ack_task.0 => None,
+                _ = &mut input_task.0 => {
+                    input_task_finished = true;
+                    None
+                },
+                _ = &mut ack_task.0 => {
+                    ack_task_finished = true;
+                    None
+                },
             };
             match next_frame {
                 Some(Ok(packet)) => {
@@ -2470,10 +2482,14 @@ async fn run_client_session(
         if let Some(ref c) = quic_conn_to_close {
             c.close(0u32.into(), b"client shutdown");
         }
-        input_task.0.abort();
-        let _ = (&mut input_task.0).await;
-        ack_task.0.abort();
-        let _ = (&mut ack_task.0).await;
+        if !input_task_finished {
+            input_task.0.abort();
+            let _ = (&mut input_task.0).await;
+        }
+        if !ack_task_finished {
+            ack_task.0.abort();
+            let _ = (&mut ack_task.0).await;
+        }
         Ok(())
     }.await;
 
