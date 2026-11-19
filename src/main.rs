@@ -3381,6 +3381,37 @@ mod tests {
     use base64::Engine as _;
 
     #[test]
+    fn ui_owned_runtime_keeps_command_dispatch_alive() {
+        use std::sync::Arc;
+        use std::time::Duration;
+        use tokio::runtime::Builder;
+        use tokio::sync::{mpsc, oneshot};
+
+        // Reproduces the previous lifecycle bug: a Handle alone does not own
+        // a Runtime. The GUI must hold an Arc<Runtime> after setup returns.
+        let runtime = Arc::new(Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .expect("Tokio runtime"));
+        let (commands_tx, mut commands_rx) = mpsc::channel::<u8>(1);
+        let (response_tx, response_rx) = oneshot::channel();
+        runtime.spawn(async move {
+            if let Some(value) = commands_rx.recv().await {
+                let _ = response_tx.send(value);
+            }
+        });
+
+        let gui_runtime_owner = Arc::clone(&runtime);
+        drop(runtime); // Simulate returning from the eframe creator closure.
+        assert!(commands_tx.blocking_send(7).is_ok(), "dispatch receiver died");
+        let received = gui_runtime_owner.block_on(async {
+            tokio::time::timeout(Duration::from_secs(2), response_rx).await
+        }).expect("runtime task timed out").expect("dispatcher response closed");
+        assert_eq!(received, 7);
+    }
+
+    #[test]
     fn access_id_roundtrip() {
         let seed = [42_u8; 32];
 
