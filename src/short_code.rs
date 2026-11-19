@@ -155,7 +155,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "uses publicly operated mailbox and external networking"]
     async fn public_mailbox_pairing_roundtrip() {
-        let identity = *iroh::SecretKey::generate(&mut rand::rngs::OsRng).public().as_bytes();
+        let identity = *iroh::SecretKey::generate().public().as_bytes();
         let (tx, mut rx) = mpsc::channel(1);
         let host = tokio::spawn(async move {
             advertise_and_pair(identity, &tx).await.expect("public pairing host")
