@@ -2062,6 +2062,7 @@ async fn runtime_dispatch_loop(
                 let event_tx = runtime_event_tx.clone();
                 let host_running_flag = Arc::clone(&host_running);
                 let registry = trust_registry.clone();
+                let registry = trust_registry.clone();
                 let bridge = Arc::clone(&ui_bridge);
                 let registry = trust_registry.clone();
 
@@ -2464,7 +2465,6 @@ async fn run_host_peer_session(
             remote_addr: remote_addr_str.clone(),
             requester_id: incoming_auth.requester_id.clone(),
             target_session: incoming_auth.target_id.clone(),
-            remember_requested: incoming_auth.remember_device,
         })
         .await
         .ok();
@@ -3175,6 +3175,7 @@ async fn request_host_consent(
             requester_id: incoming_auth.requester_id.clone(),
             remote_addr,
             target_session: incoming_auth.target_id.clone(),
+            remember_requested: incoming_auth.remember_device,
         })
         .await
         .ok();
