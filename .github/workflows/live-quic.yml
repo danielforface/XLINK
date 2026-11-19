@@ -2,7 +2,7 @@ name: Live QUIC handshake smoke
 
 on:
   push:
-    branches: [main]
+    branches: [main, "feature/public-numeric-pairing-v5"]
   pull_request:
     branches: [main]
   workflow_dispatch:
