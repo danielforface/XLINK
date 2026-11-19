@@ -10,7 +10,7 @@ use nexus_display::{CapturedFrame, ViewerFrame};
 use std::time::{Duration, Instant};
 use crate::frame_codec;
 
-const KEYFRAME_INTERVAL: Duration = Duration::from_secs(5);
+const KEYFRAME_INTERVAL: Duration = Duration::from_secs(60);
 const DELTA_HEADER_LEN: usize = 20;
 const MAX_CANVAS_BYTES: usize = 64 * 1024 * 1024;
 
@@ -24,6 +24,13 @@ pub struct DeltaEncoder {
 impl DeltaEncoder {
     pub fn new() -> Self {
         Self { previous: Vec::new(), width: 0, height: 0, last_keyframe: None }
+    }
+
+    /// A tiny heartbeat maintains the transport timeout without video payload.
+    pub fn heartbeat(sequence: u64) -> FramePacket {
+        FramePacket {
+            sequence, width: 0, height: 0, stride: 2, pixels: Vec::new(),
+        }
     }
 
     pub fn encode(&mut self, frame: CapturedFrame) -> Result<Option<FramePacket>> {
@@ -129,18 +136,28 @@ impl DeltaDecoder {
         Self { canvas: None, last_sequence: None }
     }
 
-    pub fn decode(&mut self, packet: FramePacket) -> Result<ViewerFrame> {
+    pub fn decode(&mut self, packet: FramePacket) -> Result<Option<ViewerFrame>> {
         if let Some(previous) = self.last_sequence {
             if packet.sequence <= previous {
                 bail!("out-of-order or replayed desktop frame");
             }
         }
         let sequence = packet.sequence;
+        if packet.stride == 2 {
+            if packet.width != 0 || packet.height != 0 || !packet.pixels.is_empty() {
+                bail!("malformed video heartbeat");
+            }
+            if self.canvas.is_none() {
+                bail!("heartbeat before first keyframe");
+            }
+            self.last_sequence = Some(sequence);
+            return Ok(None);
+        }
         if packet.stride != 1 {
             let frame = frame_codec::decode(packet)?;
             self.canvas = Some(frame.clone());
             self.last_sequence = Some(sequence);
-            return Ok(frame);
+            return Ok(Some(frame));
         }
 
         if packet.pixels.len() < DELTA_HEADER_LEN {
@@ -176,7 +193,7 @@ impl DeltaDecoder {
             canvas.pixels[dst..dst + bytes].copy_from_slice(&patch.pixels[src..src + bytes]);
         }
         self.last_sequence = Some(sequence);
-        Ok(canvas.clone())
+        Ok(Some(canvas.clone()))
     }
 }
 
@@ -211,9 +228,22 @@ mod tests {
         }
         let patch = encoder.encode(capture(64, 64, 1, changed)).unwrap().unwrap();
         assert_eq!(patch.stride, 1);
-        let output = decoder.decode(patch).unwrap();
+        let output = decoder.decode(patch).unwrap().unwrap();
         assert_eq!(&output.pixels[(11 * 64 + 11)*4..(11 * 64 + 11)*4+3], &[255,255,255]);
         assert_eq!(&output.pixels[0..3], &[0,0,0]);
+    }
+
+    #[test]
+    fn heartbeat_contains_no_pixels_and_preserves_canvas() {
+        let mut encoder = DeltaEncoder::new();
+        let mut decoder = DeltaDecoder::new();
+        let full = encoder.encode(capture(64, 64, 0, vec![0; 64*64*4]))
+            .unwrap().unwrap();
+        decoder.decode(full).unwrap().unwrap();
+        let heartbeat = DeltaEncoder::heartbeat(1);
+        assert!(heartbeat.pixels.is_empty());
+        assert!(decoder.decode(heartbeat).unwrap().is_none());
+        assert!(decoder.decode(DeltaEncoder::heartbeat(1)).is_err());
     }
 
     #[test]
