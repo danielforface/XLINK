@@ -115,7 +115,7 @@ fn main() -> Result<()> {
 
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([708.0, 758.0])
+            .with_inner_size([688.0, 732.0])
             .with_min_inner_size([490.0, 550.0]),
         ..Default::default()
     };
@@ -1916,11 +1916,9 @@ impl eframe::App for NexusGuiApp {
                     ui.with_layout(
                         egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             if self.host_running {
-                                if ui.add(egui::Button::new(
-                                    RichText::new("■ Stop sharing").size(11.5)
-                                        .color(Color32::from_rgb(176, 55, 64))
-                                ).fill(Color32::from_rgb(255, 237, 240))
-                                    .rounding(Rounding::same(10.0))).clicked() {
+                                if ui_widgets::toolbar_button(
+                                    ui, Glyph::Stop, "Stop sharing", false, true,
+                                ).on_hover_text("Revoke remote access immediately").clicked() {
                                     if self.runtime_cmd_tx.try_send(
                                         RuntimeCommand::StopHosting
                                     ).is_ok() {
@@ -1929,33 +1927,28 @@ impl eframe::App for NexusGuiApp {
                                         self.set_status("Stopping all remote sessions...");
                                     }
                                 }
-                            } else if ui.add(
-                                egui::Button::new("Start hosting")
-                                    .rounding(Rounding::same(10.0))
+                            } else if ui_widgets::toolbar_button(
+                                ui, Glyph::Connect, "Start hosting", false, false,
                             ).clicked() {
                                 self.start_hosting_clicked();
                             }
-                            let logs = egui::Button::new(
-                                RichText::new("☷  Logs").size(12.0)
-                            ).rounding(Rounding::same(10.0))
-                                .fill(if self.show_logs {
-                                    Color32::from_rgb(218, 231, 252)
-                                } else { Color32::from_rgb(245, 248, 252) });
-                            if ui.add(logs).clicked() {
+                            if ui_widgets::toolbar_button(
+                                ui, Glyph::Logs, "Logs", self.show_logs, false,
+                            ).clicked() {
                                 self.show_logs = !self.show_logs;
                                 self.show_preferences = false;
-                                if !self.show_logs { self.refocus_number_input = true; }
+                                if !self.show_logs {
+                                    self.refocus_number_input = true;
+                                }
                             }
-                            let settings = egui::Button::new(
-                                RichText::new("⚙  Settings").size(12.0)
-                            ).rounding(Rounding::same(10.0))
-                                .fill(if self.show_preferences {
-                                    Color32::from_rgb(218, 231, 252)
-                                } else { Color32::from_rgb(245, 248, 252) });
-                            if ui.add(settings).clicked() {
+                            if ui_widgets::toolbar_button(
+                                ui, Glyph::Settings, "Settings", self.show_preferences, false,
+                            ).clicked() {
                                 self.show_preferences = !self.show_preferences;
                                 self.show_logs = false;
-                                if !self.show_preferences { self.refocus_number_input = true; }
+                                if !self.show_preferences {
+                                    self.refocus_number_input = true;
+                                }
                             }
                         });
                 });
