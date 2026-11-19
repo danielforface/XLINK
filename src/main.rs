@@ -334,6 +334,8 @@ struct NexusGuiApp {
     host_fps: u16,
     host_max_width: u16,
     host_inject_input: bool,
+    show_logs: bool,
+    show_preferences: bool,
     host_advertise_addr_input: String,
 
     client_display_name: String,
@@ -393,7 +395,10 @@ impl NexusGuiApp {
             } else {
                 ActiveTab::HostMode
             },
-            access_id_input: launch_connection_seed.unwrap_or_default(),
+            access_id_input: launch_connection_seed.filter(|text| {
+                let digits = text.chars().filter(|c| c.is_ascii_digit()).count();
+                digits == text.len() && (8..=10).contains(&digits)
+            }).unwrap_or_default(),
             generated_access_id: None,
             qr_code_texture: None,
             copied_notice_until: None,
@@ -402,6 +407,8 @@ impl NexusGuiApp {
             host_fps: DEFAULT_FPS,
             host_max_width: 1280,
             host_inject_input: true,
+            show_logs: false,
+            show_preferences: false,
             host_advertise_addr_input: default_advertise,
             client_display_name: String::new(),
             pending_client_permission: None,
@@ -416,7 +423,7 @@ impl NexusGuiApp {
             detected_public_addr,
             detecting_public_ip,
             _runtime: runtime,
-            has_auto_hosted: true, // Mark auto-hosted as true since we spawned it above
+            has_auto_hosted: false, // Start the public pairing host on the first UI frame
             host_seed,
             client_punch_addr_input: String::new(),
             client_public_addr_display: String::new(),
@@ -453,7 +460,7 @@ impl NexusGuiApp {
                     self.generated_access_id = Some(access_id.clone());
                     self.host_advertise_addr_input = advertised_addr.to_string();
                     self.client_public_addr_display = advertised_addr.to_string();
-                    self.set_status("Host is ready and waiting for incoming sessions");
+                    self.set_status("Ready for a secure support request");
                     self.push_log(format!(
                         "HOST READY endpoint={} session_id={} fps={} mode={}",
                         advertised_addr,
@@ -462,9 +469,7 @@ impl NexusGuiApp {
                         if inject_input { "inject" } else { "preview" }
                     ));
                     self.push_log(format!("HOST CERT SHA256 {}", fingerprint));
-                    if let Err(error) = self.rebuild_qr_texture(ctx) {
-                        self.push_log(format!("QR generation failed: {error}"));
-                    }
+                    // Numeric pairing never renders a QR or private key.
                 }
                 RuntimeEvent::IncomingSession {
                     remote_addr,
@@ -1083,6 +1088,179 @@ impl NexusGuiApp {
         );
     }
 
+
+    fn draw_numeric_home(&mut self, ui: &mut egui::Ui) {
+        let ink = Color32::from_rgb(23, 37, 53);
+        let muted = Color32::from_rgb(106, 121, 140);
+        let accent = Color32::from_rgb(39, 104, 218);
+        let edge = Color32::from_rgb(227, 233, 242);
+        let surface = Color32::WHITE;
+        let radius = Rounding::same(22.0);
+
+        ui.add_space(12.0);
+        ui.vertical_centered(|ui| {
+            ui.label(RichText::new("REMOTE SUPPORT, MADE SIMPLE").size(12.0).strong()
+                .color(accent));
+            ui.add_space(6.0);
+            ui.label(RichText::new("One code. One connection. Your approval.").size(26.0)
+                .strong().color(ink));
+            ui.add_space(4.0);
+            ui.label(RichText::new(
+                "Encrypted device-to-device support over public discovery infrastructure."
+            ).size(13.0).color(muted));
+        });
+        ui.add_space(24.0);
+
+        let card_width = ui.available_width().min(860.0).max(320.0);
+        ui.allocate_ui_with_layout(egui::vec2(card_width, 0.0),
+            egui::Layout::top_down(egui::Align::Center), |ui| {
+            ui.columns(2, |columns| {
+                egui::Frame::none().fill(surface)
+                    .stroke(Stroke::new(1.0, edge)).rounding(radius)
+                    .inner_margin(egui::Margin::same(22.0))
+                    .show(&mut columns[0], |ui| {
+                        ui.set_min_width(265.0);
+                        ui.label(RichText::new("YOUR COMPUTER").size(12.0).strong().color(muted));
+                        ui.add_space(10.0);
+                        if let Some(code) = self.generated_access_id.as_ref() {
+                            ui.label(RichText::new(code).size(37.0).strong().monospace().color(ink));
+                            ui.label(RichText::new("Tell this number to the technician")
+                                .size(12.0).color(muted));
+                            ui.add_space(12.0);
+                            if ui.add(egui::Button::new("Copy my code")
+                                .fill(Color32::from_rgb(238, 244, 254))
+                                .rounding(Rounding::same(10.0))).clicked() {
+                                match copy_text_to_clipboard(code) {
+                                    Ok(()) => self.set_status("Connection code copied"),
+                                    Err(error) => self.push_log(format!("Copy failed: {error}")),
+                                }
+                            }
+                        } else {
+                            ui.label(RichText::new("Connecting...")
+                                .size(27.0).strong().color(ink));
+                            ui.label(RichText::new(
+                                "Registering a temporary numeric code with a public service"
+                            ).size(12.0).color(muted));
+                            if !self.host_running && ui.button("Try again").clicked() {
+                                self.start_hosting_clicked();
+                            }
+                        }
+                        ui.add_space(14.0);
+                        ui.label(RichText::new("Screen access always requires your approval.")
+                            .size(12.0).color(muted));
+                        if self.host_running && ui.button("Stop sharing / revoke access").clicked() {
+                            let _ = self.runtime_cmd_tx.try_send(RuntimeCommand::StopHosting);
+                            self.generated_access_id = None;
+                            self.set_status("Revoking access...");
+                        }
+                    });
+                egui::Frame::none().fill(surface)
+                    .stroke(Stroke::new(1.0, edge)).rounding(radius)
+                    .inner_margin(egui::Margin::same(22.0))
+                    .show(&mut columns[1], |ui| {
+                        ui.set_min_width(265.0);
+                        ui.label(RichText::new("CONNECT TO ANOTHER COMPUTER")
+                            .size(12.0).strong().color(muted));
+                        ui.add_space(8.0);
+                        let entry = egui::TextEdit::singleline(&mut self.access_id_input)
+                            .font(egui::TextStyle::Heading)
+                            .desired_width(ui.available_width().max(140.0))
+                            .hint_text("8–10 digit code");
+                        ui.add(entry);
+                        self.access_id_input.retain(|c| c.is_ascii_digit());
+                        self.access_id_input.truncate(10);
+                        ui.add_space(12.0);
+                        egui::Grid::new("pairing_numeric_keypad").spacing([9.0, 9.0])
+                            .show(ui, |ui| {
+                                for row in [["1","2","3"],["4","5","6"],["7","8","9"],["C","0","⌫"]] {
+                                    for digit in row {
+                                        let enabled = !self.client_running;
+                                        let button = egui::Button::new(RichText::new(digit)
+                                            .size(20.0).color(ink))
+                                            .fill(Color32::from_rgb(245, 248, 253))
+                                            .rounding(Rounding::same(12.0))
+                                            .min_size(egui::vec2(66.0, 44.0));
+                                        if ui.add_enabled(enabled, button).clicked() {
+                                            if digit == "C" {
+                                                self.access_id_input.clear();
+                                            } else if digit == "⌫" {
+                                                self.access_id_input.pop();
+                                            } else if self.access_id_input.len() < 10 {
+                                                self.access_id_input.push_str(digit);
+                                            }
+                                        }
+                                    }
+                                    ui.end_row();
+                                }
+                            });
+                        ui.add_space(12.0);
+                        let valid = short_code::parse_code(&self.access_id_input).is_ok();
+                        if ui.add_enabled(valid && !self.client_running,
+                            egui::Button::new(RichText::new("Connect securely").size(16.0)
+                                .strong().color(Color32::WHITE))
+                                .fill(accent).rounding(Rounding::same(12.0))
+                                .min_size(egui::vec2(235.0, 46.0))).clicked() {
+                            self.connect_clicked();
+                        }
+                        if self.client_running && ui.button("Cancel connection").clicked() {
+                            let _ = self.runtime_cmd_tx.try_send(RuntimeCommand::DisconnectClient);
+                        }
+                        ui.add_space(7.0);
+                        ui.label(RichText::new("The remote person must approve your request.")
+                            .size(12.0).color(muted));
+                    });
+            });
+        });
+
+        ui.add_space(17.0);
+        ui.vertical_centered(|ui| {
+            ui.horizontal(|ui| {
+                if ui.button(if self.show_logs { "Hide detailed log" }
+                    else { "Show detailed log" }).clicked() {
+                    self.show_logs = !self.show_logs;
+                }
+                if ui.button(if self.show_preferences { "Hide preferences" }
+                    else { "Preferences" }).clicked() {
+                    self.show_preferences = !self.show_preferences;
+                }
+            });
+            ui.add(egui::Label::new(RichText::new(&self.status_message)
+                .color(muted).size(12.0)).wrap(true));
+        });
+        if self.show_preferences {
+            ui.add_space(12.0);
+            egui::Frame::none().fill(surface).stroke(Stroke::new(1.0, edge))
+                .rounding(radius).inner_margin(egui::Margin::same(18.0))
+                .show(ui, |ui| {
+                    ui.heading("Support preferences");
+                    ui.checkbox(&mut self.host_inject_input,
+                        "Allow mouse and keyboard when I explicitly approve a request");
+                    ui.label("Options take effect on the next Host session.");
+                    ui.horizontal(|ui| {
+                        ui.label("Capture rate");
+                        ui.add(egui::Slider::new(&mut self.host_fps, MIN_FPS..=MAX_FPS));
+                        ui.label("Video width");
+                        ui.add(egui::Slider::new(&mut self.host_max_width, 960..=1920));
+                    });
+                });
+        }
+        if self.show_logs {
+            ui.add_space(12.0);
+            egui::Frame::none().fill(surface).stroke(Stroke::new(1.0, edge))
+                .rounding(radius).inner_margin(egui::Margin::same(18.0))
+                .show(ui, |ui| {
+                    ui.label(RichText::new("Session activity and diagnostics")
+                        .size(16.0).strong().color(ink));
+                    ui.add_space(8.0);
+                    egui::ScrollArea::vertical().max_height(250.0).show(ui, |ui| {
+                        for line in self.session_logs.iter().rev() {
+                            ui.add(egui::Label::new(RichText::new(line)
+                                .size(12.0).monospace().color(muted)).wrap(true));
+                        }
+                    });
+                });
+        }
+    }
     fn draw_dashboard(&mut self, ui: &mut egui::Ui) {
         // The two tabs are alternative workflows. Never render both side by
         // side: on 1080p screens this overflows horizontally and hides prompts.
@@ -1392,14 +1570,14 @@ impl eframe::App for NexusGuiApp {
 
 
         let ip_detection_finished = !self.detecting_public_ip.load(Ordering::Relaxed);
-        if ip_detection_finished && !self.has_auto_hosted && !self.host_running && self.active_tab == ActiveTab::HostMode {
+        if !self.has_auto_hosted && !self.host_running {
             self.has_auto_hosted = true;
             self.start_hosting_clicked();
         }
 
         self.poll_runtime_events(ctx);
-        self.trigger_launch_auto_connect();
-        self.handle_dropped_files(ctx);
+        // No file/QR/mnemonic import or implicit connection. Six-to-ten
+        // digit keypad pairing is the only interaction path.
 
         paint_app_background(ctx);
 
