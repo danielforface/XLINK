@@ -31,7 +31,7 @@ use bip39::{Language, Mnemonic};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use tokio::runtime::Builder;
+use tokio::runtime::{Builder, Runtime};
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::{self, MissedTickBehavior};
 use tracing::{error, info, warn};
@@ -82,11 +82,11 @@ fn main() -> Result<()> {
 
     let launch_connection_seed = parse_launch_connection_seed();
 
-    let runtime = Builder::new_multi_thread()
+    let runtime = Arc::new(Builder::new_multi_thread()
         .enable_all()
         .thread_name("nexus-runtime")
         .build()
-        .context("failed to create Tokio runtime")?;
+        .context("failed to create Tokio runtime")?);
 
     let (runtime_cmd_tx, runtime_cmd_rx) = mpsc::channel::<RuntimeCommand>(32);
     let (runtime_event_tx, runtime_event_rx) = mpsc::channel::<RuntimeEvent>(256);
@@ -121,7 +121,7 @@ fn main() -> Result<()> {
                     .expect("runtime event receiver missing"),
                 ui_bridge_slot.take().expect("UI bridge missing"),
                 launch_connection_seed.clone(),
-                runtime.handle().clone(),
+                Arc::clone(&runtime),
             );
             Box::new(app)
         }),
@@ -346,7 +346,7 @@ struct NexusGuiApp {
     session_logs: VecDeque<String>,
     detected_public_addr: Arc<Mutex<Option<SocketAddr>>>,
     detecting_public_ip: Arc<AtomicBool>,
-    _runtime_handle: tokio::runtime::Handle,
+    _runtime: Arc<Runtime>,
     has_auto_hosted: bool,
     host_seed: [u8; 32],
     client_punch_addr_input: String,
@@ -366,7 +366,7 @@ impl NexusGuiApp {
         runtime_event_rx: mpsc::Receiver<RuntimeEvent>,
         ui_bridge: Arc<UiBridge>,
         launch_connection_seed: Option<String>,
-        runtime_handle: tokio::runtime::Handle,
+        runtime: Arc<Runtime>,
     ) -> Self {
         apply_modern_theme(&cc.egui_ctx);
 
@@ -410,7 +410,7 @@ impl NexusGuiApp {
             session_logs: VecDeque::with_capacity(200),
             detected_public_addr,
             detecting_public_ip,
-            _runtime_handle: runtime_handle,
+            _runtime: runtime,
             has_auto_hosted: true, // Mark auto-hosted as true since we spawned it above
             host_seed,
             client_punch_addr_input: String::new(),
