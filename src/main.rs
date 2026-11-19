@@ -1924,8 +1924,6 @@ async fn run_server_session(
         warn!(requested_fps = config.fps, fps, "fps value clamped to supported range");
     }
 
-    let frame_interval_ms = (1000_u64 / fps as u64).max(1);
-
     // Derive SecretKey and session ID from the host seed
     let (secret_key, session_id) = derive_keys_from_seed(&config.seed);
     let credentials = SessionCredentials { session_id: session_id.clone() };
@@ -1953,6 +1951,32 @@ async fn run_server_session(
         .await
         .ok();
 
+    loop {
+        let result = run_host_peer_session(
+            &endpoint, &config, &credentials, &runtime_event_tx, &ui_bridge, fps,
+        ).await;
+        if let Err(error) = result {
+            warn!(?error, "incoming session ended with error; listener remains available");
+            let _ = runtime_event_tx.send(RuntimeEvent::SessionStatus(
+                format!("Session ended: {error}; awaiting another connection")
+            )).await;
+            time::sleep(Duration::from_millis(250)).await;
+        } else {
+            let _ = runtime_event_tx.send(RuntimeEvent::SessionStatus(
+                "Session ended; awaiting another connection".to_string()
+            )).await;
+        }
+    }
+}
+
+async fn run_host_peer_session(
+    endpoint: &iroh::Endpoint,
+    config: &HostRuntimeConfig,
+    credentials: &SessionCredentials,
+    runtime_event_tx: &mpsc::Sender<RuntimeEvent>,
+    ui_bridge: &Arc<UiBridge>,
+    fps: u16,
+) -> Result<()> {
     let session_state = Arc::new(SessionStateMachine::new());
     session_state.transition(SessionState::Authenticating)?;
 
