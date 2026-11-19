@@ -3,6 +3,10 @@
 mod adaptive;
 mod delta;
 mod frame_codec;
+mod numeric_entry;
+mod ui_widgets;
+mod short_code;
+mod trusted;
 
 use anyhow::{anyhow, bail, Context, Result};
 use arboard::Clipboard;
@@ -10,6 +14,8 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
 use eframe::egui;
 use egui::{Color32, ColorImage, RichText, Rounding, Stroke, TextureHandle, TextureOptions};
+use numeric_entry::EditAction;
+use ui_widgets::Glyph;
 use nexus_core::{
     ControlMessage, FramePacket, SecurityError, SessionCredentials, SessionState,
     SessionStateMachine,
@@ -19,7 +25,7 @@ use nexus_input::{
     InputController, KeyboardPreview, MousePreview, SessionState as InputSessionState,
 };
 use nexus_network::{
-    accept_connection, connect_to_peer, create_client_endpoint, EndpointAddr, RecvStream,
+    accept_connection, connect_to_peer, create_client_endpoint_with_secret, EndpointAddr, RecvStream,
     SendStream, SecretKey,
 };
 use qrcode_generator::QrCodeEcc;
@@ -51,7 +57,8 @@ use winreg::enums::HKEY_CURRENT_USER;
 #[cfg(target_os = "windows")]
 use winreg::RegKey;
 
-const PROTOCOL_VERSION: u16 = 4;
+const PROTOCOL_VERSION: u16 = 5;
+const TRUSTED_SESSION_MARKER: &str = "xlink-authenticated-trusted-device-v1";
 const MAX_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
 const MAX_CONTROL_MESSAGE_BYTES: usize = 64 * 1024;
 const MAX_FRAME_WIDTH: u32 = 16_384;
@@ -76,6 +83,8 @@ impl<T> Drop for AbortOnDrop<T> {
 
 fn main() -> Result<()> {
     init_tracing();
+    let trust_registry = trusted::TrustRegistry::load_or_create()
+        .context("cannot load Windows-protected device identity")?;
 
     if let Err(error) = register_nexus_protocol_handler() {
         warn!(?error, "failed to register nexus protocol handler");
@@ -97,6 +106,7 @@ fn main() -> Result<()> {
         runtime_cmd_rx,
         runtime_event_tx,
         Arc::clone(&ui_bridge),
+        trust_registry.clone(),
     ));
 
     let mut runtime_event_rx_slot = Some(runtime_event_rx);
@@ -105,13 +115,13 @@ fn main() -> Result<()> {
 
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1200.0, 760.0])
-            .with_min_inner_size([980.0, 640.0]),
+            .with_inner_size([688.0, 732.0])
+            .with_min_inner_size([490.0, 550.0]),
         ..Default::default()
     };
 
     eframe::run_native(
-        "NexusP2P Access Hub",
+        "XLINK | Secure Remote Support",
         native_options,
         Box::new(move |cc| {
             let app = NexusGuiApp::new(
@@ -123,6 +133,7 @@ fn main() -> Result<()> {
                 ui_bridge_slot.take().expect("UI bridge missing"),
                 launch_connection_seed.clone(),
                 Arc::clone(&runtime),
+                trust_registry.clone(),
             );
             Box::new(app)
         }),
@@ -152,6 +163,7 @@ struct ParsedAccessId {
 struct IncomingAuth {
     requester_id: String,
     target_id: String,
+    remember_device: bool,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -176,7 +188,12 @@ enum RuntimeCommand {
     ConnectWithAccessId {
         access_id: String,
         display_name: Option<String>,
+        remember_host: bool,
         _transport_mode: TransportMode,
+    },
+    ConnectTrusted {
+        endpoint_id: [u8; 32],
+        display_name: Option<String>,
     },
     RunDiagnostics,
     StopHosting,
@@ -206,9 +223,14 @@ enum RuntimeEvent {
         requester_id: String,
         remote_addr: String,
         target_session: String,
+        remember_requested: bool,
     },
+    PairingCodeRevoked,
     HostLifecycle {
         running: bool,
+    },
+    HostSessionActive {
+        active: bool,
     },
     ClientLifecycle {
         running: bool,
@@ -226,10 +248,16 @@ enum RuntimeEvent {
     Error(String),
 }
 
+#[derive(Debug, Clone, Copy)]
+struct HostConsentDecision {
+    approved: bool,
+    remember_technician: bool,
+}
+
 #[derive(Default)]
 struct UiBridge {
     pending_client_permission_sender: Mutex<Option<oneshot::Sender<bool>>>,
-    pending_host_consent_sender: Mutex<Option<oneshot::Sender<bool>>>,
+    pending_host_consent_sender: Mutex<Option<oneshot::Sender<HostConsentDecision>>>,
 }
 
 impl UiBridge {
@@ -267,7 +295,7 @@ impl UiBridge {
         }
     }
 
-    fn install_host_consent_sender(&self, sender: oneshot::Sender<bool>) -> Result<()> {
+    fn install_host_consent_sender(&self, sender: oneshot::Sender<HostConsentDecision>) -> Result<()> {
         let mut guard = self
             .pending_host_consent_sender
             .lock()
@@ -281,7 +309,7 @@ impl UiBridge {
         Ok(())
     }
 
-    fn respond_host_consent(&self, approved: bool) -> Result<()> {
+    fn respond_host_consent(&self, decision: HostConsentDecision) -> Result<()> {
         let mut guard = self
             .pending_host_consent_sender
             .lock()
@@ -289,7 +317,7 @@ impl UiBridge {
 
         match guard.take() {
             Some(sender) => sender
-                .send(approved)
+                .send(decision)
                 .map_err(|_| anyhow!("failed to send host consent decision")),
             None => Err(anyhow!("no pending host consent request")),
         }
@@ -319,6 +347,7 @@ struct HostConsentPrompt {
     requester_id: String,
     remote_addr: String,
     target_session: String,
+    remember_requested: bool,
 }
 
 struct NexusGuiApp {
@@ -333,6 +362,15 @@ struct NexusGuiApp {
     host_fps: u16,
     host_max_width: u16,
     host_inject_input: bool,
+    show_logs: bool,
+    show_preferences: bool,
+    code_ready_at: Option<Instant>,
+    refocus_number_input: bool,
+    numeric_cursor: usize,
+    window_was_focused: bool,
+    remember_this_computer: bool,
+    trust_current_technician: bool,
+    trust_registry: trusted::TrustRegistry,
     host_advertise_addr_input: String,
 
     client_display_name: String,
@@ -344,6 +382,7 @@ struct NexusGuiApp {
     ui_bridge: Arc<UiBridge>,
 
     host_running: bool,
+    host_session_active: bool,
     client_running: bool,
     status_message: String,
     session_logs: VecDeque<String>,
@@ -370,6 +409,7 @@ impl NexusGuiApp {
         ui_bridge: Arc<UiBridge>,
         launch_connection_seed: Option<String>,
         runtime: Arc<Runtime>,
+        trust_registry: trusted::TrustRegistry,
     ) -> Self {
         apply_modern_theme(&cc.egui_ctx);
 
@@ -380,7 +420,10 @@ impl NexusGuiApp {
             .map(|seed| parse_connection_seed(seed).is_ok())
             .unwrap_or(false);
 
-        let host_seed = rand::random::<[u8; 32]>();
+        // Keep an encrypted, per-Windows-user private device identity across
+        // restarts so explicitly trusted peers can recognize this machine.
+        let host_seed = trust_registry.host_seed()
+            .expect("validated DPAPI-backed local identity");
 
         // Hosting is opt-in. Opening the application must not expose a listener automatically.
         let detected_public_addr = Arc::new(Mutex::new(None));
@@ -392,7 +435,10 @@ impl NexusGuiApp {
             } else {
                 ActiveTab::HostMode
             },
-            access_id_input: launch_connection_seed.unwrap_or_default(),
+            access_id_input: launch_connection_seed.filter(|text| {
+                let digits = text.chars().filter(|c| c.is_ascii_digit()).count();
+                digits == text.len() && (8..=10).contains(&digits)
+            }).unwrap_or_default(),
             generated_access_id: None,
             qr_code_texture: None,
             copied_notice_until: None,
@@ -401,6 +447,15 @@ impl NexusGuiApp {
             host_fps: DEFAULT_FPS,
             host_max_width: 1280,
             host_inject_input: true,
+            show_logs: false,
+            show_preferences: false,
+            code_ready_at: None,
+            refocus_number_input: true,
+            numeric_cursor: 0,
+            window_was_focused: false,
+            remember_this_computer: false,
+            trust_current_technician: false,
+            trust_registry,
             host_advertise_addr_input: default_advertise,
             client_display_name: String::new(),
             pending_client_permission: None,
@@ -409,13 +464,14 @@ impl NexusGuiApp {
             runtime_event_rx,
             ui_bridge,
             host_running: false,
+            host_session_active: false,
             client_running: false,
             status_message: "Ready".to_string(),
             session_logs: VecDeque::with_capacity(200),
             detected_public_addr,
             detecting_public_ip,
             _runtime: runtime,
-            has_auto_hosted: true, // Mark auto-hosted as true since we spawned it above
+            has_auto_hosted: false, // Start the public pairing host on the first UI frame
             host_seed,
             client_punch_addr_input: String::new(),
             client_public_addr_display: String::new(),
@@ -450,9 +506,10 @@ impl NexusGuiApp {
                     inject_input,
                 } => {
                     self.generated_access_id = Some(access_id.clone());
+                    self.code_ready_at = Some(Instant::now());
                     self.host_advertise_addr_input = advertised_addr.to_string();
                     self.client_public_addr_display = advertised_addr.to_string();
-                    self.set_status("Host is ready and waiting for incoming sessions");
+                    self.set_status("Ready for a secure support request");
                     self.push_log(format!(
                         "HOST READY endpoint={} session_id={} fps={} mode={}",
                         advertised_addr,
@@ -461,9 +518,7 @@ impl NexusGuiApp {
                         if inject_input { "inject" } else { "preview" }
                     ));
                     self.push_log(format!("HOST CERT SHA256 {}", fingerprint));
-                    if let Err(error) = self.rebuild_qr_texture(ctx) {
-                        self.push_log(format!("QR generation failed: {error}"));
-                    }
+                    // Numeric pairing never renders a QR or private key.
                 }
                 RuntimeEvent::IncomingSession {
                     remote_addr,
@@ -490,11 +545,14 @@ impl NexusGuiApp {
                     requester_id,
                     remote_addr,
                     target_session,
+                    remember_requested,
                 } => {
+                    self.trust_current_technician = false;
                     self.pending_host_consent = Some(HostConsentPrompt {
                         requester_id,
                         remote_addr,
                         target_session,
+                        remember_requested,
                     });
                     self.active_tab = ActiveTab::HostMode;
                     self.set_status("ACTION REQUIRED: approve or deny the technician on this computer");
@@ -502,14 +560,29 @@ impl NexusGuiApp {
                 RuntimeEvent::HostLifecycle { running } => {
                     self.host_running = running;
                     if !running {
+                        self.host_session_active = false;
+                    }
+                    if !running {
                         self.pending_host_consent = None;
                         self.ui_bridge.clear_host_consent_sender();
-                        // Revocation invalidates previously shared endpoint codes.
-                        // A subsequent hosting session uses a fresh private identity.
-                        self.host_seed = rand::random::<[u8; 32]>();
+                        // The temporary pairing code is revoked, while the
+                        // stable device identity remains protected by DPAPI.
                         self.generated_access_id = None;
+                        self.code_ready_at = None;
                         self.push_log("Host stopped; old access code invalidated".to_string());
                     }
+                }
+                RuntimeEvent::HostSessionActive { active } => {
+                    self.host_session_active = active;
+                    if active {
+                        self.set_status("REMOTE SUPPORT SESSION ACTIVE");
+                    } else if self.host_running {
+                        self.set_status("Ready for another connection");
+                    }
+                }
+                RuntimeEvent::PairingCodeRevoked => {
+                    self.generated_access_id = None;
+                    self.code_ready_at = None;
                 }
                 RuntimeEvent::ClientLifecycle { running } => {
                     self.client_running = running;
@@ -1082,6 +1155,396 @@ impl NexusGuiApp {
         );
     }
 
+
+    fn draw_code_pie(ui: &mut egui::Ui, remaining: f32) {
+        let (rect, response) = ui.allocate_exact_size(
+            egui::vec2(26.0, 26.0), egui::Sense::hover()
+        );
+        let center = rect.center();
+        let painter = ui.painter();
+        let bg = Color32::from_rgb(224, 233, 245);
+        let fg = Color32::from_rgb(45, 113, 224);
+        painter.circle_filled(center, 12.0, bg);
+        let remaining = remaining.clamp(0.0, 1.0);
+        if remaining > 0.0 {
+            let segments = 40usize;
+            let mut points = vec![center];
+            let active = ((segments as f32 * remaining).ceil() as usize).max(1);
+            for step in 0..=active {
+                let fraction = (step as f32 / segments as f32).min(remaining);
+                let angle = -std::f32::consts::FRAC_PI_2
+                    + fraction * std::f32::consts::TAU;
+                points.push(center + egui::vec2(angle.cos(), angle.sin()) * 12.0);
+            }
+            painter.add(egui::Shape::convex_polygon(points, fg, Stroke::NONE));
+        }
+        painter.circle_filled(center, 3.2, Color32::WHITE);
+        response.on_hover_text(format!(
+            "Code refresh in {} seconds",
+            (remaining * 180.0).ceil() as u32,
+        ));
+    }
+
+    fn draw_compact_own_code(&mut self, ui: &mut egui::Ui) {
+        let ink = Color32::from_rgb(29, 50, 77);
+        let muted = Color32::from_rgb(101, 120, 145);
+        let elapsed = self.code_ready_at
+            .map(|t| t.elapsed().as_secs_f32()).unwrap_or(180.0);
+        let remaining = ((180.0 - elapsed) / 180.0).clamp(0.0, 1.0);
+        let active_code = self.generated_access_id.clone()
+            .filter(|_| remaining > 0.0);
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("YOUR ID").size(10.5).strong().color(muted));
+            ui.add_space(6.0);
+            if let Some(code) = active_code.as_ref() {
+                ui.label(RichText::new(code).size(19.5).strong().monospace().color(ink));
+                ui.add_space(5.0);
+                Self::draw_code_pie(ui, remaining);
+                ui.add_space(4.0);
+                if ui_widgets::icon_button(ui, Glyph::Copy, "Copy your temporary code").clicked() {
+                    match copy_text_to_clipboard(code) {
+                        Ok(()) => self.set_status("Code copied to clipboard"),
+                        Err(error) => self.push_log(format!("Copy failed: {error}")),
+                    }
+                }
+            } else {
+                ui.spinner();
+                ui.label(RichText::new("Refreshing ID").size(12.0).color(muted));
+                if !self.host_running && ui.small_button("Retry").clicked() {
+                    self.start_hosting_clicked();
+                }
+            }
+        });
+    }
+
+    fn draw_numeric_home(&mut self, ui: &mut egui::Ui) {
+        let ink = Color32::from_rgb(26, 45, 73);
+        let muted = Color32::from_rgb(109, 125, 149);
+        let accent = Color32::from_rgb(31, 100, 217);
+        let width = ui.available_width().max(0.0);
+        let card_width = width.min(450.0);
+        let compact = width < 405.0;
+        let padding = if compact { 15.0 } else { 24.0 };
+        let content_width = (card_width - padding * 2.0).max(240.0);
+        let m = ui_widgets::metrics(content_width);
+
+        ui.add_space(if compact { 6.0 } else { 14.0 });
+        ui.vertical_centered(|ui| {
+            ui.label(RichText::new("SECURE CONNECTION")
+                .size(10.5).strong().color(accent));
+            ui.add_space(5.0);
+            ui.label(RichText::new("Connect to a computer")
+                .size(if compact { 22.0 } else { 25.0 }).strong().color(ink));
+            ui.add_space(5.0);
+            ui.label(RichText::new("One code. Private and encrypted.")
+                .size(12.0).color(muted));
+        });
+        ui.add_space(if compact { 12.0 } else { 19.0 });
+
+        ui.vertical_centered(|ui| {
+            ui.allocate_ui_with_layout(
+                egui::vec2(card_width, 0.0),
+                egui::Layout::top_down(egui::Align::Center),
+                |ui| {
+                    egui::Frame::none()
+                        .fill(Color32::WHITE)
+                        .stroke(Stroke::new(1.0, Color32::from_rgb(222, 231, 244)))
+                        .rounding(Rounding::same(18.0))
+                        .inner_margin(egui::Margin::same(padding))
+                        .show(ui, |ui| {
+                            ui.set_width(content_width);
+                            // Every interior control uses content_width as its
+                            // coordinate system, rather than the parent window.
+                            ui_widgets::centered_row(ui, content_width, |ui| {
+                                self.draw_compact_own_code(ui);
+                            });
+                            ui.add_space(13.0);
+                            ui.separator();
+                            ui.add_space(12.0);
+
+                            ui.vertical_centered(|ui| {
+                                ui.label(RichText::new("REMOTE COMPUTER ID")
+                                    .size(11.0).strong().color(muted));
+                                ui.add_space(3.0);
+                                ui.label(RichText::new(
+                                    "8–10 digits · type, paste or use the keypad"
+                                ).size(10.5).color(Color32::from_rgb(151, 166, 185)));
+                            });
+                            ui.add_space(11.0);
+
+                            let focus = self.refocus_number_input;
+                            self.refocus_number_input = false;
+                            let mut submit = false;
+                            ui_widgets::centered_row(ui, m.slots_width, |ui| {
+                                submit = ui_widgets::code_slots(
+                                    ui, &mut self.access_id_input, &mut self.numeric_cursor,
+                                    focus, !self.client_running, m.slots_width,
+                                ).submit;
+                            });
+                            ui.add_space(15.0);
+
+                            let keys = [
+                                ["1", "2", "3"], ["4", "5", "6"],
+                                ["7", "8", "9"], ["Clear", "0", "Backspace"],
+                            ];
+                            for (row_idx, row) in keys.iter().enumerate() {
+                                ui_widgets::centered_row(ui, m.keypad_width, |ui| {
+                                    ui.spacing_mut().item_spacing.x = 9.0;
+                                    for (col_idx, key) in row.iter().enumerate() {
+                                        ui.push_id(("num_key", row_idx, col_idx), |ui| {
+                                            let pressed = ui_widgets::numeric_key(
+                                                ui, key, m.key_width, 46.0
+                                            ).clicked();
+                                            if pressed && !self.client_running {
+                                                let action = match *key {
+                                                    "Clear" => EditAction::Clear,
+                                                    "Backspace" => EditAction::Backspace,
+                                                    digit => EditAction::Digit(
+                                                        digit.chars().next().unwrap_or('0')
+                                                    ),
+                                                };
+                                                numeric_entry::apply(
+                                                    &mut self.access_id_input,
+                                                    &mut self.numeric_cursor, action,
+                                                );
+                                                self.refocus_number_input = true;
+                                            }
+                                        });
+                                    }
+                                });
+                                if row_idx != 3 { ui.add_space(8.0); }
+                            }
+                            ui.add_space(15.0);
+                            let valid = short_code::parse_code(&self.access_id_input).is_ok();
+                            let enabled = valid && !self.client_running;
+                            let mut connect_pressed = false;
+                            ui_widgets::centered_row(ui, content_width, |ui| {
+                                connect_pressed = ui_widgets::connect_button(
+                                    ui, content_width, enabled,
+                                ).clicked();
+                            });
+                            if (connect_pressed || submit) && enabled {
+                                self.connect_clicked();
+                            }
+
+                            if self.client_running {
+                                ui.add_space(7.0);
+                                if ui.button("Cancel connection").clicked() {
+                                    let _ = self.runtime_cmd_tx
+                                        .try_send(RuntimeCommand::DisconnectClient);
+                                }
+                            }
+                            ui.add_space(10.0);
+                            ui.vertical_centered(|ui| {
+                                ui.checkbox(&mut self.remember_this_computer,
+                                    "Remember this computer if its owner also agrees");
+                                ui.add_space(4.0);
+                                ui.label(RichText::new(
+                                    "The remote person must approve the connection."
+                                ).size(11.0).color(muted));
+                            });
+                        });
+                },
+            );
+        });
+
+        let saved = self.trust_registry.saved_computers();
+        if !saved.is_empty() {
+            ui.add_space(14.0);
+            ui.vertical_centered(|ui| {
+                ui.label(RichText::new("SAVED COMPUTERS")
+                    .size(11.0).strong().color(muted));
+            });
+            ui.add_space(6.0);
+            for peer in saved.iter().take(8) {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(&peer.label).size(12.0).color(ink));
+                    if ui.add_enabled(!self.client_running, egui::Button::new("Connect"))
+                        .clicked() {
+                        if let Err(error) = self.runtime_cmd_tx.try_send(
+                            RuntimeCommand::ConnectTrusted {
+                                endpoint_id: peer.endpoint_id,
+                                display_name: None,
+                            }
+                        ) {
+                            self.push_log(format!("Cannot start saved connection: {error}"));
+                        } else {
+                            self.client_running = true;
+                            self.set_status("Connecting to trusted computer...");
+                        }
+                    }
+                });
+            }
+        }
+        ui.add_space(12.0);
+        ui.vertical_centered(|ui| {
+            ui.label(RichText::new(&self.status_message)
+                .size(11.5).color(muted));
+        });
+    }
+
+    fn draw_preferences_screen(&mut self, ui: &mut egui::Ui) {
+        let ink = Color32::from_rgb(25, 45, 72);
+        let muted = Color32::from_rgb(106, 123, 144);
+        let width = ui.available_width().min(700.0).max(0.0);
+        ui.vertical_centered(|ui| {
+            ui.heading("Preferences");
+            ui.label("Your support, your control.");
+        });
+        ui.add_space(20.0);
+        ui.allocate_ui_with_layout(
+            egui::vec2(width, 0.0), egui::Layout::top_down(egui::Align::Center),
+            |ui| {
+                egui::Frame::none().fill(Color32::WHITE)
+                    .stroke(Stroke::new(1.0, Color32::from_rgb(225, 232, 241)))
+                    .rounding(Rounding::same(17.0))
+                    .inner_margin(egui::Margin::same(20.0))
+                    .show(ui, |ui| {
+                        ui.set_width((width - 40.0).max(100.0));
+                        ui.heading("Input permissions");
+                        ui.checkbox(&mut self.host_inject_input,
+                            "Allow mouse and keyboard after an approved request");
+                        ui.label(RichText::new(
+                            "Changes to video/input settings take effect at the next Host session."
+                        ).size(11.0).color(muted));
+                        ui.add_space(15.0);
+                        ui.heading("Video");
+                        ui.horizontal(|ui| {
+                            ui.label("Capture FPS");
+                            ui.add(egui::Slider::new(&mut self.host_fps, MIN_FPS..=MAX_FPS));
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label("Video width");
+                            ui.add(egui::Slider::new(&mut self.host_max_width, 960..=1920));
+                        });
+                        ui.add_space(17.0);
+                        ui.separator();
+                        ui.add_space(12.0);
+                        ui.heading("Trusted devices");
+                        ui.add(egui::Label::new(
+                            "An enrolled technician can reconnect using its authenticated                              device identity, without another approval prompt.                              No short code, private key or password is shared."
+                        ).wrap(true));
+                        ui.add_space(8.0);
+                        let mut allow = self.trust_registry.unattended_enabled();
+                        if ui.checkbox(&mut allow,
+                            "Allow unattended connections from explicitly trusted technicians"
+                        ).changed() {
+                            match self.trust_registry.set_unattended_enabled(allow) {
+                                Ok(()) => {
+                                    self.set_status(if allow {
+                                        "Trusted-device access enabled"
+                                    } else {
+                                        "Trusted-device access disabled"
+                                    });
+                                    if !allow && self.host_running {
+                                        let _ = self.runtime_cmd_tx
+                                            .try_send(RuntimeCommand::StopHosting);
+                                        self.generated_access_id = None;
+                                    }
+                                }
+                                Err(error) => self.push_log(
+                                    format!("Cannot update protected trust registry: {error}")
+                                ),
+                            }
+                        }
+                        ui.add_space(9.0);
+                        let technicians = self.trust_registry.trusted_technicians();
+                        if technicians.is_empty() {
+                            ui.label(RichText::new("No trusted technicians")
+                                .size(12.0).color(muted));
+                        }
+                        for technician in technicians {
+                            ui.horizontal(|ui| {
+                                let short_id = hex::encode(&technician.endpoint_id[..4]);
+                                ui.label(RichText::new(format!(
+                                    "{} · {}", technician.label, short_id
+                                )).color(ink));
+                                if ui.button("Revoke").clicked() {
+                                    match self.trust_registry.revoke_technician(
+                                        &technician.endpoint_id
+                                    ) {
+                                        Ok(()) => {
+                                            self.set_status("Technician trust revoked");
+                                            if self.host_running {
+                                                // Disconnect any currently active
+                                                // session, not only future sessions.
+                                                let _ = self.runtime_cmd_tx.try_send(
+                                                    RuntimeCommand::StopHosting
+                                                );
+                                            }
+                                        }
+                                        Err(error) => self.push_log(
+                                            format!("Revocation failed: {error}")
+                                        ),
+                                    }
+                                }
+                            });
+                        }
+                        ui.add_space(12.0);
+                        ui.heading("Remembered computers");
+                        let remembered = self.trust_registry.saved_computers();
+                        if remembered.is_empty() {
+                            ui.label(RichText::new("No saved computers")
+                                .size(12.0).color(muted));
+                        }
+                        for peer in remembered {
+                            ui.horizontal(|ui| {
+                                ui.label(RichText::new(&peer.label).color(ink));
+                                if ui.button("Forget").clicked() {
+                                    if let Err(error) = self.trust_registry.forget_computer(
+                                        &peer.endpoint_id
+                                    ) {
+                                        self.push_log(format!(
+                                            "Cannot remove saved computer: {error}"
+                                        ));
+                                    } else {
+                                        self.set_status("Remembered computer removed");
+                                    }
+                                }
+                            });
+                        }
+                        ui.add_space(9.0);
+                        ui.add(egui::Label::new(
+                            RichText::new("Your private identities and trust decisions are                                 protected by Windows DPAPI for your user account.")
+                                .size(11.0).color(muted)
+                        ).wrap(true));
+                    });
+            }
+        );
+    }
+
+    fn draw_logs_screen(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.heading("Activity log");
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.button("Copy log").clicked() {
+                    let joined = self.session_logs.iter().cloned()
+                        .collect::<Vec<_>>().join("\n");
+                    if let Err(error) = copy_text_to_clipboard(&joined) {
+                        self.push_log(format!("Cannot copy log: {error}"));
+                    }
+                }
+            });
+        });
+        ui.add_space(12.0);
+        egui::Frame::none().fill(Color32::WHITE)
+            .stroke(Stroke::new(1.0, Color32::from_rgb(225, 232, 241)))
+            .rounding(Rounding::same(16.0))
+            .inner_margin(egui::Margin::same(18.0))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                egui::ScrollArea::vertical().auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        for line in self.session_logs.iter().rev() {
+                            ui.add(egui::Label::new(
+                                RichText::new(line).monospace().size(12.0))
+                                .wrap(true));
+                            ui.separator();
+                        }
+                    });
+            });
+    }
+
     fn draw_dashboard(&mut self, ui: &mut egui::Ui) {
         // The two tabs are alternative workflows. Never render both side by
         // side: on 1080p screens this overflows horizontally and hides prompts.
@@ -1130,8 +1593,8 @@ impl NexusGuiApp {
             return;
         }
 
-        if let Err(error) = parse_connection_seed(access_id) {
-            self.push_log(format!("Connection seed validation failed: {error}"));
+        if let Err(error) = short_code::parse_code(access_id) {
+            self.push_log(format!("Invalid numeric code: {error}"));
             return;
         }
 
@@ -1147,6 +1610,7 @@ impl NexusGuiApp {
             } else {
                 Some(display_name)
             },
+            remember_host: self.remember_this_computer,
             _transport_mode: self.host_transport_mode,
         };
 
@@ -1276,6 +1740,14 @@ impl NexusGuiApp {
                 ui.add(egui::Label::new(format!("Session: {}", prompt.target_session)).wrap(true));
                 ui.add_space(10.0);
                 ui.add(egui::Label::new("Allow screen viewing? Keyboard and mouse control only if explicitly enabled in Host settings. You may revoke at any time.").wrap(true));
+                if prompt.remember_requested {
+                    ui.add_space(10.0);
+                    ui.checkbox(&mut self.trust_current_technician,
+                        "Trust this technician for future connections without approval");
+                    ui.add(egui::Label::new(
+                        "This permits the technician's authenticated computer to reconnect                          while XLINK is running. Disable or revoke in Settings."
+                    ).wrap(true));
+                }
                 ui.add_space(12.0);
 
                 ui.horizontal(|ui| {
@@ -1283,7 +1755,9 @@ impl NexusGuiApp {
                         .add(egui::Button::new("Deny").fill(Color32::from_rgb(128, 46, 57)))
                         .clicked()
                     {
-                        match self.ui_bridge.respond_host_consent(false) {
+                        match self.ui_bridge.respond_host_consent(HostConsentDecision {
+                            approved: false, remember_technician: false,
+                        }) {
                             Ok(()) => {
                                 self.pending_host_consent = None;
                                 self.set_status("Host denied local consent");
@@ -1298,7 +1772,11 @@ impl NexusGuiApp {
                         .add(egui::Button::new("Approve").fill(Color32::from_rgb(44, 125, 83)))
                         .clicked()
                     {
-                        match self.ui_bridge.respond_host_consent(true) {
+                        match self.ui_bridge.respond_host_consent(HostConsentDecision {
+                            approved: true,
+                            remember_technician: prompt.remember_requested
+                                && self.trust_current_technician,
+                        }) {
                             Ok(()) => {
                                 self.pending_host_consent = None;
                                 self.set_status("Host approved local consent");
@@ -1369,9 +1847,7 @@ impl NexusGuiApp {
 
 impl eframe::App for NexusGuiApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        if self.detecting_public_ip.load(Ordering::Relaxed) {
-            ctx.request_repaint_after(Duration::from_millis(100));
-        }
+        // Paint while pairing is pending; no external IP detection is needed.
 
         let detected_addr = {
             if let Ok(mut guard) = self.detected_public_addr.lock() {
@@ -1390,44 +1866,111 @@ impl eframe::App for NexusGuiApp {
 
 
 
-        let ip_detection_finished = !self.detecting_public_ip.load(Ordering::Relaxed);
-        if ip_detection_finished && !self.has_auto_hosted && !self.host_running && self.active_tab == ActiveTab::HostMode {
+        if !self.has_auto_hosted && !self.host_running {
             self.has_auto_hosted = true;
             self.start_hosting_clicked();
         }
 
         self.poll_runtime_events(ctx);
-        self.trigger_launch_auto_connect();
-        self.handle_dropped_files(ctx);
+        // No file/QR/mnemonic import or implicit connection. Six-to-ten
+        // digit keypad pairing is the only interaction path.
 
-        paint_app_background(ctx);
+        // XLINK v5: a single clear home screen, not Host and Client settings pages.
+        let window_focused = ctx.input(|input| input.focused);
+        if window_focused && !self.window_was_focused
+            && !self.show_logs && !self.show_preferences {
+            self.refocus_number_input = true;
+        }
+        self.window_was_focused = window_focused;
 
-        egui::TopBottomPanel::top("top_bar")
-            .frame(
-                egui::Frame::none()
-                    .fill(Color32::from_rgba_unmultiplied(13, 20, 31, 236))
-                    .inner_margin(egui::Margin::symmetric(18.0, 14.0)),
-            )
+        if self.code_ready_at.is_some_and(|when| when.elapsed() >= Duration::from_secs(180))
+            && self.generated_access_id.is_some() {
+            // Prevent copying an expired public mailbox nameplate.
+            self.generated_access_id = None;
+            self.code_ready_at = None;
+            self.set_status("Refreshing your temporary ID...");
+        }
+
+        egui::TopBottomPanel::top("home_navigation")
+            .frame(egui::Frame::none()
+                .fill(Color32::WHITE)
+                .inner_margin(egui::Margin::symmetric(20.0, 14.0)))
             .show(ctx, |ui| {
-                self.draw_header(ui);
-            });
-
-        egui::CentralPanel::default()
-            .frame(egui::Frame::none().inner_margin(egui::Margin::symmetric(14.0, 14.0)))
-            .show(ctx, |ui| {
-                egui::ScrollArea::vertical().show(ui, |ui| {
-                    self.draw_dashboard(ui);
+                ui.horizontal(|ui| {
+                    if ui.add(
+                        egui::Button::new(RichText::new("XLINK")
+                            .size(24.0).strong().color(Color32::from_rgb(28, 64, 119)))
+                            .frame(false)
+                    ).on_hover_text("Home").clicked() {
+                        self.show_logs = false;
+                        self.show_preferences = false;
+                        self.refocus_number_input = true;
+                    }
+                    if self.host_session_active {
+                        ui.label(RichText::new("●  LIVE SUPPORT")
+                            .strong().size(11.0).color(Color32::from_rgb(190, 51, 65)));
+                    } else if ui.available_width() > 430.0 {
+                        ui.label(RichText::new("Remote support")
+                            .size(12.0).color(Color32::from_rgb(106, 123, 142)));
+                    }
+                    ui.with_layout(
+                        egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if self.host_running {
+                                if ui_widgets::toolbar_button(
+                                    ui, Glyph::Stop, "Stop sharing", false, true,
+                                ).on_hover_text("Revoke remote access immediately").clicked() {
+                                    if self.runtime_cmd_tx.try_send(
+                                        RuntimeCommand::StopHosting
+                                    ).is_ok() {
+                                        self.generated_access_id = None;
+                                        self.code_ready_at = None;
+                                        self.set_status("Stopping all remote sessions...");
+                                    }
+                                }
+                            } else if ui_widgets::toolbar_button(
+                                ui, Glyph::Connect, "Start hosting", false, false,
+                            ).clicked() {
+                                self.start_hosting_clicked();
+                            }
+                            if ui_widgets::toolbar_button(
+                                ui, Glyph::Logs, "Logs", self.show_logs, false,
+                            ).clicked() {
+                                self.show_logs = !self.show_logs;
+                                self.show_preferences = false;
+                                if !self.show_logs {
+                                    self.refocus_number_input = true;
+                                }
+                            }
+                            if ui_widgets::toolbar_button(
+                                ui, Glyph::Settings, "Settings", self.show_preferences, false,
+                            ).clicked() {
+                                self.show_preferences = !self.show_preferences;
+                                self.show_logs = false;
+                                if !self.show_preferences {
+                                    self.refocus_number_input = true;
+                                }
+                            }
+                        });
                 });
             });
-
-        egui::TopBottomPanel::bottom("status_bar")
-            .frame(
-                egui::Frame::none()
-                    .fill(Color32::from_rgba_unmultiplied(11, 16, 24, 228))
-                    .inner_margin(egui::Margin::symmetric(16.0, 10.0)),
-            )
+        egui::CentralPanel::default()
+            .frame(egui::Frame::none()
+                .fill(Color32::from_rgb(248, 250, 253))
+                .inner_margin(egui::Margin::symmetric(
+                    if ctx.available_rect().width() < 580.0 { 10.0 } else { 24.0 },
+                    16.0,
+                )))
             .show(ctx, |ui| {
-                self.draw_status_bar(ui);
+                egui::ScrollArea::vertical().auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        if self.show_preferences {
+                            self.draw_preferences_screen(ui);
+                        } else if self.show_logs {
+                            self.draw_logs_screen(ui);
+                        } else {
+                            self.draw_numeric_home(ui);
+                        }
+                    });
             });
 
         self.draw_copy_notice(ctx);
@@ -1439,37 +1982,20 @@ impl eframe::App for NexusGuiApp {
 }
 
 fn apply_modern_theme(ctx: &egui::Context) {
-    let mut visuals = egui::Visuals::dark();
-    visuals.window_fill = Color32::from_rgb(9, 13, 20);
-    visuals.panel_fill = Color32::from_rgb(9, 13, 20);
-    visuals.faint_bg_color = Color32::from_rgb(16, 24, 38);
-    visuals.extreme_bg_color = Color32::from_rgb(7, 10, 16);
-    visuals.code_bg_color = Color32::from_rgb(11, 18, 30);
-    visuals.hyperlink_color = Color32::from_rgb(95, 194, 242);
-    visuals.selection.bg_fill = Color32::from_rgb(57, 118, 168);
-    visuals.widgets.active.bg_fill = Color32::from_rgb(52, 115, 161);
-    visuals.widgets.hovered.bg_fill = Color32::from_rgb(38, 81, 113);
-    visuals.widgets.inactive.bg_fill = Color32::from_rgb(24, 37, 56);
-    visuals.window_rounding = Rounding::same(14.0);
-    visuals.override_text_color = Some(Color32::from_rgb(225, 236, 248));
-
+    let mut visuals = egui::Visuals::light();
+    visuals.window_fill = Color32::WHITE;
+    visuals.panel_fill = Color32::from_rgb(248, 250, 253);
+    visuals.faint_bg_color = Color32::from_rgb(245, 248, 252);
+    visuals.extreme_bg_color = Color32::WHITE;
+    visuals.hyperlink_color = Color32::from_rgb(39, 104, 218);
+    visuals.selection.bg_fill = Color32::from_rgb(198, 221, 255);
+    visuals.widgets.active.bg_fill = Color32::from_rgb(222, 235, 254);
+    visuals.widgets.hovered.bg_fill = Color32::from_rgb(237, 244, 255);
+    ctx.set_visuals(visuals);
     let mut style = (*ctx.style()).clone();
-    style.visuals = visuals;
-    style.spacing.item_spacing = egui::vec2(10.0, 11.0);
-    style.spacing.button_padding = egui::vec2(14.0, 9.0);
-    style.spacing.window_margin = egui::Margin::same(12.0);
-    style.text_styles.insert(
-        egui::TextStyle::Heading,
-        egui::FontId::new(28.0, egui::FontFamily::Proportional),
-    );
-    style.text_styles.insert(
-        egui::TextStyle::Body,
-        egui::FontId::new(15.5, egui::FontFamily::Proportional),
-    );
-    style.text_styles.insert(
-        egui::TextStyle::Monospace,
-        egui::FontId::new(13.0, egui::FontFamily::Monospace),
-    );
+    style.spacing.item_spacing = egui::vec2(10.0, 8.0);
+    style.spacing.button_padding = egui::vec2(11.0, 8.0);
+    style.visuals.window_rounding = Rounding::same(16.0);
     ctx.set_style(style);
 }
 
@@ -1539,6 +2065,7 @@ async fn runtime_dispatch_loop(
     mut runtime_cmd_rx: mpsc::Receiver<RuntimeCommand>,
     runtime_event_tx: mpsc::Sender<RuntimeEvent>,
     ui_bridge: Arc<UiBridge>,
+    trust_registry: trusted::TrustRegistry,
 ) {
     let host_running = Arc::new(AtomicBool::new(false));
     let client_running = Arc::new(AtomicBool::new(false));
@@ -1570,6 +2097,7 @@ async fn runtime_dispatch_loop(
                 let event_tx = runtime_event_tx.clone();
                 let host_running_flag = Arc::clone(&host_running);
                 let bridge = Arc::clone(&ui_bridge);
+                let registry = trust_registry.clone();
 
                 host_task = Some(tokio::spawn(async move {
                     let _ = event_tx.send(RuntimeEvent::HostLifecycle { running: true }).await;
@@ -1580,7 +2108,7 @@ async fn runtime_dispatch_loop(
                         .await;
 
                     let run_result =
-                        run_server_session(config, event_tx.clone(), bridge).await;
+                        run_server_session(config, event_tx.clone(), bridge, registry).await;
 
                     host_running_flag.store(false, Ordering::Release);
                     let _ = event_tx.send(RuntimeEvent::HostLifecycle { running: false }).await;
@@ -1604,6 +2132,7 @@ async fn runtime_dispatch_loop(
             RuntimeCommand::ConnectWithAccessId {
                 access_id,
                 display_name,
+                remember_host,
                 _transport_mode: _,
             } => {
                 if client_running
@@ -1618,13 +2147,13 @@ async fn runtime_dispatch_loop(
                     continue;
                 }
 
-                let parsed_access_id = match parse_connection_seed(&access_id) {
+                let _validated_code = match short_code::parse_code(&access_id) {
                     Ok(parsed) => parsed,
                     Err(error) => {
                         client_running.store(false, Ordering::Release);
                         let _ = runtime_event_tx
                             .send(RuntimeEvent::Error(format!(
-                                "invalid connection seed supplied by UI: {error}"
+                                "invalid short pairing code: {error}"
                             )))
                             .await;
                         continue;
@@ -1633,6 +2162,7 @@ async fn runtime_dispatch_loop(
 
                 let event_tx = runtime_event_tx.clone();
                 let client_running_flag = Arc::clone(&client_running);
+                let registry = trust_registry.clone();
                 let bridge = Arc::clone(&ui_bridge);
 
                 client_task = Some(tokio::spawn(async move {
@@ -1645,13 +2175,20 @@ async fn runtime_dispatch_loop(
                         ))
                         .await;
 
-                    let run_result = run_client_session(
-                        parsed_access_id,
-                        display_name,
-                        event_tx.clone(),
-                        bridge,
-                    )
-                    .await;
+                    let run_result = async {
+                        let _ = event_tx.send(RuntimeEvent::SessionStatus(
+                            "Authenticating short code through public mailbox...".to_string()
+                        )).await;
+                        let invitation = short_code::resolve(&access_id).await
+                            .context("public pairing failed")?;
+                        let _ = event_tx.send(RuntimeEvent::SessionStatus(
+                            "Identity verified; starting encrypted QUIC connection".to_string()
+                        )).await;
+                        run_client_session(
+                            invitation, display_name, event_tx.clone(), bridge,
+                            registry, remember_host,
+                        ).await
+                    }.await;
 
                     client_running_flag.store(false, Ordering::Release);
                     let _ = event_tx
@@ -1673,6 +2210,44 @@ async fn runtime_dispatch_loop(
                                 )))
                                 .await;
                         }
+                    }
+                }));
+            }
+            RuntimeCommand::ConnectTrusted { endpoint_id, display_name } => {
+                if client_running.compare_exchange(
+                    false, true, Ordering::AcqRel, Ordering::Acquire
+                ).is_err() {
+                    let _ = runtime_event_tx.send(RuntimeEvent::Error(
+                        "A client session is already running".to_string()
+                    )).await;
+                    continue;
+                }
+                let event_tx = runtime_event_tx.clone();
+                let running_flag = Arc::clone(&client_running);
+                let bridge = Arc::clone(&ui_bridge);
+                let registry = trust_registry.clone();
+                client_task = Some(tokio::spawn(async move {
+                    let _ = event_tx.send(RuntimeEvent::ClientLifecycle {
+                        running: true
+                    }).await;
+                    let _ = event_tx.send(RuntimeEvent::SessionStatus(
+                        "Authenticating remembered computer via stable QUIC identity".into()
+                    )).await;
+                    let invitation = short_code::Invitation {
+                        endpoint_id,
+                        ticket: TRUSTED_SESSION_MARKER.to_string(),
+                    };
+                    let result = run_client_session(
+                        invitation, display_name, event_tx.clone(), bridge, registry, false
+                    ).await;
+                    running_flag.store(false, Ordering::Release);
+                    let _ = event_tx.send(RuntimeEvent::ClientLifecycle {
+                        running: false
+                    }).await;
+                    if let Err(error) = result {
+                        let _ = event_tx.send(RuntimeEvent::Error(
+                            format!("Trusted connection failed: {error}")
+                        )).await;
                     }
                 }));
             }
@@ -1751,53 +2326,127 @@ async fn run_server_session(
     config: HostRuntimeConfig,
     runtime_event_tx: mpsc::Sender<RuntimeEvent>,
     ui_bridge: Arc<UiBridge>,
+    trust_registry: trusted::TrustRegistry,
 ) -> Result<()> {
     let fps = config.fps.clamp(MIN_FPS, MAX_FPS);
     if fps != config.fps {
         warn!(requested_fps = config.fps, fps, "fps value clamped to supported range");
     }
 
-    // Derive SecretKey and session ID from the host seed
-    let (secret_key, session_id) = derive_keys_from_seed(&config.seed);
-    let credentials = SessionCredentials { session_id: session_id.clone() };
-
-    // Build and bind the iroh endpoint with the derived secret key
+    // The private endpoint identity stays local; only its PUBLIC part is
+    // exchanged in an authenticated Magic Wormhole pairing.
+    let (secret_key, _) = derive_keys_from_seed(&config.seed);
     let endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::N0)
         .secret_key(secret_key)
         .alpns(vec![nexus_network::NEXUS_ALPN.to_vec()])
         .bind()
-        .await
-        .context("failed to create iroh endpoint")?;
-
+        .await.context("failed to bind encrypted iroh endpoint")?;
     let node_id = endpoint.id();
-    let access_id = build_access_id(&config.seed)?;
 
-    runtime_event_tx
-        .send(RuntimeEvent::HostReady {
+    'host_pairing: loop {
+        let (ready_tx, mut ready_rx) = mpsc::channel(1);
+        let pairing = short_code::advertise_and_pair(
+            *node_id.as_bytes(), &ready_tx,
+        );
+        tokio::pin!(pairing);
+        // Never display a randomly fabricated local code: wait for the
+        // publicly operated mailbox to confirm a real allocated nameplate.
+        let code = tokio::select! {
+            value = ready_rx.recv() => value.context("public mailbox closed before allocation")?,
+            outcome = &mut pairing => {
+                outcome?;
+                bail!("public pairing ended without publishing a code")
+            }
+        };
+
+        let _ = runtime_event_tx.send(RuntimeEvent::HostReady {
             advertised_addr: format!("iroh:{}", node_id),
-            fingerprint: node_id.to_string(), // Actual authenticated endpoint public identity
-            session_id: credentials.session_id.clone(),
-            access_id,
+            fingerprint: node_id.to_string(),
+            session_id: "one-time-secret".to_string(),
+            access_id: code,
             fps,
             inject_input: config.inject_input,
-        })
-        .await
-        .ok();
+        }).await;
 
-    loop {
+        // Both access paths use the same authenticated QUIC endpoint:
+        // a short-code SPAKE2 pairing, or a previously enrolled technician
+        // authenticating with its stable, DPAPI-protected private identity.
+        enum Route {
+            OneTime(short_code::Invitation),
+            Trusted(nexus_network::Connection),
+        }
+        let route = loop {
+            tokio::select! {
+            pairing_result = &mut pairing => {
+                match pairing_result {
+                    Ok(invitation) => break Route::OneTime(invitation),
+                    Err(error) => {
+                        warn!(?error, "public mailbox pairing failed; requesting fresh code");
+                        let _ = runtime_event_tx.send(RuntimeEvent::PairingCodeRevoked).await;
+                        let _ = runtime_event_tx.send(RuntimeEvent::SessionStatus(
+                            format!("Pairing unavailable: {error}; refreshing code")
+                        )).await;
+                        time::sleep(Duration::from_secs(3)).await;
+                        continue 'host_pairing;
+                    }
+                }
+            }
+            incoming = accept_connection(&endpoint) => {
+                match incoming {
+                    Ok(connection) => {
+                        let key = *connection.remote_id().as_bytes();
+                        if !trust_registry.trusts_technician(&key) {
+                            warn!(remote = %connection.remote_id(),
+                                "rejected unsolicited QUIC connection: no trusted enrollment");
+                            connection.close(4u32.into(), b"not an enrolled technician");
+                            // Do not allow an untrusted peer to reach Host approval
+                            // or share its screen by exploiting the numeric mailbox.
+                            continue;
+                        }
+                        break Route::Trusted(connection)
+                    }
+                    Err(error) => {
+                        warn!(?error, "incoming QUIC handshake rejected");
+                        continue;
+                    }
+                }
+            }
+        }
+        };
+
+        let _ = runtime_event_tx.send(RuntimeEvent::PairingCodeRevoked).await;
+        let (credentials, accepted) = match route {
+            Route::OneTime(invitation) => (
+                SessionCredentials { session_id: invitation.ticket },
+                None,
+            ),
+            Route::Trusted(connection) => (
+                SessionCredentials { session_id: TRUSTED_SESSION_MARKER.to_string() },
+                Some(connection),
+            ),
+        };
+        let _ = runtime_event_tx.send(RuntimeEvent::SessionStatus(
+            "Authenticated technician connecting; checking device authorization".to_string()
+        )).await;
         let result = run_host_peer_session(
             &endpoint, &config, &credentials, &runtime_event_tx, &ui_bridge, fps,
+            accepted, &trust_registry,
         ).await;
-        if let Err(error) = result {
-            warn!(?error, "incoming session ended with error; listener remains available");
-            let _ = runtime_event_tx.send(RuntimeEvent::SessionStatus(
-                format!("Session ended: {error}; awaiting another connection")
-            )).await;
-            time::sleep(Duration::from_millis(250)).await;
-        } else {
-            let _ = runtime_event_tx.send(RuntimeEvent::SessionStatus(
-                "Session ended; awaiting another connection".to_string()
-            )).await;
+        let _ = runtime_event_tx.send(RuntimeEvent::HostSessionActive {
+            active: false
+        }).await;
+        match result {
+            Ok(()) => {
+                let _ = runtime_event_tx.send(RuntimeEvent::SessionStatus(
+                    "Support session ended; generating fresh short code".to_string()
+                )).await;
+            }
+            Err(error) => {
+                warn!(?error, "support session ended with error");
+                let _ = runtime_event_tx.send(RuntimeEvent::SessionStatus(
+                    format!("Session ended: {error}; refreshing short code")
+                )).await;
+            }
         }
     }
 }
@@ -1809,13 +2458,19 @@ async fn run_host_peer_session(
     runtime_event_tx: &mpsc::Sender<RuntimeEvent>,
     ui_bridge: &Arc<UiBridge>,
     fps: u16,
+    preconnected: Option<nexus_network::Connection>,
+    trust_registry: &trusted::TrustRegistry,
 ) -> Result<()> {
     let session_state = Arc::new(SessionStateMachine::new());
     session_state.transition(SessionState::Authenticating)?;
 
     // Accept QUIC connection via iroh
     // Waiting for a user-initiated connection is normal idle time, not a timeout.
-    let connection = accept_connection(endpoint).await?;
+    let connection = match preconnected {
+        Some(connection) => connection,
+        None => accept_connection(endpoint).await?,
+    };
+    let remote_id = *connection.remote_id().as_bytes();
     let remote_addr_str = format!("iroh:{}", connection.remote_id());
 
     let handshake_latency = 0u128; // iroh establishes connection in background
@@ -1851,7 +2506,12 @@ async fn run_host_peer_session(
         .await
         .ok();
 
-    if let Err(auth_error) = credentials.verify(&incoming_auth.target_id) {
+    let authorized_trusted = incoming_auth.target_id == TRUSTED_SESSION_MARKER
+        && trust_registry.trusts_technician(&remote_id);
+    if !authorized_trusted
+        && credentials.verify(&incoming_auth.target_id).is_err()
+    {
+        let auth_error = SecurityError::AuthenticationFailed;
         let _ = session_state.transition(SessionState::Rejected);
         error!(
             ?auth_error,
@@ -1917,16 +2577,41 @@ async fn run_host_peer_session(
 
     session_state.transition(SessionState::PendingConsent)?;
 
-    let approved = request_host_consent(
-        remote_addr_str.clone(),
-        &incoming_auth,
-        &runtime_event_tx,
-        &ui_bridge,
-    )
-    .await?;
+    let decision = if authorized_trusted {
+        let _ = runtime_event_tx.send(RuntimeEvent::SessionStatus(
+            format!("Trusted technician {} connected; use Stop Sharing to revoke",
+                incoming_auth.requester_id)
+        )).await;
+        HostConsentDecision { approved: true, remember_technician: false }
+    } else {
+        request_host_consent(
+            remote_addr_str.clone(), &incoming_auth, &runtime_event_tx, &ui_bridge,
+        ).await?
+    };
+    let approved = decision.approved;
+
+    if approved && !authorized_trusted && incoming_auth.remember_device
+        && decision.remember_technician {
+        // Both sides opted in; the peer identity is authenticated by QUIC.
+        // Only successful persistence can enable future unattended access.
+        let display_label: String = incoming_auth.requester_id.chars()
+            .take(40).collect();
+        match trust_registry.add_technician(remote_id, &display_label)
+            .and_then(|_| trust_registry.set_unattended_enabled(true)) {
+            Ok(()) => {
+                control_send.send_control(&ControlMessage::Ack(
+                    "xlink-trusted-enrollment-confirmed-v1".to_string()
+                )).await?;
+                let _ = runtime_event_tx.send(RuntimeEvent::SessionStatus(
+                    "Technician explicitly trusted. Revoke in Settings at any time.".into()
+                )).await;
+            }
+            Err(error) => warn!(?error, "cannot save approved technician securely"),
+        }
+    }
+
     control_send.send_control(&ControlMessage::SessionConsent { approved })
-        .await
-        .context("failed to send session consent result")?;
+        .await.context("failed to send session consent result")?;
 
     if !approved {
         let _ = session_state.transition(SessionState::Rejected);
@@ -1944,6 +2629,9 @@ async fn run_host_peer_session(
     }
 
     session_state.transition(SessionState::Active)?;
+    let _ = runtime_event_tx.send(RuntimeEvent::HostSessionActive {
+        active: true
+    }).await;
 
     let input = Arc::new(InputController::new()?);
     input.set_state(InputSessionState::Active);
@@ -2199,17 +2887,21 @@ async fn run_host_peer_session(
 }
 
 async fn run_client_session(
-    parsed_access_id: ParsedAccessId,
+    invitation: short_code::Invitation,
     display_name: Option<String>,
     runtime_event_tx: mpsc::Sender<RuntimeEvent>,
     ui_bridge: Arc<UiBridge>,
+    trust_registry: trusted::TrustRegistry,
+    remember_host: bool,
 ) -> Result<()> {
-    let remote_id = iroh::PublicKey::from_bytes(&parsed_access_id.endpoint_id)
+    let remote_id = iroh::PublicKey::from_bytes(&invitation.endpoint_id)
         .context("connection ID is not a valid endpoint public key")?;
-    let session_id = derive_session_id(&parsed_access_id.endpoint_id);
+    let session_id = invitation.ticket;
 
     // Create client endpoint
-    let endpoint = create_client_endpoint().await?;
+    let endpoint = create_client_endpoint_with_secret(
+        SecretKey::from_bytes(&trust_registry.technician_seed()?),
+    ).await?;
 
     // N0 provides endpoint discovery, NAT traversal and managed relay fallback.
     // Avoid pinning a guessed relay hostname that may not be the host's actual home relay.
@@ -2277,6 +2969,7 @@ async fn run_client_session(
             &ControlMessage::AuthRequest {
                 requester_id,
                 target_id: session_id.clone(),
+                remember_device: remember_host,
             },
         )
         .await?;
@@ -2303,9 +2996,27 @@ async fn run_client_session(
 
         session_state.transition(SessionState::PendingConsent)?;
 
-        time::timeout(Duration::from_secs(210), wait_for_session_consent(&control_recv))
-            .await.context("waiting for on-screen host consent timed out")??;
+        let enrollment_confirmed = time::timeout(
+            Duration::from_secs(210), wait_for_session_consent(&control_recv)
+        ).await.context("waiting for host consent timed out")??;
         session_state.transition(SessionState::Active)?;
+        if enrollment_confirmed && remember_host {
+            // A successful encrypted QUIC session AND an explicit Host
+            // enrollment acknowledgement are required before saving a device.
+            let friendly_label = format!(
+                "Computer {}", hex::encode(&invitation.endpoint_id[..3])
+            );
+            match trust_registry.remember_computer(
+                invitation.endpoint_id, &friendly_label,
+            ) {
+                Ok(()) => {
+                    let _ = runtime_event_tx.send(RuntimeEvent::SessionStatus(
+                        "This Host is now saved as a trusted computer".to_string()
+                    )).await;
+                }
+                Err(error) => warn!(?error, "failed to remember this Host securely"),
+            }
+        }
 
         // The server has received approval and can now start streaming video.
         let frame_r = time::timeout(Duration::from_secs(45), connection.accept_uni())
@@ -2489,7 +3200,7 @@ async fn request_host_consent(
     incoming_auth: &IncomingAuth,
     runtime_event_tx: &mpsc::Sender<RuntimeEvent>,
     ui_bridge: &Arc<UiBridge>,
-) -> Result<bool> {
+) -> Result<HostConsentDecision> {
     if let Ok(value) = std::env::var("NEXUS_AUTO_CONSENT") {
         let normalized = value.trim().to_ascii_lowercase();
         if matches!(normalized.as_str(), "1" | "true" | "yes" | "y") {
@@ -2497,7 +3208,7 @@ async fn request_host_consent(
         }
         if matches!(normalized.as_str(), "0" | "false" | "no" | "n") {
             warn!("NEXUS_AUTO_CONSENT enabled: auto-denying consent for this session");
-            return Ok(false);
+            return Ok(HostConsentDecision { approved: false, remember_technician: false });
         }
     }
 
@@ -2509,12 +3220,13 @@ async fn request_host_consent(
             requester_id: incoming_auth.requester_id.clone(),
             remote_addr,
             target_session: incoming_auth.target_id.clone(),
+            remember_requested: incoming_auth.remember_device,
         })
         .await
         .ok();
 
     match time::timeout(Duration::from_secs(180), decision_rx).await {
-        Ok(Ok(approved)) => Ok(approved),
+        Ok(Ok(decision)) => Ok(decision),
         Ok(Err(_)) => Err(anyhow!("host consent response channel was closed")),
         Err(_) => {
             ui_bridge.clear_host_consent_sender();
@@ -2541,6 +3253,7 @@ async fn wait_for_auth_request(control_recv: &PacketReceiver) -> Result<Incoming
             Ok(ControlMessage::AuthRequest {
                 requester_id,
                 target_id,
+                remember_device,
             }) => {
                 if !saw_hello {
                     bail!("client sent authentication request before protocol hello");
@@ -2548,6 +3261,7 @@ async fn wait_for_auth_request(control_recv: &PacketReceiver) -> Result<Incoming
                 return Ok(IncomingAuth {
                     requester_id,
                     target_id,
+                    remember_device,
                 });
             }
             Ok(other) => {
@@ -2631,24 +3345,27 @@ async fn wait_for_client_access_decision(control_recv: &PacketReceiver) -> Resul
     }
 }
 
-async fn wait_for_session_consent(control_recv: &PacketReceiver) -> Result<()> {
+async fn wait_for_session_consent(control_recv: &PacketReceiver) -> Result<bool> {
+    let mut enrollment_confirmed = false;
     loop {
         match control_recv.recv_control().await {
             Ok(ControlMessage::SessionConsent { approved }) => {
                 if approved {
-                    info!("host approved session request");
-                    return Ok(());
+                    info!(enrollment_confirmed, "host approved session request");
+                    return Ok(enrollment_confirmed);
                 }
-                return Err(SecurityError::UserConsentDenied).context("host denied user consent");
+                return Err(SecurityError::UserConsentDenied)
+                    .context("host denied user consent");
             }
             Ok(ControlMessage::Ack(text)) => {
-                info!(%text, "received server acknowledgement while waiting for consent");
+                if text == "xlink-trusted-enrollment-confirmed-v1" {
+                    enrollment_confirmed = true;
+                } else {
+                    info!(%text, "host acknowledgement while waiting for consent");
+                }
             }
             Ok(other) => {
-                error!(
-                    ?other,
-                    "SECURITY: blocked unexpected packet while waiting for consent"
-                );
+                warn!(?other, "unexpected packet while waiting for consent");
             }
             Err(error) => {
                 return Err(error).context("failed while waiting for session consent");

@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use tracing::info;
 
 /// ALPN protocol identifier for NexusP2P sessions.
-pub const NEXUS_ALPN: &[u8] = b"nexus-p2p/4";
+pub const NEXUS_ALPN: &[u8] = b"nexus-p2p/5";
 
 /// Re-export iroh types used by the application layer.
 pub use iroh::endpoint::{Connection, RecvStream, SendStream, VarInt};
@@ -62,6 +62,18 @@ pub async fn create_client_endpoint() -> Result<Endpoint> {
     Ok(endpoint)
 }
 
+/// A stable client key permits future connections to be authorized by the
+/// remote computer's explicit public-key allowlist.
+pub async fn create_client_endpoint_with_secret(secret: SecretKey) -> Result<Endpoint> {
+    let endpoint = Endpoint::builder(iroh::endpoint::presets::N0)
+        .secret_key(secret)
+        .bind()
+        .await
+        .context("failed to create stable authenticated technician endpoint")?;
+    info!(identity = %endpoint.id(), "stable technician QUIC endpoint created");
+    Ok(endpoint)
+}
+
 /// Get the full EndpointAddr for an endpoint (includes relay URLs and direct addresses).
 pub async fn get_node_addr(endpoint: &Endpoint) -> Result<EndpointAddr> {
     Ok(endpoint.addr())
@@ -117,15 +129,24 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires local UDP and functional iroh relay/discovery"]
     async fn two_endpoints_exchange_bidirectional_data() {
-        use super::{accept_connection, connect_to_peer, create_client_endpoint, create_endpoint};
+        use super::{
+            accept_connection, connect_to_peer, create_client_endpoint_with_secret,
+            create_endpoint, SecretKey,
+        };
         use tokio::time::{timeout, Duration};
 
         let server = create_endpoint().await.expect("server endpoint");
-        let client = create_client_endpoint().await.expect("client endpoint");
+        let technician_key = SecretKey::generate();
+        let expected_identity = technician_key.public();
+        let client = create_client_endpoint_with_secret(technician_key)
+            .await.expect("stable client endpoint");
+        assert_eq!(client.id(), expected_identity);
         let address = server.addr();
         let server_task = tokio::spawn(async move {
             let connection = timeout(Duration::from_secs(20), accept_connection(&server))
                 .await.expect("server accept deadline").expect("accepted");
+            assert_eq!(connection.remote_id(), expected_identity,
+                "trusted identity must be authenticated by QUIC");
             let (mut tx, mut rx) = connection.accept_bi().await.expect("control stream");
             let mut received = [0_u8; 4];
             rx.read_exact(&mut received).await.expect("read request");

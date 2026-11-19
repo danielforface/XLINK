@@ -166,6 +166,7 @@ pub enum ControlMessage {
     AuthRequest {
         requester_id: String,
         target_id: String,
+        remember_device: bool,
     },
     AuthResult { success: bool, message: String },
     AccessRequest {
@@ -229,6 +230,7 @@ mod tests {
         let original = ControlMessage::AuthRequest {
             requester_id: "requester".to_string(),
             target_id: "target".to_string(),
+            remember_device: true,
         };
 
         let encoded = bincode::serialize(&original).expect("serialize ControlMessage");
@@ -238,7 +240,9 @@ mod tests {
             ControlMessage::AuthRequest {
                 requester_id,
                 target_id,
+                remember_device,
             } => {
+                assert!(remember_device);
                 assert_eq!(requester_id, "requester");
                 assert_eq!(target_id, "target");
             }
