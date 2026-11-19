@@ -2067,6 +2067,14 @@ async fn run_host_peer_session(
     let mut delta_encoder = delta::DeltaEncoder::new();
     let mut video_sequence = 0u64;
     let mut last_video_packet = Instant::now();
+    let mut stats_started = Instant::now();
+    let mut stats_full = 0u64;
+    let mut stats_rect = 0u64;
+    let mut stats_tiles = 0u64;
+    let mut stats_keepalive = 0u64;
+    let mut stats_idle_ticks = 0u64;
+    let mut stats_bytes = 0u64;
+    let mut stats_max_send_ms = 0u128;
     let mut ticker = time::interval(pacer.interval());
     ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
@@ -2127,7 +2135,10 @@ async fn run_host_peer_session(
                 // header rather than duplicating a full image.
                 delta::DeltaEncoder::heartbeat(video_sequence)
             }
-            None => continue,
+            None => {
+                stats_idle_ticks += 1;
+                continue;
+            }
         };
         video_sequence = video_sequence.wrapping_add(1);
         last_video_packet = Instant::now();
@@ -2144,6 +2155,29 @@ async fn run_host_peer_session(
             }
         }
 
+        match packet.stride {
+            1 => stats_rect += 1,
+            2 => stats_keepalive += 1,
+            3 => stats_tiles += 1,
+            _ => stats_full += 1,
+        }
+        stats_bytes += packet.pixels.len() as u64;
+        stats_max_send_ms = stats_max_send_ms.max(started.elapsed().as_millis());
+        if stats_started.elapsed() >= Duration::from_secs(5) {
+            let _ = runtime_event_tx.send(RuntimeEvent::SessionStatus(format!(
+                "Video {}fps: key={} patch={} tiles={} idle={} keepalive={} transmitted={} KiB peak-frame={}ms",
+                pacer.current(), stats_full, stats_rect, stats_tiles, stats_idle_ticks,
+                stats_keepalive, stats_bytes / 1024, stats_max_send_ms,
+            ))).await;
+            stats_started = Instant::now();
+            stats_full = 0;
+            stats_rect = 0;
+            stats_tiles = 0;
+            stats_keepalive = 0;
+            stats_idle_ticks = 0;
+            stats_bytes = 0;
+            stats_max_send_ms = 0;
+        }
         if pacer.observe(started.elapsed()) {
             info!(fps = pacer.current(), "adaptive frame pacing updated");
             ticker = time::interval(pacer.interval());
