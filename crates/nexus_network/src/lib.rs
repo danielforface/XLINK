@@ -129,15 +129,24 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires local UDP and functional iroh relay/discovery"]
     async fn two_endpoints_exchange_bidirectional_data() {
-        use super::{accept_connection, connect_to_peer, create_client_endpoint, create_endpoint};
+        use super::{
+            accept_connection, connect_to_peer, create_client_endpoint_with_secret,
+            create_endpoint, SecretKey,
+        };
         use tokio::time::{timeout, Duration};
 
         let server = create_endpoint().await.expect("server endpoint");
-        let client = create_client_endpoint().await.expect("client endpoint");
+        let technician_key = SecretKey::generate();
+        let expected_identity = technician_key.public();
+        let client = create_client_endpoint_with_secret(technician_key)
+            .await.expect("stable client endpoint");
+        assert_eq!(client.id(), expected_identity);
         let address = server.addr();
         let server_task = tokio::spawn(async move {
             let connection = timeout(Duration::from_secs(20), accept_connection(&server))
                 .await.expect("server accept deadline").expect("accepted");
+            assert_eq!(connection.remote_id(), expected_identity,
+                "trusted identity must be authenticated by QUIC");
             let (mut tx, mut rx) = connection.accept_bi().await.expect("control stream");
             let mut received = [0_u8; 4];
             rx.read_exact(&mut received).await.expect("read request");
