@@ -2106,6 +2106,7 @@ async fn run_server_session(
     config: HostRuntimeConfig,
     runtime_event_tx: mpsc::Sender<RuntimeEvent>,
     ui_bridge: Arc<UiBridge>,
+    trust_registry: trusted::TrustRegistry,
 ) -> Result<()> {
     let fps = config.fps.clamp(MIN_FPS, MAX_FPS);
     if fps != config.fps {
@@ -2147,23 +2148,67 @@ async fn run_server_session(
             inject_input: config.inject_input,
         }).await;
 
-        let invitation = match pairing.await {
-            Ok(invitation) => invitation,
-            Err(error) => {
-                warn!(?error, "public mailbox pairing failed; retrying with new code");
-                let _ = runtime_event_tx.send(RuntimeEvent::SessionStatus(
-                    format!("Pairing unavailable: {error}; refreshing code")
-                )).await;
-                time::sleep(Duration::from_secs(3)).await;
-                continue;
+        // Both access paths use the same authenticated QUIC endpoint:
+        // a short-code SPAKE2 pairing, or a previously enrolled technician
+        // authenticating with its stable, DPAPI-protected private identity.
+        enum Route {
+            OneTime(short_code::Invitation),
+            Trusted(nexus_network::Connection),
+        }
+        let route = tokio::select! {
+            pairing_result = &mut pairing => {
+                match pairing_result {
+                    Ok(invitation) => Route::OneTime(invitation),
+                    Err(error) => {
+                        warn!(?error, "public mailbox pairing failed; requesting fresh code");
+                        let _ = runtime_event_tx.send(RuntimeEvent::PairingCodeRevoked).await;
+                        let _ = runtime_event_tx.send(RuntimeEvent::SessionStatus(
+                            format!("Pairing unavailable: {error}; refreshing code")
+                        )).await;
+                        time::sleep(Duration::from_secs(3)).await;
+                        continue;
+                    }
+                }
+            }
+            incoming = accept_connection(&endpoint) => {
+                match incoming {
+                    Ok(connection) => {
+                        let key = *connection.remote_id().as_bytes();
+                        if !trust_registry.trusts_technician(&key) {
+                            warn!(remote = %connection.remote_id(),
+                                "rejected unsolicited QUIC connection: no trusted enrollment");
+                            connection.close(4u32.into(), b"not an enrolled technician");
+                            // Do not allow an untrusted peer to reach Host approval
+                            // or share its screen by exploiting the numeric mailbox.
+                            continue;
+                        }
+                        Route::Trusted(connection)
+                    }
+                    Err(error) => {
+                        warn!(?error, "incoming QUIC handshake rejected");
+                        continue;
+                    }
+                }
             }
         };
-        let credentials = SessionCredentials { session_id: invitation.ticket };
+
+        let _ = runtime_event_tx.send(RuntimeEvent::PairingCodeRevoked).await;
+        let (credentials, accepted) = match route {
+            Route::OneTime(invitation) => (
+                SessionCredentials { session_id: invitation.ticket },
+                None,
+            ),
+            Route::Trusted(connection) => (
+                SessionCredentials { session_id: TRUSTED_SESSION_MARKER.to_string() },
+                Some(connection),
+            ),
+        };
         let _ = runtime_event_tx.send(RuntimeEvent::SessionStatus(
-            "Short code authenticated; waiting for technician QUIC handshake".to_string()
+            "Authenticated technician connecting; checking device authorization".to_string()
         )).await;
         let result = run_host_peer_session(
             &endpoint, &config, &credentials, &runtime_event_tx, &ui_bridge, fps,
+            accepted, &trust_registry,
         ).await;
         match result {
             Ok(()) => {
@@ -2188,13 +2233,19 @@ async fn run_host_peer_session(
     runtime_event_tx: &mpsc::Sender<RuntimeEvent>,
     ui_bridge: &Arc<UiBridge>,
     fps: u16,
+    preconnected: Option<nexus_network::Connection>,
+    trust_registry: &trusted::TrustRegistry,
 ) -> Result<()> {
     let session_state = Arc::new(SessionStateMachine::new());
     session_state.transition(SessionState::Authenticating)?;
 
     // Accept QUIC connection via iroh
     // Waiting for a user-initiated connection is normal idle time, not a timeout.
-    let connection = accept_connection(endpoint).await?;
+    let connection = match preconnected {
+        Some(connection) => connection,
+        None => accept_connection(endpoint).await?,
+    };
+    let remote_id = *connection.remote_id().as_bytes();
     let remote_addr_str = format!("iroh:{}", connection.remote_id());
 
     let handshake_latency = 0u128; // iroh establishes connection in background
@@ -2231,7 +2282,12 @@ async fn run_host_peer_session(
         .await
         .ok();
 
-    if let Err(auth_error) = credentials.verify(&incoming_auth.target_id) {
+    let authorized_trusted = incoming_auth.target_id == TRUSTED_SESSION_MARKER
+        && trust_registry.trusts_technician(&remote_id);
+    if !authorized_trusted
+        && credentials.verify(&incoming_auth.target_id).is_err()
+    {
+        let auth_error = SecurityError::AuthenticationFailed;
         let _ = session_state.transition(SessionState::Rejected);
         error!(
             ?auth_error,
@@ -2297,16 +2353,39 @@ async fn run_host_peer_session(
 
     session_state.transition(SessionState::PendingConsent)?;
 
-    let approved = request_host_consent(
-        remote_addr_str.clone(),
-        &incoming_auth,
-        &runtime_event_tx,
-        &ui_bridge,
-    )
-    .await?;
+    let decision = if authorized_trusted {
+        let _ = runtime_event_tx.send(RuntimeEvent::SessionStatus(
+            format!("Trusted technician {} connected; use Stop Sharing to revoke",
+                incoming_auth.requester_id)
+        )).await;
+        HostConsentDecision { approved: true, remember_technician: false }
+    } else {
+        request_host_consent(
+            remote_addr_str.clone(), &incoming_auth, &runtime_event_tx, &ui_bridge,
+        ).await?
+    };
+    let approved = decision.approved;
+
+    if approved && !authorized_trusted && incoming_auth.remember_device
+        && decision.remember_technician {
+        // Both sides opted in; the peer identity is authenticated by QUIC.
+        // Only successful persistence can enable future unattended access.
+        match trust_registry.add_technician(remote_id, &incoming_auth.requester_id)
+            .and_then(|_| trust_registry.set_unattended_enabled(true)) {
+            Ok(()) => {
+                control_send.send_control(&ControlMessage::Ack(
+                    "xlink-trusted-enrollment-confirmed-v1".to_string()
+                )).await?;
+                let _ = runtime_event_tx.send(RuntimeEvent::SessionStatus(
+                    "Technician explicitly trusted. Revoke in Settings at any time.".into()
+                )).await;
+            }
+            Err(error) => warn!(?error, "cannot save approved technician securely"),
+        }
+    }
+
     control_send.send_control(&ControlMessage::SessionConsent { approved })
-        .await
-        .context("failed to send session consent result")?;
+        .await.context("failed to send session consent result")?;
 
     if !approved {
         let _ = session_state.transition(SessionState::Rejected);
