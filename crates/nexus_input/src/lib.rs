@@ -1,5 +1,7 @@
 use anyhow::{anyhow, Result};
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::Mutex;
 use windows::core::{Error as WindowsError, PCWSTR};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT, KEYEVENTF_KEYUP,
@@ -45,6 +47,7 @@ pub struct InputController {
     desktop_width: i32,
     desktop_height: i32,
     state: AtomicU8,
+    pressed_keys: Mutex<HashSet<u16>>,
 }
 
 impl InputController {
@@ -56,11 +59,35 @@ impl InputController {
             desktop_width,
             desktop_height,
             state: AtomicU8::new(SESSION_INACTIVE),
+            pressed_keys: Mutex::new(HashSet::new()),
         })
     }
 
     pub fn set_state(&self, state: SessionState) {
         self.state.store(state_to_u8(state), Ordering::Release);
+        if state != SessionState::Active {
+            self.release_held_keys();
+        }
+    }
+
+    fn release_held_keys(&self) {
+        if let Ok(mut keys) = self.pressed_keys.lock() {
+            for key in keys.drain() {
+                let input = INPUT {
+                    r#type: INPUT_KEYBOARD,
+                    Anonymous: INPUT_0 {
+                        ki: KEYBDINPUT {
+                            wVk: VIRTUAL_KEY(key),
+                            wScan: 0,
+                            dwFlags: KEYEVENTF_KEYUP,
+                            time: 0,
+                            dwExtraInfo: 0,
+                        },
+                    },
+                };
+                let _ = unsafe { SendInput(&[input], std::mem::size_of::<INPUT>() as i32) };
+            }
+        }
     }
 
     pub fn state(&self) -> SessionState {
@@ -151,6 +178,13 @@ impl InputController {
             ));
         }
 
+        if let Ok(mut keys) = self.pressed_keys.lock() {
+            if pressed {
+                keys.insert(virtual_key);
+            } else {
+                keys.remove(&virtual_key);
+            }
+        }
         Ok(preview)
     }
 
@@ -222,6 +256,12 @@ impl InputController {
                 self.state()
             ))
         }
+    }
+}
+
+impl Drop for InputController {
+    fn drop(&mut self) {
+        self.release_held_keys();
     }
 }
 
