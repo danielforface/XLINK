@@ -50,7 +50,7 @@ use winreg::enums::HKEY_CURRENT_USER;
 #[cfg(target_os = "windows")]
 use winreg::RegKey;
 
-const PROTOCOL_VERSION: u16 = 2;
+const PROTOCOL_VERSION: u16 = 3;
 const MAX_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
 const MAX_CONTROL_MESSAGE_BYTES: usize = 64 * 1024;
 const MAX_FRAME_WIDTH: u32 = 16_384;
@@ -396,7 +396,7 @@ impl NexusGuiApp {
             pending_auto_connect,
             host_port,
             host_fps: DEFAULT_FPS,
-            host_inject_input: false,
+            host_inject_input: true,
             host_advertise_addr_input: default_advertise,
             client_display_name: String::new(),
             pending_client_permission: None,
@@ -656,7 +656,7 @@ impl NexusGuiApp {
                         ui.add(egui::Slider::new(&mut self.host_fps, MIN_FPS..=MAX_FPS));
                     });
                     ui.add_space(8.0);
-                    ui.checkbox(&mut self.host_inject_input, "Allow remote input after local approval");
+                    ui.checkbox(&mut self.host_inject_input, "Allow keyboard and mouse only after I approve the technician");
                     ui.add_space(8.0);
                     ui.label("Transport: encrypted iroh QUIC (automatic direct P2P / relay fallback)");
                     ui.label("Connection identity is generated after Start Hosting. No IP or port forwarding is normally required.");
@@ -1986,6 +1986,15 @@ async fn run_host_peer_session(
                     // Do not flood the control channel with acknowledgements for
                     // every mouse movement. QUIC already provides reliable delivery.
                 }
+                Ok(ControlMessage::MouseButtonEvent { button, pressed }) => {
+                    if !session_state_for_control.is_active() || !inject_input {
+                        warn!(button, pressed, "blocked mouse click without active authorized control");
+                        continue;
+                    }
+                    if let Err(error) = input_for_control.inject_mouse_button(button, pressed) {
+                        warn!(?error, button, pressed, "mouse click injection failed");
+                    }
+                }
                 Ok(ControlMessage::SimulatedKeyEvent {
                     virtual_key,
                     pressed,
@@ -2256,6 +2265,9 @@ async fn run_client_session(
                 let message = match event {
                     ViewerInputEvent::MouseMove { x_norm, y_norm } => {
                         ControlMessage::SimulatedMouseMove { x_norm, y_norm }
+                    }
+                    ViewerInputEvent::MouseButton { button, pressed } => {
+                        ControlMessage::MouseButtonEvent { button, pressed }
                     }
                     ViewerInputEvent::Keyboard {
                         virtual_key,
