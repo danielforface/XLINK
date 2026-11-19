@@ -163,6 +163,8 @@ enum RuntimeCommand {
         _transport_mode: TransportMode,
     },
     RunDiagnostics,
+    StopHosting,
+    DisconnectClient,
 }
 
 #[derive(Debug)]
@@ -782,9 +784,16 @@ impl NexusGuiApp {
                                 .rounding(Rounding::same(10.0))
                                 .fill(Color32::from_rgb(42, 132, 92)),
                         )
-                        .clicked()
+                        .clicked() && !self.host_running
                     {
                         self.start_hosting_clicked();
+                    }
+                    if self.host_running && ui.button("Stop hosting / Revoke control").clicked() {
+                        if let Err(error) = self.runtime_cmd_tx.try_send(RuntimeCommand::StopHosting) {
+                            self.push_log(format!("Failed to revoke hosting: {error}"));
+                        } else {
+                            self.set_status("Revoking host session...");
+                        }
                     }
                 });
             },
@@ -1149,9 +1158,16 @@ impl NexusGuiApp {
                                 .rounding(Rounding::same(10.0))
                                 .fill(Color32::from_rgb(42, 132, 92)),
                         )
-                        .clicked()
+                        .clicked() && !self.client_running
                     {
                         self.connect_clicked();
+                    }
+                    if self.client_running && ui.button("Disconnect now").clicked() {
+                        if let Err(error) = self.runtime_cmd_tx.try_send(RuntimeCommand::DisconnectClient) {
+                            self.push_log(format!("Disconnect request failed: {error}"));
+                        } else {
+                            self.set_status("Disconnecting...");
+                        }
                     }
                 });
             },
@@ -1688,6 +1704,8 @@ async fn runtime_dispatch_loop(
 ) {
     let host_running = Arc::new(AtomicBool::new(false));
     let client_running = Arc::new(AtomicBool::new(false));
+    let mut host_task: Option<tokio::task::JoinHandle<()>> = None;
+    let mut client_task: Option<tokio::task::JoinHandle<()>> = None;
 
     // Spawn STUN network topology diagnostic immediately on startup
     let event_tx_clone = runtime_event_tx.clone();
@@ -1715,7 +1733,7 @@ async fn runtime_dispatch_loop(
                 let host_running_flag = Arc::clone(&host_running);
                 let bridge = Arc::clone(&ui_bridge);
 
-                tokio::spawn(async move {
+                host_task = Some(tokio::spawn(async move {
                     let _ = event_tx.send(RuntimeEvent::HostLifecycle { running: true }).await;
                     let _ = event_tx
                         .send(RuntimeEvent::SessionStatus(
@@ -1743,7 +1761,7 @@ async fn runtime_dispatch_loop(
                                 .await;
                         }
                     }
-                });
+                }));
             }
             RuntimeCommand::ConnectWithAccessId {
                 access_id,
@@ -1779,7 +1797,7 @@ async fn runtime_dispatch_loop(
                 let client_running_flag = Arc::clone(&client_running);
                 let bridge = Arc::clone(&ui_bridge);
 
-                tokio::spawn(async move {
+                client_task = Some(tokio::spawn(async move {
                     let _ = event_tx
                         .send(RuntimeEvent::ClientLifecycle { running: true })
                         .await;
@@ -1818,7 +1836,7 @@ async fn runtime_dispatch_loop(
                                 .await;
                         }
                     }
-                });
+                }));
             }
             RuntimeCommand::RunDiagnostics => {
                 let event_tx = runtime_event_tx.clone();
@@ -1826,6 +1844,26 @@ async fn runtime_dispatch_loop(
                     let (topology, public_addr) = run_diagnostics(0).await;
                     let _ = event_tx.send(RuntimeEvent::DiagnosticsCompleted { topology, public_addr }).await;
                 });
+            }
+            RuntimeCommand::StopHosting => {
+                if let Some(task) = host_task.take() {
+                    task.abort();
+                    let _ = task.await;
+                }
+                host_running.store(false, Ordering::Release);
+                ui_bridge.clear_host_consent_sender();
+                let _ = runtime_event_tx.send(RuntimeEvent::HostLifecycle { running: false }).await;
+                let _ = runtime_event_tx.send(RuntimeEvent::SessionStatus("Host session revoked".into())).await;
+            }
+            RuntimeCommand::DisconnectClient => {
+                if let Some(task) = client_task.take() {
+                    task.abort();
+                    let _ = task.await;
+                }
+                client_running.store(false, Ordering::Release);
+                ui_bridge.clear_client_permission_sender();
+                let _ = runtime_event_tx.send(RuntimeEvent::ClientLifecycle { running: false }).await;
+                let _ = runtime_event_tx.send(RuntimeEvent::SessionStatus("Client disconnected".into())).await;
             }
         }
     }
