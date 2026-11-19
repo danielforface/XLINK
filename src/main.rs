@@ -2142,7 +2142,7 @@ async fn run_host_peer_session(
 
                     match apply_mouse_event(&input_for_control, x_norm, y_norm, inject_input) {
                         Ok(preview) => {
-                            info!(
+                            tracing::debug!(
                                 x_norm,
                                 y_norm,
                                 absolute_x = preview.absolute_x,
@@ -2160,17 +2160,8 @@ async fn run_host_peer_session(
                         }
                     }
 
-                    if let Err(error) = control_send_clone.send_control(
-                        &ControlMessage::Ack(format!(
-                            "{} move to ({x_norm:.3}, {y_norm:.3})",
-                            if inject_input { "injected" } else { "previewed" }
-                        )),
-                    )
-                    .await
-                    {
-                        error!(?error, "failed to send mouse acknowledgement");
-                        break;
-                    }
+                    // Do not flood the control channel with acknowledgements for
+                    // every mouse movement. QUIC already provides reliable delivery.
                 }
                 Ok(ControlMessage::SimulatedKeyEvent {
                     virtual_key,
@@ -2488,7 +2479,9 @@ async fn run_client_session(
         let mut ack_task_finished = false;
         loop {
             let next_frame = tokio::select! {
-                frame = frame_recv.recv_frame() => Some(frame),
+                frame = time::timeout(Duration::from_secs(45), frame_recv.recv_frame()) => {
+                    Some(frame.unwrap_or_else(|_| Err(anyhow!("video stream stalled for 45 seconds"))))
+                },
                 _ = &mut input_task.0 => {
                     input_task_finished = true;
                     None
