@@ -50,6 +50,7 @@ pub struct InputController {
     desktop_height: i32,
     state: AtomicU8,
     pressed_keys: Mutex<HashSet<u16>>,
+    pressed_buttons: Mutex<HashSet<u8>>,
 }
 
 impl InputController {
@@ -62,6 +63,7 @@ impl InputController {
             desktop_height,
             state: AtomicU8::new(SESSION_INACTIVE),
             pressed_keys: Mutex::new(HashSet::new()),
+            pressed_buttons: Mutex::new(HashSet::new()),
         })
     }
 
@@ -69,6 +71,7 @@ impl InputController {
         self.state.store(state_to_u8(state), Ordering::Release);
         if state != SessionState::Active {
             self.release_held_keys();
+            self.release_held_buttons();
         }
     }
 
@@ -84,6 +87,29 @@ impl InputController {
                             dwFlags: KEYEVENTF_KEYUP,
                             time: 0,
                             dwExtraInfo: 0,
+                        },
+                    },
+                };
+                let _ = unsafe { SendInput(&[input], std::mem::size_of::<INPUT>() as i32) };
+            }
+        }
+    }
+
+    fn release_held_buttons(&self) {
+        if let Ok(mut buttons) = self.pressed_buttons.lock() {
+            for button in buttons.drain() {
+                let flags = match button {
+                    0 => MOUSEEVENTF_LEFTUP,
+                    1 => MOUSEEVENTF_RIGHTUP,
+                    2 => MOUSEEVENTF_MIDDLEUP,
+                    _ => continue,
+                };
+                let input = INPUT {
+                    r#type: INPUT_MOUSE,
+                    Anonymous: INPUT_0 {
+                        mi: MOUSEINPUT {
+                            dx: 0, dy: 0, mouseData: 0,
+                            dwFlags: flags, time: 0, dwExtraInfo: 0,
                         },
                     },
                 };
@@ -162,6 +188,13 @@ impl InputController {
         let sent = unsafe { SendInput(&[input], std::mem::size_of::<INPUT>() as i32) };
         if sent != 1 {
             return Err(anyhow!("SendInput mouse button failed: {}", WindowsError::from_win32()));
+        }
+        if let Ok(mut buttons) = self.pressed_buttons.lock() {
+            if pressed {
+                buttons.insert(button);
+            } else {
+                buttons.remove(&button);
+            }
         }
         Ok(())
     }
@@ -297,6 +330,7 @@ impl InputController {
 impl Drop for InputController {
     fn drop(&mut self) {
         self.release_held_keys();
+        self.release_held_buttons();
     }
 }
 
