@@ -2285,13 +2285,11 @@ async fn run_client_session(
         let (control_s, control_r) = time::timeout(HANDSHAKE_TIMEOUT, connection.open_bi())
             .await.context("opening control stream timed out")?
             .context("failed to open control stream")?;
-        let frame_r = time::timeout(HANDSHAKE_TIMEOUT, connection.accept_uni())
-            .await.context("waiting for remote video stream timed out")?
-            .context("server did not open a frame stream")?;
-
+        // QUIC streams become visible to the peer only when data is sent.
+        // Do not wait for video before Hello/AuthRequest: the host awaits
+        // that control stream and will send video only after human consent.
         let control_send = PacketSender(Arc::new(tokio::sync::Mutex::new(control_s)));
         let control_recv = PacketReceiver(Arc::new(tokio::sync::Mutex::new(control_r)));
-        let frame_recv = FrameReceiver(Arc::new(tokio::sync::Mutex::new(frame_r)));
 
         let session_state = Arc::new(SessionStateMachine::new());
         session_state.transition(SessionState::Authenticating)?;
@@ -2355,6 +2353,12 @@ async fn run_client_session(
         time::timeout(Duration::from_secs(210), wait_for_session_consent(&control_recv))
             .await.context("waiting for on-screen host consent timed out")??;
         session_state.transition(SessionState::Active)?;
+
+        // The server has received approval and can now start streaming video.
+        let frame_r = time::timeout(Duration::from_secs(45), connection.accept_uni())
+            .await.context("approved session did not start its video stream")?
+            .context("server failed to provide a video stream")?;
+        let frame_recv = FrameReceiver(Arc::new(tokio::sync::Mutex::new(frame_r)));
 
         let (viewer_frame_tx, mut viewer_input_rx) =
             spawn_remote_viewer("NexusP2P - Remote Session [Active]")?;
