@@ -3,6 +3,8 @@
 mod adaptive;
 mod delta;
 mod frame_codec;
+mod numeric_entry;
+mod ui_widgets;
 mod short_code;
 mod trusted;
 
@@ -12,6 +14,8 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
 use eframe::egui;
 use egui::{Color32, ColorImage, RichText, Rounding, Stroke, TextureHandle, TextureOptions};
+use numeric_entry::EditAction;
+use ui_widgets::Glyph;
 use nexus_core::{
     ControlMessage, FramePacket, SecurityError, SessionCredentials, SessionState,
     SessionStateMachine,
@@ -111,13 +115,13 @@ fn main() -> Result<()> {
 
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([920.0, 740.0])
-            .with_min_inner_size([500.0, 530.0]),
+            .with_inner_size([708.0, 758.0])
+            .with_min_inner_size([490.0, 550.0]),
         ..Default::default()
     };
 
     eframe::run_native(
-        "NexusP2P Access Hub",
+        "XLINK | Secure Remote Support",
         native_options,
         Box::new(move |cc| {
             let app = NexusGuiApp::new(
@@ -362,6 +366,7 @@ struct NexusGuiApp {
     show_preferences: bool,
     code_ready_at: Option<Instant>,
     refocus_number_input: bool,
+    numeric_cursor: usize,
     window_was_focused: bool,
     remember_this_computer: bool,
     trust_current_technician: bool,
@@ -446,6 +451,7 @@ impl NexusGuiApp {
             show_preferences: false,
             code_ready_at: None,
             refocus_number_input: true,
+            numeric_cursor: 0,
             window_was_focused: false,
             remember_this_computer: false,
             trust_current_technician: false,
@@ -1180,25 +1186,22 @@ impl NexusGuiApp {
     }
 
     fn draw_compact_own_code(&mut self, ui: &mut egui::Ui) {
-        let ink = Color32::from_rgb(26, 45, 67);
-        let muted = Color32::from_rgb(105, 124, 146);
+        let ink = Color32::from_rgb(29, 50, 77);
+        let muted = Color32::from_rgb(101, 120, 145);
         let elapsed = self.code_ready_at
             .map(|t| t.elapsed().as_secs_f32()).unwrap_or(180.0);
         let remaining = ((180.0 - elapsed) / 180.0).clamp(0.0, 1.0);
         let active_code = self.generated_access_id.clone()
             .filter(|_| remaining > 0.0);
         ui.horizontal(|ui| {
-            ui.label(RichText::new("YOUR ID").size(10.0).strong().color(muted));
+            ui.label(RichText::new("YOUR ID").size(10.5).strong().color(muted));
             ui.add_space(6.0);
             if let Some(code) = active_code.as_ref() {
-                ui.label(RichText::new(code).size(19.0).strong().monospace().color(ink));
+                ui.label(RichText::new(code).size(19.5).strong().monospace().color(ink));
+                ui.add_space(5.0);
                 Self::draw_code_pie(ui, remaining);
-                if ui.add(
-                    egui::Button::new(RichText::new("⧉").size(17.0).color(ink))
-                        .fill(Color32::from_rgb(239, 245, 253))
-                        .rounding(Rounding::same(9.0))
-                        .min_size(egui::vec2(32.0, 30.0))
-                ).on_hover_text("Copy your temporary code").clicked() {
+                ui.add_space(4.0);
+                if ui_widgets::icon_button(ui, Glyph::Copy, "Copy your temporary code").clicked() {
                     match copy_text_to_clipboard(code) {
                         Ok(()) => self.set_status("Code copied to clipboard"),
                         Err(error) => self.push_log(format!("Copy failed: {error}")),
@@ -1215,123 +1218,144 @@ impl NexusGuiApp {
     }
 
     fn draw_numeric_home(&mut self, ui: &mut egui::Ui) {
-        let ink = Color32::from_rgb(25, 45, 72);
-        let muted = Color32::from_rgb(106, 123, 144);
-        let accent = Color32::from_rgb(37, 104, 215);
-        let available = ui.available_width().max(0.0);
-        let card_width = available.min(480.0);
-        let compact = available < 400.0;
-        let margin = if compact { 12.0 } else { 24.0 };
-        let entry_width = (card_width - margin * 2.0 - 12.0).max(100.0);
+        let ink = Color32::from_rgb(26, 45, 73);
+        let muted = Color32::from_rgb(109, 125, 149);
+        let accent = Color32::from_rgb(31, 100, 217);
+        let width = ui.available_width().max(0.0);
+        let card_width = width.min(450.0);
+        let compact = width < 405.0;
+        let padding = if compact { 15.0 } else { 24.0 };
+        let content_width = (card_width - padding * 2.0).max(240.0);
+        let m = ui_widgets::metrics(content_width);
 
-        ui.add_space(if compact { 7.0 } else { 24.0 });
+        ui.add_space(if compact { 6.0 } else { 14.0 });
         ui.vertical_centered(|ui| {
-            ui.label(RichText::new("CONNECT TO A COMPUTER")
-                .size(11.0).strong().color(accent));
+            ui.label(RichText::new("SECURE CONNECTION")
+                .size(10.5).strong().color(accent));
             ui.add_space(5.0);
-            ui.label(RichText::new("Remote support, simplified.")
-                .size(if compact { 21.0 } else { 25.0 }).strong().color(ink));
+            ui.label(RichText::new("Connect to a computer")
+                .size(if compact { 22.0 } else { 25.0 }).strong().color(ink));
+            ui.add_space(5.0);
+            ui.label(RichText::new("One code. Private and encrypted.")
+                .size(12.0).color(muted));
         });
-        ui.add_space(if compact { 13.0 } else { 26.0 });
+        ui.add_space(if compact { 12.0 } else { 19.0 });
 
         ui.vertical_centered(|ui| {
             ui.allocate_ui_with_layout(
                 egui::vec2(card_width, 0.0),
                 egui::Layout::top_down(egui::Align::Center),
                 |ui| {
-                egui::Frame::none()
-                    .fill(Color32::WHITE)
-                    .stroke(Stroke::new(1.0, Color32::from_rgb(224, 232, 244)))
-                    .rounding(Rounding::same(20.0))
-                    .inner_margin(egui::Margin::same(margin))
-                    .show(ui, |ui| {
-                        ui.set_width(entry_width);
-                        self.draw_compact_own_code(ui);
-                        ui.add_space(15.0);
-                        ui.separator();
-                        ui.add_space(17.0);
-                        ui.label(RichText::new("ENTER REMOTE ID")
-                            .size(11.0).strong().color(muted));
-                        ui.add_space(7.0);
-                        let entry = egui::TextEdit::singleline(&mut self.access_id_input)
-                            .font(egui::TextStyle::Heading)
-                            .desired_width(entry_width)
-                            .hint_text("8–10 digits");
-                        let response = ui.add_sized([entry_width, 42.0], entry);
-                        if self.refocus_number_input {
-                            response.request_focus();
+                    egui::Frame::none()
+                        .fill(Color32::WHITE)
+                        .stroke(Stroke::new(1.0, Color32::from_rgb(222, 231, 244)))
+                        .rounding(Rounding::same(18.0))
+                        .inner_margin(egui::Margin::same(padding))
+                        .show(ui, |ui| {
+                            ui.set_width(content_width);
+                            // Every interior control uses content_width as its
+                            // coordinate system, rather than the parent window.
+                            ui_widgets::centered_row(ui, content_width, |ui| {
+                                self.draw_compact_own_code(ui);
+                            });
+                            ui.add_space(13.0);
+                            ui.separator();
+                            ui.add_space(12.0);
+
+                            ui.vertical_centered(|ui| {
+                                ui.label(RichText::new("REMOTE COMPUTER ID")
+                                    .size(11.0).strong().color(muted));
+                                ui.add_space(3.0);
+                                ui.label(RichText::new(
+                                    "8–10 digits · type, paste or use the keypad"
+                                ).size(10.5).color(Color32::from_rgb(151, 166, 185)));
+                            });
+                            ui.add_space(11.0);
+
+                            let focus = self.refocus_number_input;
                             self.refocus_number_input = false;
-                        }
-                        self.access_id_input.retain(|c| c.is_ascii_digit());
-                        self.access_id_input.truncate(10);
-                        ui.add_space(12.0);
-                        let keypad_width = entry_width.min(318.0);
-                        let gap = 8.0;
-                        let key_width = ((keypad_width - gap * 2.0) / 3.0).max(45.0);
-                        ui.vertical_centered(|ui| {
-                            egui::Grid::new("main_numeric_keypad")
-                                .spacing([gap, gap])
-                                .show(ui, |ui| {
-                                    for row in [
-                                        ["1", "2", "3"], ["4", "5", "6"],
-                                        ["7", "8", "9"], ["Clear", "0", "⌫"],
-                                    ] {
-                                        for digit in row {
-                                            let enabled = !self.client_running;
-                                            let button = egui::Button::new(
-                                                RichText::new(digit)
-                                                    .size(if digit == "Clear" { 12.0 } else { 21.0 })
-                                                    .color(ink))
-                                                .fill(Color32::from_rgb(244, 248, 254))
-                                                .rounding(Rounding::same(11.0))
-                                                .min_size(egui::vec2(key_width, 46.0));
-                                            if ui.add_enabled(enabled, button).clicked() {
-                                                if digit == "Clear" {
-                                                    self.access_id_input.clear();
-                                                } else if digit == "⌫" {
-                                                    self.access_id_input.pop();
-                                                } else if self.access_id_input.len() < 10 {
-                                                    self.access_id_input.push_str(digit);
-                                                }
+                            let mut submit = false;
+                            ui_widgets::centered_row(ui, m.slots_width, |ui| {
+                                submit = ui_widgets::code_slots(
+                                    ui, &mut self.access_id_input, &mut self.numeric_cursor,
+                                    focus, !self.client_running, m.slots_width,
+                                ).submit;
+                            });
+                            ui.add_space(15.0);
+
+                            let keys = [
+                                ["1", "2", "3"], ["4", "5", "6"],
+                                ["7", "8", "9"], ["Clear", "0", "Backspace"],
+                            ];
+                            for (row_idx, row) in keys.iter().enumerate() {
+                                ui_widgets::centered_row(ui, m.keypad_width, |ui| {
+                                    ui.spacing_mut().item_spacing.x = 9.0;
+                                    for (col_idx, key) in row.iter().enumerate() {
+                                        ui.push_id(("num_key", row_idx, col_idx), |ui| {
+                                            let pressed = ui_widgets::numeric_key(
+                                                ui, key, m.key_width, 46.0
+                                            ).clicked();
+                                            if pressed && !self.client_running {
+                                                let action = match *key {
+                                                    "Clear" => EditAction::Clear,
+                                                    "Backspace" => EditAction::Backspace,
+                                                    digit => EditAction::Digit(
+                                                        digit.chars().next().unwrap_or('0')
+                                                    ),
+                                                };
+                                                numeric_entry::apply(
+                                                    &mut self.access_id_input,
+                                                    &mut self.numeric_cursor, action,
+                                                );
+                                                self.refocus_number_input = true;
                                             }
-                                        }
-                                        ui.end_row();
+                                        });
                                     }
                                 });
+                                if row_idx != 3 { ui.add_space(8.0); }
+                            }
+                            ui.add_space(15.0);
+                            let valid = short_code::parse_code(&self.access_id_input).is_ok();
+                            let enabled = valid && !self.client_running;
+                            let mut connect_pressed = false;
+                            ui_widgets::centered_row(ui, content_width, |ui| {
+                                connect_pressed = ui_widgets::connect_button(
+                                    ui, content_width, enabled,
+                                ).clicked();
+                            });
+                            if (connect_pressed || submit) && enabled {
+                                self.connect_clicked();
+                            }
+
+                            if self.client_running {
+                                ui.add_space(7.0);
+                                if ui.button("Cancel connection").clicked() {
+                                    let _ = self.runtime_cmd_tx
+                                        .try_send(RuntimeCommand::DisconnectClient);
+                                }
+                            }
+                            ui.add_space(10.0);
+                            ui.vertical_centered(|ui| {
+                                ui.checkbox(&mut self.remember_this_computer,
+                                    "Remember this computer if its owner also agrees");
+                                ui.add_space(4.0);
+                                ui.label(RichText::new(
+                                    "The remote person must approve the connection."
+                                ).size(11.0).color(muted));
+                            });
                         });
-                        ui.add_space(14.0);
-                        let valid = short_code::parse_code(&self.access_id_input).is_ok();
-                        if ui.add_enabled(valid && !self.client_running,
-                            egui::Button::new(
-                                RichText::new("Connect securely")
-                                    .size(15.0).strong().color(Color32::WHITE)
-                            ).fill(accent).rounding(Rounding::same(11.0))
-                                .min_size(egui::vec2(entry_width, 44.0))
-                        ).clicked() {
-                            self.connect_clicked();
-                        }
-                        if self.client_running && ui.button("Cancel connection").clicked() {
-                            let _ = self.runtime_cmd_tx
-                                .try_send(RuntimeCommand::DisconnectClient);
-                        }
-                        ui.add_space(7.0);
-                        ui.checkbox(&mut self.remember_this_computer,
-                            "Remember this computer if its owner also agrees");
-                        ui.add_space(8.0);
-                        ui.add(egui::Label::new(
-                            RichText::new("The other person must approve the connection.")
-                                .size(11.0).color(muted)).wrap(true));
-                    });
-            });
+                },
+            );
         });
+
         let saved = self.trust_registry.saved_computers();
         if !saved.is_empty() {
-            ui.add_space(17.0);
+            ui.add_space(14.0);
             ui.vertical_centered(|ui| {
                 ui.label(RichText::new("SAVED COMPUTERS")
                     .size(11.0).strong().color(muted));
             });
-            ui.add_space(7.0);
+            ui.add_space(6.0);
             for peer in saved.iter().take(8) {
                 ui.horizontal(|ui| {
                     ui.label(RichText::new(&peer.label).size(12.0).color(ink));
@@ -1352,11 +1376,10 @@ impl NexusGuiApp {
                 });
             }
         }
-        ui.add_space(16.0);
+        ui.add_space(12.0);
         ui.vertical_centered(|ui| {
-            ui.add(egui::Label::new(
-                RichText::new(&self.status_message).size(12.0).color(muted))
-                .wrap(true));
+            ui.label(RichText::new(&self.status_message)
+                .size(11.5).color(muted));
         });
     }
 
