@@ -579,69 +579,10 @@ impl NexusGuiApp {
             });
 
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                status_chip(
-                    ui,
-                    if self.client_running {
-                        "CLIENT ACTIVE"
-                    } else {
-                        "CLIENT READY"
-                    },
-                    if self.client_running {
-                        Color32::from_rgb(38, 123, 92)
-                    } else {
-                        Color32::from_rgb(59, 74, 96)
-                    },
-                );
-                status_chip(
-                    ui,
-                    if self.host_running {
-                        "🟢 LIVE & AVAILABLE"
-                    } else {
-                        "⚪ STANDBY"
-                    },
-                    if self.host_running {
-                        Color32::from_rgb(33, 115, 70)
-                    } else {
-                        Color32::from_rgb(65, 84, 110)
-                    },
-                );
-                match self.network_topology {
-                    NetworkTopology::Undetermined => {
-                        status_chip(
-                            ui,
-                            "⚪ Network Status: Detecting...",
-                            Color32::from_rgb(97, 107, 124),
-                        );
-                    }
-                    NetworkTopology::OpenInternet => {
-                        status_chip(
-                            ui,
-                            "🟢 Network Status: Excellent (Open Internet)",
-                            Color32::from_rgb(33, 115, 70),
-                        );
-                    }
-                    NetworkTopology::ConeNatFriendly => {
-                        status_chip(
-                            ui,
-                            "🟢 Network Status: Excellent (P2P Direct)",
-                            Color32::from_rgb(33, 115, 70),
-                        );
-                    }
-                    NetworkTopology::SymmetricNatRestrictive => {
-                        status_chip(
-                            ui,
-                            "🟠 Network Status: Restrictive (Symmetric NAT - TCP Recommended)",
-                            Color32::from_rgb(217, 119, 6),
-                        );
-                    }
-                    NetworkTopology::UdpBlockedStrict => {
-                        status_chip(
-                            ui,
-                            "🔴 Network Status: Blocked UDP (HTTPS Fallback Enforced)",
-                            Color32::from_rgb(198, 40, 40),
-                        );
-                    }
-                }
+                status_chip(ui,
+                    if self.host_running { "Host listening" } else { "Host idle" },
+                    if self.host_running { Color32::from_rgb(33, 115, 70) }
+                    else { Color32::from_rgb(59, 74, 96) });
             });
         });
 
@@ -903,7 +844,7 @@ impl NexusGuiApp {
 
                         if let Some(texture) = &self.qr_code_texture {
                             ui.vertical_centered(|ui| {
-                                let side = 240.0;
+                                let side = ui.available_width().min(220.0).max(96.0);
                                 ui.image((texture.id(), egui::vec2(side, side)));
                             });
                         }
@@ -925,27 +866,12 @@ impl NexusGuiApp {
             "Import connection seed from text, file, or QR payload",
             |ui| {
                 ui.vertical(|ui| {
-                    ui.label("Connection Seed / Mnemonic Phrase / Deep Link:");
+                    ui.label("Remote Host public Access ID / mnemonic / link:");
                     ui.add_sized(
-                        [ui.available_width(), 80.0],
+                        [ui.available_width().max(100.0), 90.0],
                         egui::TextEdit::multiline(&mut self.access_id_input)
                             .hint_text("Paste the public Access ID copied from the remote Host"),
                     );
-
-                    if !self.client_public_addr_display.is_empty() {
-                        ui.add_space(4.0);
-                        ui.horizontal(|ui| {
-                            ui.label(RichText::new("My Public UDP Address (share this with Host):").color(Color32::from_rgb(140, 160, 190)));
-                            ui.label(RichText::new(&self.client_public_addr_display).strong().color(Color32::from_rgb(230, 239, 251)));
-                            if ui.button("Copy").clicked() {
-                                if let Err(e) = copy_text_to_clipboard(&self.client_public_addr_display) {
-                                    self.push_log(format!("Failed to copy public address: {}", e));
-                                } else {
-                                    self.set_status("Public UDP address copied to clipboard");
-                                }
-                            }
-                        });
-                    }
 
                     let suggestions = {
                         let current_text = &self.access_id_input;
@@ -1121,28 +1047,24 @@ impl NexusGuiApp {
             |ui| {
                 ui.vertical(|ui| {
                     ui.group(|ui| {
-                        ui.label(RichText::new("Active Connection Parameters").strong().size(13.0));
-                        ui.horizontal(|ui| {
-                            ui.label("Protocol:");
-                            ui.label(RichText::new(&self.telemetry_protocol).strong().color(Color32::from_rgb(95, 194, 242)));
-                            ui.add_space(15.0);
-                            ui.label("Local Socket:");
-                            ui.label(RichText::new(&self.telemetry_local_addr).strong().color(Color32::from_rgb(230, 239, 251)));
-                            ui.add_space(15.0);
-                            ui.label("Latency:");
+                        ui.label(RichText::new("Connection details").strong().size(13.0));
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label(format!("Protocol: {}", self.telemetry_protocol));
                             if let Some(latency) = self.telemetry_latency_ms {
-                                ui.label(RichText::new(format!("{} ms", latency)).strong().color(Color32::from_rgb(46, 125, 50)));
-                            } else {
-                                ui.label(RichText::new("N/A").strong().color(Color32::from_rgb(140, 160, 190)));
+                                ui.label(format!("QUIC handshake: {} ms (not screen latency)", latency));
                             }
                         });
+                        ui.label("Local endpoint identity:");
+                        ui.add(egui::Label::new(
+                            RichText::new(&self.telemetry_local_addr).monospace().size(11.0)
+                        ).wrap(true));
                     });
                     ui.add_space(6.0);
                     egui::ScrollArea::vertical()
                         .max_height(200.0)
                         .show(ui, |ui| {
                             for line in self.session_logs.iter().rev().take(max_lines) {
-                                ui.label(RichText::new(line).size(12.5));
+                                ui.add(egui::Label::new(RichText::new(line).size(12.5)).wrap(true));
                             }
                         });
                 });
@@ -1151,43 +1073,25 @@ impl NexusGuiApp {
     }
 
     fn draw_dashboard(&mut self, ui: &mut egui::Ui) {
-        let screen_width = ui.ctx().screen_rect().width();
-        if screen_width >= 1100.0 {
-            ui.columns(2, |columns| {
-                columns[0].vertical(|ui| {
-                    self.draw_host_controls_card(ui);
-                    ui.add_space(10.0);
-                    self.draw_oob_exchange_card(ui);
-                    ui.add_space(10.0);
-                    self.draw_telemetry_card(ui, "Host Live Telemetry", 35);
-                });
-
-                columns[1].vertical(|ui| {
-                    self.draw_client_request_card(ui);
-                    ui.add_space(10.0);
-                    self.draw_telemetry_card(ui, "Connection Telemetry", 35);
-                });
-            });
-        } else {
+        // The two tabs are alternative workflows. Never render both side by
+        // side: on 1080p screens this overflows horizontally and hides prompts.
+        ui.vertical(|ui| {
+            ui.set_width(ui.available_width());
             match self.active_tab {
                 ActiveTab::HostMode => {
-                    ui.vertical(|ui| {
-                        self.draw_host_controls_card(ui);
-                        ui.add_space(10.0);
-                        self.draw_oob_exchange_card(ui);
-                        ui.add_space(10.0);
-                        self.draw_telemetry_card(ui, "Live Telemetry", 35);
-                    });
+                    self.draw_host_controls_card(ui);
+                    ui.add_space(12.0);
+                    self.draw_oob_exchange_card(ui);
+                    ui.add_space(12.0);
+                    self.draw_telemetry_card(ui, "Host connection events", 35);
                 }
                 ActiveTab::ClientMode => {
-                    ui.vertical(|ui| {
-                        self.draw_client_request_card(ui);
-                        ui.add_space(10.0);
-                        self.draw_telemetry_card(ui, "Connection Telemetry", 50);
-                    });
+                    self.draw_client_request_card(ui);
+                    ui.add_space(12.0);
+                    self.draw_telemetry_card(ui, "Technician connection events", 35);
                 }
             }
-        }
+        });
     }
 
     fn start_hosting_clicked(&mut self) {
@@ -1248,36 +1152,19 @@ impl NexusGuiApp {
 
     fn draw_status_bar(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
-            status_chip(
-                ui,
-                if self.host_running { "🟢 LIVE - AVAILABLE FOR INCOMING SESSIONS" } else { "⚪ STANDBY" },
-                if self.host_running {
-                    Color32::from_rgb(33, 115, 70)
-                } else {
-                    Color32::from_rgb(66, 84, 107)
-                },
-            );
-
-            status_chip(
-                ui,
-                if self.client_running {
-                    "CLIENT RUNNING"
-                } else {
-                    "CLIENT STANDBY"
-                },
-                if self.client_running {
-                    Color32::from_rgb(38, 123, 92)
-                } else {
-                    Color32::from_rgb(66, 84, 107)
-                },
-            );
-
-            ui.add_space(10.0);
-            ui.label(
-                RichText::new(&self.status_message)
-                    .color(Color32::from_rgb(230, 239, 251))
-                    .size(13.0),
-            );
+            let (label, fill) = match self.active_tab {
+                ActiveTab::HostMode if self.host_running =>
+                    ("HOST READY", Color32::from_rgb(33, 115, 70)),
+                ActiveTab::ClientMode if self.client_running =>
+                    ("CONNECTING / ACTIVE", Color32::from_rgb(38, 123, 92)),
+                _ => ("IDLE", Color32::from_rgb(59, 74, 96)),
+            };
+            status_chip(ui, label, fill);
+            ui.separator();
+            ui.add(egui::Label::new(
+                RichText::new(&self.status_message).size(12.0)
+            ).truncate(true).sense(egui::Sense::hover()))
+              .on_hover_text(&self.status_message);
         });
     }
 
