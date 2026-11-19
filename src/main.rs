@@ -2100,6 +2100,9 @@ async fn run_host_peer_session(
                 continue;
             }
         };
+        // Constrain the desktop pixel budget before differencing and JPEG.
+        // A stable scaled canvas lets patches remain aligned across frames.
+        let frame = frame_codec::fit_desktop(frame, 1280, 800)?;
         let Some(packet) = delta_encoder.encode(frame)? else {
             // No pixels changed: never send a redundant full-screen JPEG.
             // A periodic keyframe is automatically emitted by DeltaEncoder.
