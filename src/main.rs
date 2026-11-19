@@ -336,6 +336,9 @@ struct NexusGuiApp {
     host_inject_input: bool,
     show_logs: bool,
     show_preferences: bool,
+    code_ready_at: Option<Instant>,
+    refocus_number_input: bool,
+    window_was_focused: bool,
     host_advertise_addr_input: String,
 
     client_display_name: String,
@@ -409,6 +412,9 @@ impl NexusGuiApp {
             host_inject_input: true,
             show_logs: false,
             show_preferences: false,
+            code_ready_at: None,
+            refocus_number_input: true,
+            window_was_focused: false,
             host_advertise_addr_input: default_advertise,
             client_display_name: String::new(),
             pending_client_permission: None,
@@ -458,6 +464,7 @@ impl NexusGuiApp {
                     inject_input,
                 } => {
                     self.generated_access_id = Some(access_id.clone());
+                    self.code_ready_at = Some(Instant::now());
                     self.host_advertise_addr_input = advertised_addr.to_string();
                     self.client_public_addr_display = advertised_addr.to_string();
                     self.set_status("Ready for a secure support request");
@@ -514,6 +521,7 @@ impl NexusGuiApp {
                         // A subsequent hosting session uses a fresh private identity.
                         self.host_seed = rand::random::<[u8; 32]>();
                         self.generated_access_id = None;
+                        self.code_ready_at = None;
                         self.push_log("Host stopped; old access code invalidated".to_string());
                     }
                 }
@@ -1089,178 +1097,249 @@ impl NexusGuiApp {
     }
 
 
-    fn draw_numeric_home(&mut self, ui: &mut egui::Ui) {
-        let ink = Color32::from_rgb(23, 37, 53);
-        let muted = Color32::from_rgb(106, 121, 140);
-        let accent = Color32::from_rgb(39, 104, 218);
-        let edge = Color32::from_rgb(227, 233, 242);
-        let surface = Color32::WHITE;
-        let radius = Rounding::same(22.0);
+    fn draw_code_pie(ui: &mut egui::Ui, remaining: f32) {
+        let (rect, response) = ui.allocate_exact_size(
+            egui::vec2(26.0, 26.0), egui::Sense::hover()
+        );
+        let center = rect.center();
+        let painter = ui.painter();
+        let bg = Color32::from_rgb(224, 233, 245);
+        let fg = Color32::from_rgb(45, 113, 224);
+        painter.circle_filled(center, 12.0, bg);
+        let remaining = remaining.clamp(0.0, 1.0);
+        if remaining > 0.0 {
+            let segments = 40usize;
+            let mut points = vec![center];
+            let active = ((segments as f32 * remaining).ceil() as usize).max(1);
+            for step in 0..=active {
+                let fraction = (step as f32 / segments as f32).min(remaining);
+                let angle = -std::f32::consts::FRAC_PI_2
+                    + fraction * std::f32::consts::TAU;
+                points.push(center + egui::vec2(angle.cos(), angle.sin()) * 12.0);
+            }
+            painter.add(egui::Shape::convex_polygon(points, fg, Stroke::NONE));
+        }
+        painter.circle_filled(center, 3.2, Color32::WHITE);
+        response.on_hover_text(format!(
+            "Code refresh in {} seconds",
+            (remaining * 180.0).ceil() as u32,
+        ));
+    }
 
-        ui.add_space(12.0);
-        ui.vertical_centered(|ui| {
-            ui.label(RichText::new("REMOTE SUPPORT, MADE SIMPLE").size(12.0).strong()
-                .color(accent));
+    fn draw_compact_own_code(&mut self, ui: &mut egui::Ui) {
+        let ink = Color32::from_rgb(26, 45, 67);
+        let muted = Color32::from_rgb(105, 124, 146);
+        let elapsed = self.code_ready_at
+            .map(|t| t.elapsed().as_secs_f32()).unwrap_or(180.0);
+        let remaining = ((180.0 - elapsed) / 180.0).clamp(0.0, 1.0);
+        let active_code = self.generated_access_id.clone()
+            .filter(|_| remaining > 0.0);
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("YOUR ID").size(10.0).strong().color(muted));
             ui.add_space(6.0);
-            ui.label(RichText::new("One code. One connection. Your approval.").size(26.0)
-                .strong().color(ink));
-            ui.add_space(4.0);
-            ui.label(RichText::new(
-                "Encrypted device-to-device support over public discovery infrastructure."
-            ).size(13.0).color(muted));
+            if let Some(code) = active_code.as_ref() {
+                ui.label(RichText::new(code).size(19.0).strong().monospace().color(ink));
+                Self::draw_code_pie(ui, remaining);
+                if ui.add(
+                    egui::Button::new(RichText::new("⧉").size(17.0).color(ink))
+                        .fill(Color32::from_rgb(239, 245, 253))
+                        .rounding(Rounding::same(9.0))
+                        .min_size(egui::vec2(32.0, 30.0))
+                ).on_hover_text("Copy your temporary code").clicked() {
+                    match copy_text_to_clipboard(code) {
+                        Ok(()) => self.set_status("Code copied to clipboard"),
+                        Err(error) => self.push_log(format!("Copy failed: {error}")),
+                    }
+                }
+            } else {
+                ui.spinner();
+                ui.label(RichText::new("Refreshing ID").size(12.0).color(muted));
+                if !self.host_running && ui.small_button("Retry").clicked() {
+                    self.start_hosting_clicked();
+                }
+            }
         });
-        ui.add_space(24.0);
+    }
 
-        let card_width = ui.available_width().min(860.0).max(320.0);
-        ui.allocate_ui_with_layout(egui::vec2(card_width, 0.0),
-            egui::Layout::top_down(egui::Align::Center), |ui| {
-            ui.columns(2, |columns| {
-                egui::Frame::none().fill(surface)
-                    .stroke(Stroke::new(1.0, edge)).rounding(radius)
-                    .inner_margin(egui::Margin::same(22.0))
-                    .show(&mut columns[0], |ui| {
-                        ui.set_min_width(265.0);
-                        ui.label(RichText::new("YOUR COMPUTER").size(12.0).strong().color(muted));
-                        ui.add_space(10.0);
-                        if let Some(code) = self.generated_access_id.as_ref() {
-                            ui.label(RichText::new(code).size(37.0).strong().monospace().color(ink));
-                            ui.label(RichText::new("Tell this number to the technician")
-                                .size(12.0).color(muted));
-                            ui.add_space(12.0);
-                            if ui.add(egui::Button::new("Copy my code")
-                                .fill(Color32::from_rgb(238, 244, 254))
-                                .rounding(Rounding::same(10.0))).clicked() {
-                                match copy_text_to_clipboard(code) {
-                                    Ok(()) => self.set_status("Connection code copied"),
-                                    Err(error) => self.push_log(format!("Copy failed: {error}")),
-                                }
-                            }
-                        } else {
-                            ui.label(RichText::new("Connecting...")
-                                .size(27.0).strong().color(ink));
-                            ui.label(RichText::new(
-                                "Registering a temporary numeric code with a public service"
-                            ).size(12.0).color(muted));
-                            if !self.host_running && ui.button("Try again").clicked() {
-                                self.start_hosting_clicked();
-                            }
-                        }
-                        ui.add_space(14.0);
-                        ui.label(RichText::new("Screen access always requires your approval.")
-                            .size(12.0).color(muted));
-                        if self.host_running && ui.button("Stop sharing / revoke access").clicked() {
-                            let _ = self.runtime_cmd_tx.try_send(RuntimeCommand::StopHosting);
-                            self.generated_access_id = None;
-                            self.set_status("Revoking access...");
-                        }
-                    });
-                egui::Frame::none().fill(surface)
-                    .stroke(Stroke::new(1.0, edge)).rounding(radius)
-                    .inner_margin(egui::Margin::same(22.0))
-                    .show(&mut columns[1], |ui| {
-                        ui.set_min_width(265.0);
-                        ui.label(RichText::new("CONNECT TO ANOTHER COMPUTER")
-                            .size(12.0).strong().color(muted));
-                        ui.add_space(8.0);
+    fn draw_numeric_home(&mut self, ui: &mut egui::Ui) {
+        let ink = Color32::from_rgb(25, 45, 72);
+        let muted = Color32::from_rgb(106, 123, 144);
+        let accent = Color32::from_rgb(37, 104, 215);
+        let available = ui.available_width().max(0.0);
+        let card_width = available.min(480.0);
+        let compact = available < 400.0;
+        let margin = if compact { 12.0 } else { 24.0 };
+        let entry_width = (card_width - margin * 2.0 - 12.0).max(100.0);
+
+        ui.add_space(if compact { 7.0 } else { 24.0 });
+        ui.vertical_centered(|ui| {
+            ui.label(RichText::new("CONNECT TO A COMPUTER")
+                .size(11.0).strong().color(accent));
+            ui.add_space(5.0);
+            ui.label(RichText::new("Remote support, simplified.")
+                .size(if compact { 21.0 } else { 25.0 }).strong().color(ink));
+        });
+        ui.add_space(if compact { 13.0 } else { 26.0 });
+
+        ui.vertical_centered(|ui| {
+            ui.add_sized([card_width, 0.0], |ui: &mut egui::Ui| {
+                egui::Frame::none()
+                    .fill(Color32::WHITE)
+                    .stroke(Stroke::new(1.0, Color32::from_rgb(224, 232, 244)))
+                    .rounding(Rounding::same(20.0))
+                    .inner_margin(egui::Margin::same(margin))
+                    .show(ui, |ui| {
+                        ui.set_width(entry_width);
+                        self.draw_compact_own_code(ui);
+                        ui.add_space(15.0);
+                        ui.separator();
+                        ui.add_space(17.0);
+                        ui.label(RichText::new("ENTER REMOTE ID")
+                            .size(11.0).strong().color(muted));
+                        ui.add_space(7.0);
                         let entry = egui::TextEdit::singleline(&mut self.access_id_input)
                             .font(egui::TextStyle::Heading)
-                            .desired_width(ui.available_width().max(140.0))
-                            .hint_text("8–10 digit code");
-                        ui.add(entry);
+                            .desired_width(entry_width)
+                            .hint_text("8–10 digits");
+                        let response = ui.add_sized([entry_width, 42.0], entry);
+                        if self.refocus_number_input {
+                            response.request_focus();
+                            self.refocus_number_input = false;
+                        }
                         self.access_id_input.retain(|c| c.is_ascii_digit());
                         self.access_id_input.truncate(10);
                         ui.add_space(12.0);
-                        egui::Grid::new("pairing_numeric_keypad").spacing([9.0, 9.0])
-                            .show(ui, |ui| {
-                                for row in [["1","2","3"],["4","5","6"],["7","8","9"],["C","0","⌫"]] {
-                                    for digit in row {
-                                        let enabled = !self.client_running;
-                                        let button = egui::Button::new(RichText::new(digit)
-                                            .size(20.0).color(ink))
-                                            .fill(Color32::from_rgb(245, 248, 253))
-                                            .rounding(Rounding::same(12.0))
-                                            .min_size(egui::vec2(66.0, 44.0));
-                                        if ui.add_enabled(enabled, button).clicked() {
-                                            if digit == "C" {
-                                                self.access_id_input.clear();
-                                            } else if digit == "⌫" {
-                                                self.access_id_input.pop();
-                                            } else if self.access_id_input.len() < 10 {
-                                                self.access_id_input.push_str(digit);
+                        let keypad_width = entry_width.min(318.0);
+                        let gap = 8.0;
+                        let key_width = ((keypad_width - gap * 2.0) / 3.0).max(45.0);
+                        ui.vertical_centered(|ui| {
+                            egui::Grid::new("main_numeric_keypad")
+                                .spacing([gap, gap])
+                                .show(ui, |ui| {
+                                    for row in [
+                                        ["1", "2", "3"], ["4", "5", "6"],
+                                        ["7", "8", "9"], ["Clear", "0", "⌫"],
+                                    ] {
+                                        for digit in row {
+                                            let enabled = !self.client_running;
+                                            let button = egui::Button::new(
+                                                RichText::new(digit)
+                                                    .size(if digit == "Clear" { 12.0 } else { 21.0 })
+                                                    .color(ink))
+                                                .fill(Color32::from_rgb(244, 248, 254))
+                                                .rounding(Rounding::same(11.0))
+                                                .min_size(egui::vec2(key_width, 46.0));
+                                            if ui.add_enabled(enabled, button).clicked() {
+                                                if digit == "Clear" {
+                                                    self.access_id_input.clear();
+                                                } else if digit == "⌫" {
+                                                    self.access_id_input.pop();
+                                                } else if self.access_id_input.len() < 10 {
+                                                    self.access_id_input.push_str(digit);
+                                                }
                                             }
                                         }
+                                        ui.end_row();
                                     }
-                                    ui.end_row();
-                                }
-                            });
-                        ui.add_space(12.0);
+                                });
+                        });
+                        ui.add_space(14.0);
                         let valid = short_code::parse_code(&self.access_id_input).is_ok();
                         if ui.add_enabled(valid && !self.client_running,
-                            egui::Button::new(RichText::new("Connect securely").size(16.0)
-                                .strong().color(Color32::WHITE))
-                                .fill(accent).rounding(Rounding::same(12.0))
-                                .min_size(egui::vec2(235.0, 46.0))).clicked() {
+                            egui::Button::new(
+                                RichText::new("Connect securely")
+                                    .size(15.0).strong().color(Color32::WHITE)
+                            ).fill(accent).rounding(Rounding::same(11.0))
+                                .min_size(egui::vec2(entry_width, 44.0))
+                        ).clicked() {
                             self.connect_clicked();
                         }
                         if self.client_running && ui.button("Cancel connection").clicked() {
-                            let _ = self.runtime_cmd_tx.try_send(RuntimeCommand::DisconnectClient);
+                            let _ = self.runtime_cmd_tx
+                                .try_send(RuntimeCommand::DisconnectClient);
                         }
-                        ui.add_space(7.0);
-                        ui.label(RichText::new("The remote person must approve your request.")
-                            .size(12.0).color(muted));
+                        ui.add_space(8.0);
+                        ui.add(egui::Label::new(
+                            RichText::new("The other person must approve the connection.")
+                                .size(11.0).color(muted)).wrap(true));
                     });
             });
         });
-
-        ui.add_space(17.0);
+        ui.add_space(16.0);
         ui.vertical_centered(|ui| {
-            ui.horizontal(|ui| {
-                if ui.button(if self.show_logs { "Hide detailed log" }
-                    else { "Show detailed log" }).clicked() {
-                    self.show_logs = !self.show_logs;
-                }
-                if ui.button(if self.show_preferences { "Hide preferences" }
-                    else { "Preferences" }).clicked() {
-                    self.show_preferences = !self.show_preferences;
-                }
-            });
-            ui.add(egui::Label::new(RichText::new(&self.status_message)
-                .color(muted).size(12.0)).wrap(true));
+            ui.add(egui::Label::new(
+                RichText::new(&self.status_message).size(12.0).color(muted))
+                .wrap(true));
         });
-        if self.show_preferences {
-            ui.add_space(12.0);
-            egui::Frame::none().fill(surface).stroke(Stroke::new(1.0, edge))
-                .rounding(radius).inner_margin(egui::Margin::same(18.0))
+    }
+
+    fn draw_preferences_screen(&mut self, ui: &mut egui::Ui) {
+        let width = ui.available_width().min(700.0);
+        ui.vertical_centered(|ui| {
+            ui.heading("Preferences");
+            ui.label("Control how XLINK responds to support requests.");
+        });
+        ui.add_space(24.0);
+        ui.allocate_ui(egui::vec2(width, 0.0), |ui| {
+            egui::Frame::none().fill(Color32::WHITE)
+                .rounding(Rounding::same(16.0))
+                .inner_margin(egui::Margin::same(22.0))
                 .show(ui, |ui| {
-                    ui.heading("Support preferences");
+                    ui.heading("Remote control permission");
                     ui.checkbox(&mut self.host_inject_input,
-                        "Allow mouse and keyboard when I explicitly approve a request");
-                    ui.label("Options take effect on the next Host session.");
+                        "Allow mouse and keyboard only after local approval");
+                    ui.label("Changes apply when the next Host listener starts.");
+                    ui.add_space(16.0);
+                    ui.heading("Video quality");
                     ui.horizontal(|ui| {
-                        ui.label("Capture rate");
+                        ui.label("Frame rate");
                         ui.add(egui::Slider::new(&mut self.host_fps, MIN_FPS..=MAX_FPS));
-                        ui.label("Video width");
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("Max width");
                         ui.add(egui::Slider::new(&mut self.host_max_width, 960..=1920));
                     });
+                    ui.add_space(12.0);
+                    ui.label("Trusted devices are not yet enabled. Future unattended access "
+                        .to a remembered computer requires explicit enrollment on BOTH devices, "
+                        .to_string()
+                        + "secure OS-backed credential storage and a visible revoke control.");
                 });
-        }
-        if self.show_logs {
-            ui.add_space(12.0);
-            egui::Frame::none().fill(surface).stroke(Stroke::new(1.0, edge))
-                .rounding(radius).inner_margin(egui::Margin::same(18.0))
-                .show(ui, |ui| {
-                    ui.label(RichText::new("Session activity and diagnostics")
-                        .size(16.0).strong().color(ink));
-                    ui.add_space(8.0);
-                    egui::ScrollArea::vertical().max_height(250.0).show(ui, |ui| {
+        });
+    }
+
+    fn draw_logs_screen(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.heading("Activity log");
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.button("Copy log").clicked() {
+                    let joined = self.session_logs.iter().cloned()
+                        .collect::<Vec<_>>().join("\n");
+                    if let Err(error) = copy_text_to_clipboard(&joined) {
+                        self.push_log(format!("Cannot copy log: {error}"));
+                    }
+                }
+            });
+        });
+        ui.add_space(12.0);
+        egui::Frame::none().fill(Color32::WHITE)
+            .stroke(Stroke::new(1.0, Color32::from_rgb(225, 232, 241)))
+            .rounding(Rounding::same(16.0))
+            .inner_margin(egui::Margin::same(18.0))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                egui::ScrollArea::vertical().auto_shrink([false, false])
+                    .show(ui, |ui| {
                         for line in self.session_logs.iter().rev() {
-                            ui.add(egui::Label::new(RichText::new(line)
-                                .size(12.0).monospace().color(muted)).wrap(true));
+                            ui.add(egui::Label::new(
+                                RichText::new(line).monospace().size(12.0))
+                                .wrap(true));
+                            ui.separator();
                         }
                     });
-                });
-        }
+            });
     }
+
     fn draw_dashboard(&mut self, ui: &mut egui::Ui) {
         // The two tabs are alternative workflows. Never render both side by
         // side: on 1080p screens this overflows horizontally and hides prompts.
