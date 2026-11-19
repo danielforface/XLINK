@@ -2209,31 +2209,20 @@ async fn run_client_session(
 
         let requested_session_id = time::timeout(HANDSHAKE_TIMEOUT, wait_for_access_request(&control_recv))
             .await.context("waiting for access request timed out")??;
-        let client_approved = request_client_permission(
-            remote_addr_str.clone(),
-            &requested_session_id,
-            &runtime_event_tx,
-            &ui_bridge,
-        )
-        .await?;
-
-        control_send.send_control(
-            &ControlMessage::AccessDecision {
-                approved: client_approved,
-            },
-        )
-        .await
-        .context("failed to send client access decision")?;
-
-        if !client_approved {
-            let _ = session_state.transition(SessionState::Rejected);
-            info!("local client denied access request");
-            if let Some(ref c) = quic_conn_to_close {
-                c.close(3u32.into(), b"client denied access request");
-            }
-            let _ = session_state.transition(SessionState::Terminated);
-            return Ok(());
+        if requested_session_id != session_id {
+            bail!("host requested an unexpected session identity");
         }
+
+        // The technician's explicit Connect click is the local permission
+        // to REQUEST service, not permission to control the remote machine.
+        // Requiring a second self-approval dialog here delays the real
+        // remote consent prompt and makes a healthy connection look hung.
+        // The remote Host MUST still grant on-screen SessionConsent.
+        control_send.send_control(&ControlMessage::AccessDecision { approved: true })
+            .await.context("failed to request remote host approval")?;
+        let _ = runtime_event_tx.send(RuntimeEvent::SessionStatus(
+            "Connected to Host; waiting for approval on the REMOTE computer".to_string()
+        )).await;
 
         session_state.transition(SessionState::PendingConsent)?;
 
