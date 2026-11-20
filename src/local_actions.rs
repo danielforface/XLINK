@@ -34,7 +34,7 @@ pub fn record_global_input(stop: Arc<AtomicBool>) -> Result<(PathBuf, u64)> {
             break;
         }
         let mut pos = POINT::default();
-        if unsafe { GetCursorPos(&mut pos) }.as_bool() {
+        if unsafe { GetCursorPos(&mut pos) }.is_ok() {
             let next = (pos.x,pos.y);
             if previous != Some(next) {
                 writer.push(Action::Move {
