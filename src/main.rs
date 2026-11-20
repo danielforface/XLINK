@@ -3315,6 +3315,11 @@ async fn run_client_session(
                     ViewerInputEvent::SetFrameRate(fps) => {
                         ControlMessage::SetTargetFps { fps }
                     }
+                    ViewerInputEvent::ActionRecordStart
+                    | ViewerInputEvent::ActionRecordStop
+                    | ViewerInputEvent::ActionReplay { .. }
+                    | ViewerInputEvent::ActionReplayFile { .. }
+                    | ViewerInputEvent::ActionStopPlayback => continue,
                     ViewerInputEvent::ScreenshotRemote(frame) => {
                         let status = event_tx_for_screenshots.clone();
                         tokio::task::spawn_blocking(move || {
