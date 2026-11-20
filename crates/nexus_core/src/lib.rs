@@ -180,6 +180,7 @@ pub enum ControlMessage {
     SimulatedKeyEvent { virtual_key: u16, pressed: bool },
     MouseButtonEvent { button: u8, pressed: bool },
     SetTargetFps { fps: u16 },
+    ReleaseAllInputs,
     Ack(String),
 }
 
