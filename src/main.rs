@@ -4,6 +4,7 @@ mod adaptive;
 mod delta;
 mod frame_codec;
 mod history;
+mod screenshot;
 mod numeric_entry;
 mod ui_widgets;
 mod short_code;
@@ -36,7 +37,7 @@ use std::fs;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
 use std::path::{Path, PathBuf};
 use bip39::{Language, Mnemonic};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::runtime::{Builder, Runtime};
@@ -2726,6 +2727,8 @@ async fn run_host_peer_session(
     .await
     .context("failed to send session approval acknowledgement")?;
 
+    let live_fps = Arc::new(AtomicU16::new(fps));
+    let live_fps_for_control = Arc::clone(&live_fps);
     let session_state_for_control = Arc::clone(&session_state);
     let input_for_control = Arc::clone(&input);
     let inject_input = config.inject_input;
@@ -2764,6 +2767,14 @@ async fn run_host_peer_session(
 
                     // Do not flood the control channel with acknowledgements for
                     // every mouse movement. QUIC already provides reliable delivery.
+                }
+                Ok(ControlMessage::SetTargetFps { fps }) => {
+                    if session_state_for_control.is_active() && (1..=60).contains(&fps) {
+                        live_fps_for_control.store(fps, Ordering::Release);
+                        info!(requested_fps = fps, "technician adjusted video rate");
+                    } else {
+                        warn!(fps, "ignored unauthorized or invalid FPS request");
+                    }
                 }
                 Ok(ControlMessage::MouseButtonEvent { button, pressed }) => {
                     if !session_state_for_control.is_active() || !inject_input {
@@ -2833,6 +2844,7 @@ async fn run_host_peer_session(
     let mut control_task_finished = false;
     let mut capture_failures = 0u32;
     let mut pacer = adaptive::AdaptiveFrameRate::new(fps);
+    let mut last_requested_fps = fps;
     let mut delta_encoder = delta::DeltaEncoder::new();
     let mut video_sequence = 0u64;
     let mut last_video_packet = Instant::now();
@@ -2863,6 +2875,14 @@ async fn run_host_peer_session(
                 "SECURITY: blocked frame transmission while session not active"
             );
             continue;
+        }
+
+        let new_fps = live_fps.load(Ordering::Acquire);
+        if last_requested_fps != new_fps {
+            last_requested_fps = new_fps;
+            pacer.set_requested(new_fps);
+            ticker = time::interval(pacer.interval());
+            ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
         }
 
         let started = Instant::now();
@@ -3114,6 +3134,7 @@ async fn run_client_session(
 
         let session_state_for_input = Arc::clone(&session_state);
         let control_send_clone = control_send.clone();
+        let event_tx_for_screenshots = runtime_event_tx.clone();
         let mut input_task = AbortOnDrop(tokio::spawn(async move {
             while let Some(event) = viewer_input_rx.recv().await {
                 if !session_state_for_input.is_active() {
@@ -3131,13 +3152,38 @@ async fn run_client_session(
                     ViewerInputEvent::MouseButton { button, pressed } => {
                         ControlMessage::MouseButtonEvent { button, pressed }
                     }
-                    ViewerInputEvent::Keyboard {
-                        virtual_key,
-                        pressed,
-                    } => ControlMessage::SimulatedKeyEvent {
-                        virtual_key,
-                        pressed,
-                    },
+                    ViewerInputEvent::Keyboard { virtual_key, pressed } => {
+                        ControlMessage::SimulatedKeyEvent { virtual_key, pressed }
+                    }
+                    ViewerInputEvent::SetFrameRate(fps) => {
+                        ControlMessage::SetTargetFps { fps }
+                    }
+                    ViewerInputEvent::ScreenshotRemote(frame) => {
+                        let status = event_tx_for_screenshots.clone();
+                        tokio::task::spawn_blocking(move || {
+                            let msg = match screenshot::capture_remote(frame) {
+                                Ok(path) => format!(
+                                    "Remote screenshot saved to {} and clipboard", path.display()
+                                ),
+                                Err(error) => format!("Remote screenshot error: {error}"),
+                            };
+                            let _ = status.blocking_send(RuntimeEvent::SessionStatus(msg));
+                        });
+                        continue;
+                    }
+                    ViewerInputEvent::ScreenshotLocal => {
+                        let status = event_tx_for_screenshots.clone();
+                        tokio::task::spawn_blocking(move || {
+                            let msg = match screenshot::capture_local() {
+                                Ok(path) => format!(
+                                    "Local screenshot saved to {} and clipboard", path.display()
+                                ),
+                                Err(error) => format!("Local screenshot error: {error}"),
+                            };
+                            let _ = status.blocking_send(RuntimeEvent::SessionStatus(msg));
+                        });
+                        continue;
+                    }
                 };
 
                 if let Err(error) = control_send_clone.send_control(&message).await {
