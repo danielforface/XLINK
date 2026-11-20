@@ -57,6 +57,7 @@ pub enum ViewerInputEvent {
     ScreenshotLocal,
     SetFrameRate(u16),
     ToggleAudio,
+    OpenFileManager,
     ActionRecordStart,
     ActionRecordStop,
     ActionReplay { repetitions: Option<u32> },
@@ -462,6 +463,9 @@ fn run_remote_viewer(
             Some(10) => { let _ = input_tx.blocking_send(
                 ViewerInputEvent::ActionStopPlayback
             ); }
+            Some(13) => { let _ = input_tx.blocking_send(
+                ViewerInputEvent::OpenFileManager
+            ); }
             Some(12) => { sound_enabled = !sound_enabled; let _ = input_tx.blocking_send(
                 ViewerInputEvent::ToggleAudio
             ); }
@@ -469,6 +473,9 @@ fn run_remote_viewer(
                 ViewerInputEvent::ActionReplayFile { repetitions: Some(1) }
             ); }
             _ => {}
+        }
+        if window.is_key_pressed(Key::F12, KeyRepeat::No) {
+            let _ = input_tx.blocking_send(ViewerInputEvent::OpenFileManager);
         }
         if window.is_key_pressed(Key::F2, KeyRepeat::No) {
             sound_enabled = !sound_enabled;
@@ -561,6 +568,11 @@ fn attach_session_menu(window: &mut Window) -> Result<()> {
     performance.add_item("Reduce FPS (F7)", 4).build();
     performance.add_item("Increase FPS (F8)", 5).build();
     window.add_menu(&performance);
+
+    let mut files = Menu::new("Files")
+        .map_err(|e| anyhow!("cannot create Files menu: {e}"))?;
+    files.add_item("Open two-pane file explorer (F12)", 13).build();
+    window.add_menu(&files);
 
     let mut sound = Menu::new("Sound")
         .map_err(|e| anyhow!("cannot create Sound menu: {e}"))?;
