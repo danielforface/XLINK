@@ -20,7 +20,7 @@ The light, responsive interface has one primary screen:
 - A permanently accessible **Stop sharing** control while listening.
 
 The temporary code expires after approximately 180 seconds and is replaced
-through a fresh public mailbox registration. Expired codes are never shown
+through a fresh mailbox registration with the selected infrastructure. Expired codes are never shown
 as valid. Returning from Settings or Logs, or refocusing the window while on
 Home, places keyboard focus back in the numeric entry field.
 
@@ -32,17 +32,37 @@ the window does not distort or move controls unpredictably.
 1. Both people open the **same XLINK version**.
 2. The person receiving help reads the compact numeric code, or copies it.
 3. The technician enters the digits and presses **Connect securely**.
-4. The two devices authenticate the short code using the publicly operated
-   Magic Wormhole mailbox/PAKE protocol and exchange ephemeral session
+4. The two devices authenticate the short code through the selected
+   Magic Wormhole-compatible mailbox using PAKE and exchange ephemeral session
    credentials and the public iroh identity.
 5. iroh establishes an encrypted QUIC connection, direct where possible
-   or through public relay infrastructure.
+   or via the explicitly selected public/private relay infrastructure.
 6. The person receiving help **explicitly approves** screen/control access
    on that computer. No short code grants authorization by itself.
 
 **XLINK does not operate its own rendezvous, relay, or identity server.**
 An external publicly operated service may be unavailable or rate-limited;
 there is no guarantee of uninterrupted service.
+
+## Connection infrastructure: public or private
+
+**Settings → Connection infrastructure** now offers two deployment models:
+
+- **Public (default)**: Public Magic Wormhole pairing and iroh N0
+  discovery/relay, without operating XLINK-owned servers.
+- **Private (opt-in)**: Enter a TLS-protected Magic Wormhole-compatible
+  mailbox URL (`wss://...`) and an iroh-compatible Relay URL (`https://...`).
+  The app configures both the Host and technician endpoints to use the
+  specified service, without automatic fallback to public services.
+  Both installations must use matching settings.
+
+Preferences are stored encrypted using **Windows DPAPI**. Changing servers
+invalidates the Host's old numeric code and requires restarting hosting.
+Remember that a private server is only as secure as its TLS configuration,
+access policy, administration and maintenance.
+
+See **[Private server configuration and security](docs/NETWORK_PROFILES.md)**
+for requirements, network isolation, deployment, and test procedures.
 
 ## Optional remembered computers
 
@@ -137,6 +157,7 @@ See [the comprehensive validation plan](docs/VALIDATION.md) and
 
 - No XLINK-operated servers, tracking infrastructure or relay nodes.
 - No environment variable may auto-approve ordinary one-time support.
-- Optional remote audio is not implemented yet.
+- v6 remote audio and media-control features require physical two-PC acceptance
+  before they can be certified as production-ready.
 - The software is **not a background service**: the person receiving help
   must have XLINK running for trusted repeat connections.
