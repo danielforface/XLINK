@@ -17,6 +17,17 @@ impl AdaptiveFrameRate {
 
     pub fn current(&self) -> u16 { self.current }
 
+    /// Update an authenticated technician's requested FPS budget while
+    /// retaining the adaptive congestion protection.
+    pub fn set_requested(&mut self, fps: u16) -> bool {
+        let next = fps.clamp(1, 60);
+        if self.requested == next { return false; }
+        self.requested = next;
+        self.current = self.current.min(self.requested);
+        self.healthy_samples = 0;
+        true
+    }
+
     pub fn interval(&self) -> Duration {
         Duration::from_millis((1000 / u64::from(self.current)).max(1))
     }
@@ -74,6 +85,18 @@ mod tests {
             rate.observe(Duration::ZERO);
         }
         assert_eq!(rate.current(), 60);
+    }
+
+    #[test]
+    fn technician_controls_fps_without_disabling_backpressure() {
+        let mut rate = AdaptiveFrameRate::new(30);
+        assert!(rate.set_requested(10));
+        assert_eq!(rate.current(), 10);
+        assert!(rate.set_requested(60));
+        for _ in 0..30 { rate.observe(Duration::ZERO); }
+        assert_eq!(rate.current(), 11);
+        assert!(rate.set_requested(0));
+        assert_eq!(rate.current(), 1);
     }
 
     #[test]

@@ -47,6 +47,17 @@ extern "system" {
     fn LocalFree(handle: *mut c_void) -> *mut c_void;
 }
 
+/// Encrypt arbitrary local metadata under the current Windows account.
+pub fn encrypt_local_metadata(plaintext: &[u8]) -> Result<Vec<u8>> {
+    dpapi(plaintext, true)
+}
+
+/// Decrypt metadata; any failure must fail closed instead of treating the
+/// encrypted bytes as empty/unprotected state.
+pub fn decrypt_local_metadata(ciphertext: &[u8]) -> Result<Vec<u8>> {
+    dpapi(ciphertext, false)
+}
+
 fn dpapi(input: &[u8], encrypt: bool) -> Result<Vec<u8>> {
     let mut bytes = input.to_vec();
     let blob = DataBlob {

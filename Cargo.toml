@@ -36,6 +36,7 @@ tokio = { version = "1.35", features = ["full"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 winreg = "0.50"
+wasapi = "=0.20.0"
 windows = { version = "0.52", features = [
     "Win32_Foundation",
     "Win32_Graphics_Direct3D",
@@ -73,6 +74,8 @@ rand.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 winreg.workspace = true
+wasapi.workspace = true
+windows.workspace = true
 nexus_core = { path = "crates/nexus_core" }
 nexus_display = { path = "crates/nexus_display" }
 nexus_input = { path = "crates/nexus_input" }

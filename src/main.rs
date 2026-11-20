@@ -1,8 +1,16 @@
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 
 mod adaptive;
+mod actions;
+mod audio;
 mod delta;
 mod frame_codec;
+mod file_service;
+mod file_client;
+mod history;
+mod local_actions;
+mod screenshot;
+mod network_profile;
 mod numeric_entry;
 mod ui_widgets;
 mod short_code;
@@ -25,7 +33,7 @@ use nexus_input::{
     InputController, KeyboardPreview, MousePreview, SessionState as InputSessionState,
 };
 use nexus_network::{
-    accept_connection, connect_to_peer, create_client_endpoint_with_secret, EndpointAddr, RecvStream,
+    accept_connection, connect_to_peer, RecvStream,
     SendStream, SecretKey,
 };
 use qrcode_generator::QrCodeEcc;
@@ -35,7 +43,7 @@ use std::fs;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
 use std::path::{Path, PathBuf};
 use bip39::{Language, Mnemonic};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::runtime::{Builder, Runtime};
@@ -85,6 +93,8 @@ fn main() -> Result<()> {
     init_tracing();
     let trust_registry = trusted::TrustRegistry::load_or_create()
         .context("cannot load Windows-protected device identity")?;
+    let network_profile = network_profile::NetworkProfile::load()
+        .context("cannot load protected network configuration")?;
 
     if let Err(error) = register_nexus_protocol_handler() {
         warn!(?error, "failed to register nexus protocol handler");
@@ -107,6 +117,7 @@ fn main() -> Result<()> {
         runtime_event_tx,
         Arc::clone(&ui_bridge),
         trust_registry.clone(),
+        network_profile.clone(),
     ));
 
     let mut runtime_event_rx_slot = Some(runtime_event_rx);
@@ -134,6 +145,7 @@ fn main() -> Result<()> {
                 launch_connection_seed.clone(),
                 Arc::clone(&runtime),
                 trust_registry.clone(),
+                network_profile.clone(),
             );
             Box::new(app)
         }),
@@ -180,6 +192,7 @@ struct HostRuntimeConfig {
     max_width: u16,
     inject_input: bool,
     seed: [u8; 32],
+    network_profile: network_profile::NetworkProfile,
 }
 
 #[derive(Debug)]
@@ -189,11 +202,13 @@ enum RuntimeCommand {
         access_id: String,
         display_name: Option<String>,
         remember_host: bool,
+        network_profile: network_profile::NetworkProfile,
         _transport_mode: TransportMode,
     },
     ConnectTrusted {
         endpoint_id: [u8; 32],
         display_name: Option<String>,
+        network_profile: network_profile::NetworkProfile,
     },
     RunDiagnostics,
     StopHosting,
@@ -232,6 +247,9 @@ enum RuntimeEvent {
     HostSessionActive {
         active: bool,
     },
+    ConnectionAuthenticated { peer: String, direction: history::Direction },
+    ClientServiceConnection(nexus_network::Connection),
+    OpenFileManager,
     ClientLifecycle {
         running: bool,
     },
@@ -252,6 +270,8 @@ enum RuntimeEvent {
 struct HostConsentDecision {
     approved: bool,
     remember_technician: bool,
+    allow_audio: bool,
+    allow_files: bool,
 }
 
 #[derive(Default)]
@@ -350,6 +370,16 @@ struct HostConsentPrompt {
     remember_requested: bool,
 }
 
+#[derive(Clone, Default)]
+struct FileUiSnapshot {
+    remote_path: String,
+    remote_items: Vec<file_service::Item>,
+    busy: bool,
+    transferred: u64,
+    total: u64,
+    message: String,
+}
+
 struct NexusGuiApp {
     active_tab: ActiveTab,
     access_id_input: String,
@@ -364,13 +394,35 @@ struct NexusGuiApp {
     host_inject_input: bool,
     show_logs: bool,
     show_preferences: bool,
+    show_history: bool,
+    show_files: bool,
+    show_actions: bool,
+    local_record_confirmation: bool,
+    local_record_stop: Arc<AtomicBool>,
+    local_record_handle: Option<std::thread::JoinHandle<Result<(PathBuf, u64)>>>,
+    local_action_file: Option<PathBuf>,
+    local_playback_stop: Arc<AtomicBool>,
+    local_playback_status: Arc<Mutex<String>>,
+    recent_history: Option<history::History>,
+    client_service_connection: Option<nexus_network::Connection>,
+    file_snapshot: Arc<Mutex<FileUiSnapshot>>,
+    file_local_folder: PathBuf,
+    file_selected_local: Option<PathBuf>,
+    file_selected_remote: Option<file_service::Item>,
+    file_destination: String,
+    file_clipboard: Option<(String, bool)>,
+    file_pending_delete: Option<String>,
     code_ready_at: Option<Instant>,
     refocus_number_input: bool,
     numeric_cursor: usize,
     window_was_focused: bool,
     remember_this_computer: bool,
     trust_current_technician: bool,
+    approve_audio_for_session: bool,
+    approve_files_for_session: bool,
     trust_registry: trusted::TrustRegistry,
+    network_profile: network_profile::NetworkProfile,
+    network_draft: network_profile::NetworkProfile,
     host_advertise_addr_input: String,
 
     client_display_name: String,
@@ -410,6 +462,7 @@ impl NexusGuiApp {
         launch_connection_seed: Option<String>,
         runtime: Arc<Runtime>,
         trust_registry: trusted::TrustRegistry,
+        network_profile: network_profile::NetworkProfile,
     ) -> Self {
         apply_modern_theme(&cc.egui_ctx);
 
@@ -449,13 +502,42 @@ impl NexusGuiApp {
             host_inject_input: true,
             show_logs: false,
             show_preferences: false,
+            show_history: false,
+            show_files: false,
+            show_actions: false,
+            local_record_confirmation: false,
+            local_record_stop: Arc::new(AtomicBool::new(false)),
+            local_record_handle: None,
+            local_action_file: None,
+            local_playback_stop: Arc::new(AtomicBool::new(true)),
+            local_playback_status: Arc::new(Mutex::new("Idle".into())),
+            client_service_connection: None,
+            file_snapshot: Arc::new(Mutex::new(FileUiSnapshot::default())),
+            file_local_folder: std::env::var_os("USERPROFILE")
+                .map(PathBuf::from).unwrap_or_default().join("Downloads"),
+            file_selected_local: None,
+            file_selected_remote: None,
+            file_destination: String::new(),
+            file_clipboard: None,
+            file_pending_delete: None,
+            recent_history: match history::History::open() {
+                Ok(archive) => Some(archive),
+                Err(error) => {
+                    tracing::warn!(?error, "encrypted connection history unavailable");
+                    None
+                }
+            },
             code_ready_at: None,
             refocus_number_input: true,
             numeric_cursor: 0,
             window_was_focused: false,
             remember_this_computer: false,
             trust_current_technician: false,
+            approve_audio_for_session: false,
+            approve_files_for_session: false,
             trust_registry,
+            network_draft: network_profile.clone(),
+            network_profile,
             host_advertise_addr_input: default_advertise,
             client_display_name: String::new(),
             pending_client_permission: None,
@@ -548,6 +630,8 @@ impl NexusGuiApp {
                     remember_requested,
                 } => {
                     self.trust_current_technician = false;
+                    self.approve_audio_for_session = false;
+                    self.approve_files_for_session = false;
                     self.pending_host_consent = Some(HostConsentPrompt {
                         requester_id,
                         remote_addr,
@@ -580,12 +664,32 @@ impl NexusGuiApp {
                         self.set_status("Ready for another connection");
                     }
                 }
+                RuntimeEvent::ClientServiceConnection(connection) => {
+                    self.client_service_connection = Some(connection);
+                }
+                RuntimeEvent::OpenFileManager => {
+                    self.show_files = true;
+                    self.show_logs = false;
+                    self.show_history = false;
+                    self.show_preferences = false;
+                    self.start_file_action(file_client::Operation::List("".into()));
+                }
+                RuntimeEvent::ConnectionAuthenticated { peer, direction } => {
+                    if let Some(history) = self.recent_history.as_mut() {
+                        if let Err(error) = history.record(direction, &peer) {
+                            self.push_log(format!("History save failed: {error}"));
+                        }
+                    }
+                }
                 RuntimeEvent::PairingCodeRevoked => {
                     self.generated_access_id = None;
                     self.code_ready_at = None;
                 }
                 RuntimeEvent::ClientLifecycle { running } => {
                     self.client_running = running;
+                    if !running {
+                        self.client_service_connection = None;
+                    }
                     if !running {
                         self.pending_client_permission = None;
                         self.ui_bridge.clear_client_permission_sender();
@@ -1222,24 +1326,27 @@ impl NexusGuiApp {
         let muted = Color32::from_rgb(109, 125, 149);
         let accent = Color32::from_rgb(31, 100, 217);
         let width = ui.available_width().max(0.0);
-        let card_width = width.min(450.0);
-        let compact = width < 405.0;
-        let padding = if compact { 15.0 } else { 24.0 };
+        let card_width = width.min(436.0);
+        // Dense by default: the complete home screen must fit the 688×732
+        // startup window without demanding an initial scroll.
+        let dense = ui.ctx().screen_rect().height() < 830.0 || width < 405.0;
+        ui.spacing_mut().item_spacing.y = if dense { 3.0 } else { 6.0 };
+        let padding = if dense { 17.0 } else { 23.0 };
         let content_width = (card_width - padding * 2.0).max(240.0);
         let m = ui_widgets::metrics(content_width);
 
-        ui.add_space(if compact { 6.0 } else { 14.0 });
+        ui.add_space(if dense { 3.0 } else { 14.0 });
         ui.vertical_centered(|ui| {
             ui.label(RichText::new("SECURE CONNECTION")
                 .size(10.5).strong().color(accent));
-            ui.add_space(5.0);
+            ui.add_space(if dense { 2.0 } else { 5.0 });
             ui.label(RichText::new("Connect to a computer")
-                .size(if compact { 22.0 } else { 25.0 }).strong().color(ink));
-            ui.add_space(5.0);
+                .size(if dense { 22.0 } else { 25.0 }).strong().color(ink));
+            ui.add_space(if dense { 2.0 } else { 5.0 });
             ui.label(RichText::new("One code. Private and encrypted.")
                 .size(12.0).color(muted));
         });
-        ui.add_space(if compact { 12.0 } else { 19.0 });
+        ui.add_space(if dense { 9.0 } else { 19.0 });
 
         ui.vertical_centered(|ui| {
             ui.allocate_ui_with_layout(
@@ -1258,19 +1365,19 @@ impl NexusGuiApp {
                             ui_widgets::centered_row(ui, content_width, |ui| {
                                 self.draw_compact_own_code(ui);
                             });
-                            ui.add_space(13.0);
+                            ui.add_space(if dense { 7.0 } else { 13.0 });
                             ui.separator();
-                            ui.add_space(12.0);
+                            ui.add_space(if dense { 6.0 } else { 12.0 });
 
                             ui.vertical_centered(|ui| {
                                 ui.label(RichText::new("REMOTE COMPUTER ID")
                                     .size(11.0).strong().color(muted));
-                                ui.add_space(3.0);
+                                ui.add_space(2.0);
                                 ui.label(RichText::new(
                                     "8–10 digits · type, paste or use the keypad"
                                 ).size(10.5).color(Color32::from_rgb(151, 166, 185)));
                             });
-                            ui.add_space(11.0);
+                            ui.add_space(if dense { 5.0 } else { 11.0 });
 
                             let focus = self.refocus_number_input;
                             self.refocus_number_input = false;
@@ -1281,7 +1388,7 @@ impl NexusGuiApp {
                                     focus, !self.client_running, m.slots_width,
                                 ).submit;
                             });
-                            ui.add_space(15.0);
+                            ui.add_space(if dense { 7.0 } else { 15.0 });
 
                             let keys = [
                                 ["1", "2", "3"], ["4", "5", "6"],
@@ -1293,7 +1400,8 @@ impl NexusGuiApp {
                                     for (col_idx, key) in row.iter().enumerate() {
                                         ui.push_id(("num_key", row_idx, col_idx), |ui| {
                                             let pressed = ui_widgets::numeric_key(
-                                                ui, key, m.key_width, 46.0
+                                                ui, key, m.key_width,
+                                                if dense { 40.0 } else { 46.0 }
                                             ).clicked();
                                             if pressed && !self.client_running {
                                                 let action = match *key {
@@ -1312,9 +1420,11 @@ impl NexusGuiApp {
                                         });
                                     }
                                 });
-                                if row_idx != 3 { ui.add_space(8.0); }
+                                if row_idx != 3 {
+                                    ui.add_space(if dense { 5.0 } else { 8.0 });
+                                }
                             }
-                            ui.add_space(15.0);
+                            ui.add_space(if dense { 8.0 } else { 15.0 });
                             let valid = short_code::parse_code(&self.access_id_input).is_ok();
                             let enabled = valid && !self.client_running;
                             let mut connect_pressed = false;
@@ -1334,11 +1444,11 @@ impl NexusGuiApp {
                                         .try_send(RuntimeCommand::DisconnectClient);
                                 }
                             }
-                            ui.add_space(10.0);
+                            ui.add_space(if dense { 5.0 } else { 10.0 });
                             ui.vertical_centered(|ui| {
                                 ui.checkbox(&mut self.remember_this_computer,
                                     "Remember this computer if its owner also agrees");
-                                ui.add_space(4.0);
+                                ui.add_space(if dense { 1.0 } else { 4.0 });
                                 ui.label(RichText::new(
                                     "The remote person must approve the connection."
                                 ).size(11.0).color(muted));
@@ -1365,6 +1475,7 @@ impl NexusGuiApp {
                             RuntimeCommand::ConnectTrusted {
                                 endpoint_id: peer.endpoint_id,
                                 display_name: None,
+                                network_profile: self.network_profile.clone(),
                             }
                         ) {
                             self.push_log(format!("Cannot start saved connection: {error}"));
@@ -1376,7 +1487,7 @@ impl NexusGuiApp {
                 });
             }
         }
-        ui.add_space(12.0);
+        ui.add_space(if dense { 6.0 } else { 12.0 });
         ui.vertical_centered(|ui| {
             ui.label(RichText::new(&self.status_message)
                 .size(11.5).color(muted));
@@ -1401,6 +1512,89 @@ impl NexusGuiApp {
                     .inner_margin(egui::Margin::same(20.0))
                     .show(ui, |ui| {
                         ui.set_width((width - 40.0).max(100.0));
+                        ui.heading("Connection infrastructure");
+                        ui.add(egui::Label::new(
+                            RichText::new("Choose where XLINK discovers peers and routes encrypted QUIC.")
+                                .size(12.0).color(muted),
+                        ).wrap(true));
+                        ui.add_space(8.0);
+                        ui.radio_value(
+                            &mut self.network_draft.mode,
+                            network_profile::NetworkMode::Public,
+                            "Public (default) · Magic Wormhole + iroh N0",
+                        );
+                        ui.radio_value(
+                            &mut self.network_draft.mode,
+                            network_profile::NetworkMode::Private,
+                            "Private servers · no public fallback",
+                        );
+                        if self.network_draft.is_private() {
+                            ui.add_space(8.0);
+                            ui.label(RichText::new("Private pairing mailbox (WSS)")
+                                .strong().size(12.0));
+                            ui.add(egui::TextEdit::singleline(&mut self.network_draft.mailbox_url)
+                                .desired_width(ui.available_width())
+                                .hint_text("wss://mailbox.example.org/v1"));
+                            ui.add_space(7.0);
+                            ui.label(RichText::new("Private iroh relay (HTTPS)")
+                                .strong().size(12.0));
+                            ui.add(egui::TextEdit::singleline(&mut self.network_draft.relay_url)
+                                .desired_width(ui.available_width())
+                                .hint_text("https://relay.example.org"));
+                            ui.add_space(6.0);
+                            ui.add(egui::Label::new(
+                                RichText::new(
+                                    "Both computers must configure the same servers.                                      Certificates must be valid and trusted by Windows.                                      Private mode does not contact N0 discovery or                                      the public Magic Wormhole mailbox."
+                                ).size(11.0).color(muted),
+                            ).wrap(true));
+                        }
+                        ui.add_space(10.0);
+                        let dirty = self.network_draft != self.network_profile;
+                        ui.horizontal(|ui| {
+                            if ui.add_enabled(
+                                dirty && !self.host_session_active && !self.client_running,
+                                egui::Button::new("Apply connection settings"),
+                            ).clicked() {
+                                match self.network_draft.validate().and_then(|_| self.network_draft.save()) {
+                                    Ok(()) => {
+                                        self.network_profile = self.network_draft.clone();
+                                        if self.host_running {
+                                            let _ = self.runtime_cmd_tx.try_send(
+                                                RuntimeCommand::StopHosting
+                                            );
+                                            self.generated_access_id = None;
+                                            self.code_ready_at = None;
+                                        }
+                                        self.has_auto_hosted = true;
+                                        self.set_status(
+                                            "Infrastructure saved securely. Start hosting again                                              to publish a code using the selected servers."
+                                        );
+                                    }
+                                    Err(error) => {
+                                        self.push_log(format!(
+                                            "Private infrastructure configuration rejected: {error}"
+                                        ));
+                                        self.set_status(format!("Invalid private server settings: {error}"));
+                                    }
+                                }
+                            }
+                            if dirty && ui.small_button("Discard changes").clicked() {
+                                self.network_draft = self.network_profile.clone();
+                            }
+                        });
+                        ui.add_space(7.0);
+                        ui.label(
+                            RichText::new(format!("Active: {}", self.network_profile.describe()))
+                                .size(11.0).color(muted)
+                        );
+                        ui.add(egui::Label::new(
+                            RichText::new(
+                                "TLS validates server identity; remote sessions are still                                  end-to-end encrypted and require consent or trusted enrollment.                                  A private server changes infrastructure ownership; it is not                                  automatically more secure."
+                            ).size(11.0).color(muted),
+                        ).wrap(true));
+                        ui.add_space(16.0);
+                        ui.separator();
+                        ui.add_space(11.0);
                         ui.heading("Input permissions");
                         ui.checkbox(&mut self.host_inject_input,
                             "Allow mouse and keyboard after an approved request");
@@ -1513,6 +1707,405 @@ impl NexusGuiApp {
         );
     }
 
+    fn start_file_action(&mut self, action: file_client::Operation) {
+        let Some(connection) = self.client_service_connection.clone() else {
+            self.set_status("Connect to an approved remote computer to browse its files");
+            return;
+        };
+        let snapshot = Arc::clone(&self.file_snapshot);
+        if let Ok(mut state) = snapshot.lock() {
+            if state.busy {
+                self.set_status("A file transfer is already in progress");
+                return;
+            }
+            state.busy = true;
+            state.message = "Communicating securely with the remote computer...".into();
+            state.transferred = 0;
+            state.total = 0;
+        }
+        let should_refresh = !matches!(action, file_client::Operation::List(_));
+        self._runtime.spawn(async move {
+            let feedback = Arc::clone(&snapshot);
+            let result = file_client::execute(&connection, action, |current, total| {
+                if let Ok(mut state) = feedback.lock() {
+                    state.transferred = current;
+                    state.total = total;
+                }
+            }).await;
+            if let Ok(mut state) = snapshot.lock() {
+                match result {
+                    Ok(file_client::Outcome::Directory { path, items }) => {
+                        state.remote_path = path;
+                        state.remote_items = items;
+                        state.message = "Remote folder refreshed".into();
+                    }
+                    Ok(file_client::Outcome::Complete(msg)) => {
+                        state.message = msg;
+                    }
+                    Err(error) => state.message = format!("File operation failed: {error}"),
+                }
+                state.busy = false;
+            }
+            if should_refresh {
+                let path = snapshot.lock().ok().map(|s| s.remote_path.clone())
+                    .unwrap_or_default();
+                if let Ok(file_client::Outcome::Directory { path, items }) =
+                    file_client::execute(
+                        &connection,
+                        file_client::Operation::List(path),
+                        |_, _| {},
+                    ).await {
+                    if let Ok(mut state) = snapshot.lock() {
+                        state.remote_items = items;
+                        state.remote_path = path;
+                    }
+                }
+            }
+        });
+    }
+
+    fn draw_local_actions_screen(&mut self, ui: &mut egui::Ui) {
+        if self.local_record_handle.as_ref().is_some_and(|thread| thread.is_finished()) {
+            let task = self.local_record_handle.take().unwrap();
+            match task.join() {
+                Ok(Ok((path, count))) => {
+                    self.local_action_file = Some(path.clone());
+                    self.set_status(format!("{count} actions saved to {}", path.display()));
+                }
+                Ok(Err(error)) => self.set_status(format!("Recording failed: {error}")),
+                Err(_) => self.set_status("Local action recording thread crashed"),
+            }
+        }
+        ui.heading("Local action studio");
+        ui.add(egui::Label::new(
+            "Record and replay mouse and keyboard on THIS computer, without a remote session.              Global recording may capture passwords or private information.              Pause/Break stops a recording or a playback, even when XLINK is not focused."
+        ).wrap(true));
+        ui.add_space(14.0);
+        let recording = self.local_record_handle.is_some();
+        if recording {
+            ui.label(RichText::new("● LOCAL RECORDING ACTIVE").strong()
+                .color(Color32::from_rgb(183, 47, 62)));
+            if ui.button("Stop local recording").clicked() {
+                self.local_record_stop.store(true, Ordering::Release);
+            }
+        } else {
+            ui.checkbox(&mut self.local_record_confirmation,
+                "I authorize an explicit local recording of keyboard and mouse input");
+            if ui.add_enabled(self.local_record_confirmation,
+                egui::Button::new("Start local recording")).clicked() {
+                self.local_record_stop.store(false, Ordering::Release);
+                let stop = Arc::clone(&self.local_record_stop);
+                match std::thread::Builder::new()
+                    .name("xlink-local-input-recorder".into())
+                    .spawn(move || local_actions::record_global_input(stop)) {
+                    Ok(handle) => {
+                        self.local_record_handle = Some(handle);
+                        self.local_record_confirmation = false;
+                        self.set_status("LOCAL RECORDING — Press Pause/Break to stop");
+                    }
+                    Err(error) => self.push_log(format!("Cannot start recording: {error}")),
+                }
+            }
+        }
+        ui.add_space(15.0);
+        if ui.button("Load portable XLINK .xlaction recording").clicked() {
+            if let Some(path) = rfd::FileDialog::new()
+                .add_filter("XLINK actions", &["xlaction"]).pick_file() {
+                match actions::inspect(&path) {
+                    Ok((events, length_ms)) => {
+                        self.local_action_file = Some(path);
+                        self.set_status(format!(
+                            "{events} events · {:.2}s",
+                            length_ms as f64 / 1000.0
+                        ));
+                    }
+                    Err(error) => self.set_status(format!("Invalid recording: {error}")),
+                }
+            }
+        }
+        if let Some(path) = &self.local_action_file {
+            ui.add(egui::Label::new(format!("Current action: {}",path.display()))
+                .wrap(true));
+        }
+        let playing = !self.local_playback_stop.load(Ordering::Acquire);
+        if playing {
+            ui.label(RichText::new("● LOCAL ACTION PLAYBACK").strong()
+                .color(Color32::from_rgb(37, 106, 211)));
+            if ui.button("STOP PLAYBACK").clicked() {
+                self.local_playback_stop.store(true, Ordering::Release);
+            }
+        } else {
+            ui.horizontal(|ui| {
+                for (label,repeat) in [
+                    ("Replay once", Some(1u32)),
+                    ("Replay 5 times", Some(5u32)),
+                    ("Loop until stopped", None),
+                ] {
+                    if ui.add_enabled(!recording && self.local_action_file.is_some(),
+                        egui::Button::new(label)).clicked() {
+                        if let Some(path) = self.local_action_file.clone() {
+                            self.local_playback_stop.store(false, Ordering::Release);
+                            let stop = Arc::clone(&self.local_playback_stop);
+                            let status = Arc::clone(&self.local_playback_status);
+                            self._runtime.spawn(async move {
+                                let result = local_actions::play_local(
+                                    path, repeat, Arc::clone(&stop)
+                                ).await;
+                                stop.store(true, Ordering::Release);
+                                if let Ok(mut state) = status.lock() {
+                                    *state = match result {
+                                        Ok(count) => format!("Played {count} events"),
+                                        Err(error) => format!("Action replay error: {error}"),
+                                    };
+                                }
+                            });
+                        }
+                    }
+                }
+            });
+        }
+        if let Ok(status) = self.local_playback_status.lock() {
+            ui.label(status.clone());
+        }
+    }
+
+    fn draw_file_manager(&mut self, ui: &mut egui::Ui) {
+        let snapshot = match self.file_snapshot.lock() {
+            Ok(state) => state.clone(),
+            Err(_) => {
+                ui.label("File manager is temporarily unavailable");
+                return;
+            }
+        };
+        ui.heading("Secure file explorer");
+        ui.add(egui::Label::new(
+            "File sharing uses a separate encrypted QUIC channel. The remote person              must explicitly authorize access to Downloads/XLINK-Shared."
+        ).wrap(true));
+        ui.add_space(11.0);
+        if snapshot.busy {
+            ui.spinner();
+            if snapshot.total > 0 {
+                ui.add(egui::ProgressBar::new(
+                    (snapshot.transferred as f64 / snapshot.total as f64)
+                        .clamp(0.0, 1.0) as f32
+                ).show_percentage());
+                ui.label(format!(
+                    "{} / {} bytes transferred", snapshot.transferred, snapshot.total
+                ));
+            }
+        }
+        ui.label(RichText::new(&snapshot.message)
+            .size(12.0).color(Color32::from_rgb(60, 101, 169)));
+        ui.add_space(10.0);
+
+        let mut requested: Option<file_client::Operation> = None;
+        let selectable = !snapshot.busy && self.client_service_connection.is_some();
+        ui.columns(2, |panes| {
+            panes[0].heading("This computer");
+            panes[0].label(
+                RichText::new(self.file_local_folder.display().to_string()).size(11.0)
+            );
+            if panes[0].button("Choose folder").clicked() {
+                if let Some(path) = rfd::FileDialog::new().pick_folder() {
+                    self.file_local_folder = path;
+                    self.file_selected_local = None;
+                }
+            }
+            if panes[0].button("Choose any file for upload").clicked() {
+                self.file_selected_local = rfd::FileDialog::new().pick_file();
+            }
+            panes[0].separator();
+            egui::ScrollArea::vertical().max_height(260.0)
+                .show(&mut panes[0], |ui| {
+                    if let Ok(entries) = std::fs::read_dir(&self.file_local_folder) {
+                        for entry in entries.flatten().take(350) {
+                            let path = entry.path();
+                            let is_dir = path.is_dir();
+                            let label = format!(
+                                "{} {}", if is_dir { "Folder" } else { "File" },
+                                entry.file_name().to_string_lossy()
+                            );
+                            let selected = self.file_selected_local.as_ref()
+                                .is_some_and(|selection| selection == &path);
+                            if ui.selectable_label(selected, label).clicked() {
+                                if is_dir {
+                                    self.file_local_folder = path;
+                                    self.file_selected_local = None;
+                                } else { self.file_selected_local = Some(path); }
+                            }
+                        }
+                    }
+                });
+            if let Some(selected) = self.file_selected_local.as_ref() {
+                panes[0].label(RichText::new(format!(
+                    "Selected: {}", selected.display()
+                )).small());
+            }
+            if panes[0].add_enabled(selectable, egui::Button::new(
+                "Upload selected file to remote"
+            )).clicked() {
+                if let Some(source) = self.file_selected_local.clone() {
+                    let name = source.file_name()
+                        .map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+                    let path = if snapshot.remote_path.is_empty() {
+                        name
+                    } else {
+                        format!("{}/{}", snapshot.remote_path, name)
+                    };
+                    requested = Some(file_client::Operation::Upload {
+                        source, target: path,
+                    });
+                }
+            }
+
+            panes[1].heading("Remote computer");
+            panes[1].label(format!("XLINK-Shared / {}", snapshot.remote_path));
+            panes[1].horizontal(|ui| {
+                if ui.add_enabled(selectable, egui::Button::new("Up")).clicked() {
+                    let parent = std::path::Path::new(&snapshot.remote_path)
+                        .parent().map(|p| p.to_string_lossy().to_string())
+                        .unwrap_or_default();
+                    requested = Some(file_client::Operation::List(parent));
+                    self.file_selected_remote = None;
+                }
+                if ui.add_enabled(selectable, egui::Button::new("Refresh")).clicked() {
+                    requested = Some(file_client::Operation::List(
+                        snapshot.remote_path.clone()
+                    ));
+                }
+            });
+            panes[1].separator();
+            egui::ScrollArea::vertical().max_height(260.0)
+                .show(&mut panes[1], |ui| {
+                    for entry in &snapshot.remote_items {
+                        let title = format!(
+                            "{} {}{}", if entry.is_dir { "Folder" } else { "File" },
+                            entry.name, if entry.is_dir { "" } else { "" },
+                        );
+                        let selected = self.file_selected_remote.as_ref()
+                            .is_some_and(|item| item.name == entry.name);
+                        if ui.selectable_label(selected, title).clicked() {
+                            if entry.is_dir {
+                                let path = if snapshot.remote_path.is_empty() {
+                                    entry.name.clone()
+                                } else {
+                                    format!("{}/{}", snapshot.remote_path, entry.name)
+                                };
+                                requested = Some(file_client::Operation::List(path));
+                                self.file_selected_remote = None;
+                            } else {
+                                self.file_selected_remote = Some(entry.clone());
+                            }
+                        }
+                    }
+                });
+            let selected_remote_path = self.file_selected_remote.as_ref().map(|file| {
+                if snapshot.remote_path.is_empty() { file.name.clone() }
+                else { format!("{}/{}", snapshot.remote_path, file.name) }
+            });
+            if panes[1].add_enabled(selectable && selected_remote_path.is_some(),
+                egui::Button::new("Download to local folder")
+            ).clicked() {
+                if let Some(source) = selected_remote_path.clone() {
+                    requested = Some(file_client::Operation::Download {
+                        source, directory: self.file_local_folder.clone(),
+                    });
+                }
+            }
+            panes[1].horizontal(|ui| {
+                if ui.add_enabled(selectable && selected_remote_path.is_some(),
+                    egui::Button::new("Copy")).clicked() {
+                    self.file_clipboard = selected_remote_path.clone().map(|p| (p, false));
+                }
+                if ui.add_enabled(selectable && selected_remote_path.is_some(),
+                    egui::Button::new("Cut")).clicked() {
+                    self.file_clipboard = selected_remote_path.clone().map(|p| (p, true));
+                }
+                if ui.add_enabled(selectable && selected_remote_path.is_some(),
+                    egui::Button::new("Delete")).clicked() {
+                    self.file_pending_delete = selected_remote_path;
+                }
+            });
+            panes[1].label("Destination name/path (or new folder name):");
+            panes[1].text_edit_singleline(&mut self.file_destination);
+            panes[1].horizontal(|ui| {
+                if ui.add_enabled(selectable && self.file_clipboard.is_some()
+                    && !self.file_destination.is_empty(),
+                    egui::Button::new("Paste")).clicked() {
+                    if let Some((from, cut)) = self.file_clipboard.take() {
+                        let to = self.file_destination.clone();
+                        requested = Some(if cut {
+                            file_client::Operation::Move { from, to }
+                        } else {
+                            file_client::Operation::Copy { from, to }
+                        });
+                    }
+                }
+                if ui.add_enabled(selectable && !self.file_destination.is_empty(),
+                    egui::Button::new("New folder")).clicked() {
+                    requested = Some(file_client::Operation::Mkdir(
+                        self.file_destination.clone()
+                    ));
+                }
+            });
+        });
+
+        if let Some(path) = self.file_pending_delete.clone() {
+            ui.add_space(10.0);
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(format!("Delete remote file {path}?"))
+                    .color(Color32::from_rgb(174, 54, 64)));
+                if ui.button("Confirm deletion").clicked() {
+                    requested = Some(file_client::Operation::Delete(path));
+                    self.file_pending_delete = None;
+                }
+                if ui.button("Cancel").clicked() {
+                    self.file_pending_delete = None;
+                }
+            });
+        }
+        if let Some(request) = requested { self.start_file_action(request); }
+    }
+
+    fn draw_history_screen(&mut self, ui: &mut egui::Ui) {
+        let ink = Color32::from_rgb(27, 47, 73);
+        ui.heading("Recent sessions");
+        ui.label("Encrypted locally for your Windows account. No passwords or screen data.");
+        ui.add_space(14.0);
+        let mut bookmark: Option<(usize, bool)> = None;
+        match self.recent_history.as_ref() {
+            Some(archive) => {
+                if archive.entries().is_empty() {
+                    ui.label("No successful sessions recorded yet.");
+                }
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    for (index, entry) in archive.entries().iter().enumerate() {
+                        ui.horizontal(|ui| {
+                            let action = if entry.direction == history::Direction::Helping {
+                                "Helped" } else { "Received help" };
+                            ui.label(RichText::new(format!(
+                                "{} · {} · {}",
+                                entry.at_epoch_secs, action, entry.peer
+                            )).color(ink).size(12.0));
+                            if ui.button(if entry.saved { "Unsave" } else { "Save" }).clicked() {
+                                bookmark = Some((index, !entry.saved));
+                            }
+                        });
+                        ui.separator();
+                    }
+                });
+            }
+            None => { ui.label("Protected history unavailable. Check Logs."); }
+        }
+        if let Some((index, state)) = bookmark {
+            if let Some(archive) = self.recent_history.as_mut() {
+                if let Err(error) = archive.set_saved(index, state) {
+                    self.push_log(format!("Cannot save history bookmark: {error}"));
+                }
+            }
+        }
+    }
+
     fn draw_logs_screen(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             ui.heading("Activity log");
@@ -1573,6 +2166,7 @@ impl NexusGuiApp {
             max_width: self.host_max_width,
             inject_input: self.host_inject_input,
             seed: self.host_seed,
+            network_profile: self.network_profile.clone(),
         });
 
         match self.runtime_cmd_tx.try_send(command) {
@@ -1611,6 +2205,7 @@ impl NexusGuiApp {
                 Some(display_name)
             },
             remember_host: self.remember_this_computer,
+            network_profile: self.network_profile.clone(),
             _transport_mode: self.host_transport_mode,
         };
 
@@ -1740,6 +2335,13 @@ impl NexusGuiApp {
                 ui.add(egui::Label::new(format!("Session: {}", prompt.target_session)).wrap(true));
                 ui.add_space(10.0);
                 ui.add(egui::Label::new("Allow screen viewing? Keyboard and mouse control only if explicitly enabled in Host settings. You may revoke at any time.").wrap(true));
+                ui.add_space(10.0);
+                ui.checkbox(&mut self.approve_audio_for_session,
+                    "Share this computer's speaker audio with the technician");
+                ui.checkbox(&mut self.approve_files_for_session,
+                    "Allow file operations inside Downloads/XLINK-Shared only");
+                ui.label(RichText::new("Audio is OFF by default and requires separate consent.")
+                    .size(11.0).color(Color32::from_rgb(110, 126, 147)));
                 if prompt.remember_requested {
                     ui.add_space(10.0);
                     ui.checkbox(&mut self.trust_current_technician,
@@ -1757,6 +2359,8 @@ impl NexusGuiApp {
                     {
                         match self.ui_bridge.respond_host_consent(HostConsentDecision {
                             approved: false, remember_technician: false,
+                            allow_audio: false,
+                            allow_files: false,
                         }) {
                             Ok(()) => {
                                 self.pending_host_consent = None;
@@ -1776,6 +2380,8 @@ impl NexusGuiApp {
                             approved: true,
                             remember_technician: prompt.remember_requested
                                 && self.trust_current_technician,
+                            allow_audio: self.approve_audio_for_session,
+                            allow_files: self.approve_files_for_session,
                         }) {
                             Ok(()) => {
                                 self.pending_host_consent = None;
@@ -1891,27 +2497,37 @@ impl eframe::App for NexusGuiApp {
             self.set_status("Refreshing your temporary ID...");
         }
 
+        // Reserve the brand's own width; the toolbar never paints across it.
+        // At the default window size navigation uses uniform icon controls.
+        // Tooltips retain every feature name. Larger windows reveal labels.
+        let compact_nav = ui_widgets::compact_navigation(ctx.screen_rect().width());
         egui::TopBottomPanel::top("home_navigation")
             .frame(egui::Frame::none()
                 .fill(Color32::WHITE)
-                .inner_margin(egui::Margin::symmetric(20.0, 14.0)))
+                .inner_margin(egui::Margin::symmetric(14.0, 8.0)))
             .show(ctx, |ui| {
+                ui.spacing_mut().item_spacing.x = if compact_nav { 5.0 } else { 8.0 };
                 ui.horizontal(|ui| {
                     if ui.add(
                         egui::Button::new(RichText::new("XLINK")
-                            .size(24.0).strong().color(Color32::from_rgb(28, 64, 119)))
+                            .size(21.0).strong().color(Color32::from_rgb(28, 64, 119)))
                             .frame(false)
-                    ).on_hover_text("Home").clicked() {
+                    ).on_hover_text("Back to connection screen").clicked() {
                         self.show_logs = false;
                         self.show_preferences = false;
+                        self.show_history = false;
+                        self.show_files = false;
+                        self.show_actions = false;
                         self.refocus_number_input = true;
                     }
-                    if self.host_session_active {
-                        ui.label(RichText::new("●  LIVE SUPPORT")
-                            .strong().size(11.0).color(Color32::from_rgb(190, 51, 65)));
-                    } else if ui.available_width() > 430.0 {
-                        ui.label(RichText::new("Remote support")
-                            .size(12.0).color(Color32::from_rgb(106, 123, 142)));
+                    if !compact_nav {
+                        if self.host_session_active {
+                            ui.label(RichText::new("● LIVE SUPPORT")
+                                .strong().size(10.0).color(Color32::from_rgb(190, 51, 65)));
+                        } else if ui.available_width() > 930.0 {
+                            ui.label(RichText::new("Remote support")
+                                .size(12.0).color(Color32::from_rgb(106, 123, 142)));
+                        }
                     }
                     ui.with_layout(
                         egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -1932,23 +2548,77 @@ impl eframe::App for NexusGuiApp {
                             ).clicked() {
                                 self.start_hosting_clicked();
                             }
-                            if ui_widgets::toolbar_button(
-                                ui, Glyph::Logs, "Logs", self.show_logs, false,
-                            ).clicked() {
-                                self.show_logs = !self.show_logs;
-                                self.show_preferences = false;
-                                if !self.show_logs {
-                                    self.refocus_number_input = true;
-                                }
-                            }
-                            if ui_widgets::toolbar_button(
-                                ui, Glyph::Settings, "Settings", self.show_preferences, false,
-                            ).clicked() {
-                                self.show_preferences = !self.show_preferences;
+
+                            let actions = if compact_nav {
+                                ui_widgets::toolbar_icon_button(ui, Glyph::Actions, "Actions", self.show_actions)
+                            } else {
+                                ui_widgets::toolbar_button(ui, Glyph::Actions, "Actions", self.show_actions, false)
+                            };
+                            if actions.clicked() {
+                                self.show_actions = !self.show_actions;
+                                self.show_files = false;
+                                self.show_history = false;
                                 self.show_logs = false;
-                                if !self.show_preferences {
-                                    self.refocus_number_input = true;
-                                }
+                                self.show_preferences = false;
+                                if !self.show_actions { self.refocus_number_input = true; }
+                            }
+
+                            let files = if compact_nav {
+                                ui_widgets::toolbar_icon_button(ui, Glyph::Files, "Files", self.show_files)
+                            } else {
+                                ui_widgets::toolbar_button(ui, Glyph::Files, "Files", self.show_files, false)
+                            };
+                            if files.clicked() {
+                                self.show_files = !self.show_files;
+                                self.show_actions = false;
+                                self.show_logs = false;
+                                self.show_history = false;
+                                self.show_preferences = false;
+                                if self.show_files {
+                                    self.start_file_action(file_client::Operation::List("".into()));
+                                } else { self.refocus_number_input = true; }
+                            }
+
+                            let recent = if compact_nav {
+                                ui_widgets::toolbar_icon_button(ui, Glyph::Recent, "Recent connections", self.show_history)
+                            } else {
+                                ui_widgets::toolbar_button(ui, Glyph::Recent, "Recent", self.show_history, false)
+                            };
+                            if recent.clicked() {
+                                self.show_history = !self.show_history;
+                                self.show_actions = false;
+                                self.show_files = false;
+                                self.show_logs = false;
+                                self.show_preferences = false;
+                                if !self.show_history { self.refocus_number_input = true; }
+                            }
+
+                            let logs = if compact_nav {
+                                ui_widgets::toolbar_icon_button(ui, Glyph::Logs, "Detailed logs", self.show_logs)
+                            } else {
+                                ui_widgets::toolbar_button(ui, Glyph::Logs, "Logs", self.show_logs, false)
+                            };
+                            if logs.clicked() {
+                                self.show_logs = !self.show_logs;
+                                self.show_actions = false;
+                                self.show_files = false;
+                                self.show_preferences = false;
+                                self.show_history = false;
+                                if !self.show_logs { self.refocus_number_input = true; }
+                            }
+
+                            let settings = if compact_nav {
+                                ui_widgets::toolbar_icon_button(ui, Glyph::Settings, "Settings", self.show_preferences)
+                            } else {
+                                ui_widgets::toolbar_button(ui, Glyph::Settings, "Settings", self.show_preferences, false)
+                            };
+                            if settings.clicked() {
+                                self.show_preferences = !self.show_preferences;
+                                self.show_actions = false;
+                                self.show_files = false;
+                                self.show_logs = false;
+                                self.show_history = false;
+                                if !self.show_preferences { self.refocus_number_input = true; }
                             }
                         });
                 });
@@ -1957,20 +2627,36 @@ impl eframe::App for NexusGuiApp {
             .frame(egui::Frame::none()
                 .fill(Color32::from_rgb(248, 250, 253))
                 .inner_margin(egui::Margin::symmetric(
-                    if ctx.available_rect().width() < 580.0 { 10.0 } else { 24.0 },
-                    16.0,
+                    if ctx.available_rect().width() < 580.0 { 9.0 } else { 17.0 },
+                    8.0,
                 )))
             .show(ctx, |ui| {
-                egui::ScrollArea::vertical().auto_shrink([false, false])
-                    .show(ui, |ui| {
-                        if self.show_preferences {
-                            self.draw_preferences_screen(ui);
-                        } else if self.show_logs {
-                            self.draw_logs_screen(ui);
-                        } else {
-                            self.draw_numeric_home(ui);
-                        }
-                    });
+                let on_home = !(self.show_actions || self.show_files ||
+                    self.show_preferences || self.show_logs || self.show_history);
+                // The default 688×732 startup view has no vertical scrollbar.
+                // Restore scrolling for very small windows and for long lists.
+                let needs_scroll = !on_home || ui.available_height() < 610.0 ||
+                    !self.trust_registry.saved_computers().is_empty();
+                if needs_scroll {
+                    egui::ScrollArea::vertical().auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            if self.show_actions {
+                                self.draw_local_actions_screen(ui);
+                            } else if self.show_files {
+                                self.draw_file_manager(ui);
+                            } else if self.show_preferences {
+                                self.draw_preferences_screen(ui);
+                            } else if self.show_logs {
+                                self.draw_logs_screen(ui);
+                            } else if self.show_history {
+                                self.draw_history_screen(ui);
+                            } else {
+                                self.draw_numeric_home(ui);
+                            }
+                        });
+                } else {
+                    self.draw_numeric_home(ui);
+                }
             });
 
         self.draw_copy_notice(ctx);
@@ -1978,6 +2664,13 @@ impl eframe::App for NexusGuiApp {
         self.draw_host_consent_prompt(ctx);
 
         ctx.request_repaint_after(Duration::from_millis(UI_REPAINT_MS));
+    }
+}
+
+impl Drop for NexusGuiApp {
+    fn drop(&mut self) {
+        self.local_record_stop.store(true, Ordering::Release);
+        self.local_playback_stop.store(true, Ordering::Release);
     }
 }
 
@@ -2066,6 +2759,7 @@ async fn runtime_dispatch_loop(
     runtime_event_tx: mpsc::Sender<RuntimeEvent>,
     ui_bridge: Arc<UiBridge>,
     trust_registry: trusted::TrustRegistry,
+    initial_profile: network_profile::NetworkProfile,
 ) {
     let host_running = Arc::new(AtomicBool::new(false));
     let client_running = Arc::new(AtomicBool::new(false));
@@ -2074,10 +2768,14 @@ async fn runtime_dispatch_loop(
 
     // Spawn STUN network topology diagnostic immediately on startup
     let event_tx_clone = runtime_event_tx.clone();
-    tokio::spawn(async move {
-        let (topology, public_addr) = run_diagnostics(0).await;
-        let _ = event_tx_clone.send(RuntimeEvent::DiagnosticsCompleted { topology, public_addr }).await;
-    });
+    if !initial_profile.is_private() {
+        tokio::spawn(async move {
+            let (topology, public_addr) = run_diagnostics(0).await;
+            let _ = event_tx_clone.send(RuntimeEvent::DiagnosticsCompleted {
+                topology, public_addr
+            }).await;
+        });
+    }
 
     while let Some(command) = runtime_cmd_rx.recv().await {
         match command {
@@ -2133,6 +2831,7 @@ async fn runtime_dispatch_loop(
                 access_id,
                 display_name,
                 remember_host,
+                network_profile,
                 _transport_mode: _,
             } => {
                 if client_running
@@ -2177,16 +2876,17 @@ async fn runtime_dispatch_loop(
 
                     let run_result = async {
                         let _ = event_tx.send(RuntimeEvent::SessionStatus(
-                            "Authenticating short code through public mailbox...".to_string()
+                            format!("Authenticating short code through {}",
+                                network_profile.describe())
                         )).await;
-                        let invitation = short_code::resolve(&access_id).await
-                            .context("public pairing failed")?;
+                        let invitation = short_code::resolve(&access_id, &network_profile).await
+                            .context("selected mailbox pairing failed; no public fallback")?;
                         let _ = event_tx.send(RuntimeEvent::SessionStatus(
                             "Identity verified; starting encrypted QUIC connection".to_string()
                         )).await;
                         run_client_session(
                             invitation, display_name, event_tx.clone(), bridge,
-                            registry, remember_host,
+                            registry, remember_host, network_profile,
                         ).await
                     }.await;
 
@@ -2213,7 +2913,9 @@ async fn runtime_dispatch_loop(
                     }
                 }));
             }
-            RuntimeCommand::ConnectTrusted { endpoint_id, display_name } => {
+            RuntimeCommand::ConnectTrusted {
+                endpoint_id, display_name, network_profile
+            } => {
                 if client_running.compare_exchange(
                     false, true, Ordering::AcqRel, Ordering::Acquire
                 ).is_err() {
@@ -2238,7 +2940,8 @@ async fn runtime_dispatch_loop(
                         ticket: TRUSTED_SESSION_MARKER.to_string(),
                     };
                     let result = run_client_session(
-                        invitation, display_name, event_tx.clone(), bridge, registry, false
+                        invitation, display_name, event_tx.clone(), bridge, registry,
+                        false, network_profile,
                     ).await;
                     running_flag.store(false, Ordering::Release);
                     let _ = event_tx.send(RuntimeEvent::ClientLifecycle {
@@ -2252,11 +2955,21 @@ async fn runtime_dispatch_loop(
                 }));
             }
             RuntimeCommand::RunDiagnostics => {
-                let event_tx = runtime_event_tx.clone();
-                tokio::spawn(async move {
-                    let (topology, public_addr) = run_diagnostics(0).await;
-                    let _ = event_tx.send(RuntimeEvent::DiagnosticsCompleted { topology, public_addr }).await;
-                });
+                // Never probe the public STUN service after a private
+                // infrastructure profile was selected at startup.
+                if initial_profile.is_private() {
+                    let _ = runtime_event_tx.send(RuntimeEvent::SessionStatus(
+                        "Public network diagnostics disabled in private mode".into()
+                    )).await;
+                } else {
+                    let event_tx = runtime_event_tx.clone();
+                    tokio::spawn(async move {
+                        let (topology, public_addr) = run_diagnostics(0).await;
+                        let _ = event_tx.send(RuntimeEvent::DiagnosticsCompleted {
+                            topology, public_addr
+                        }).await;
+                    });
+                }
             }
             RuntimeCommand::StopHosting => {
                 if let Some(task) = host_task.take() {
@@ -2336,7 +3049,7 @@ async fn run_server_session(
     // The private endpoint identity stays local; only its PUBLIC part is
     // exchanged in an authenticated Magic Wormhole pairing.
     let (secret_key, _) = derive_keys_from_seed(&config.seed);
-    let endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::N0)
+    let endpoint = config.network_profile.endpoint_builder()?
         .secret_key(secret_key)
         .alpns(vec![nexus_network::NEXUS_ALPN.to_vec()])
         .bind()
@@ -2346,7 +3059,7 @@ async fn run_server_session(
     'host_pairing: loop {
         let (ready_tx, mut ready_rx) = mpsc::channel(1);
         let pairing = short_code::advertise_and_pair(
-            *node_id.as_bytes(), &ready_tx,
+            *node_id.as_bytes(), &ready_tx, &config.network_profile,
         );
         tokio::pin!(pairing);
         // Never display a randomly fabricated local code: wait for the
@@ -2582,7 +3295,10 @@ async fn run_host_peer_session(
             format!("Trusted technician {} connected; use Stop Sharing to revoke",
                 incoming_auth.requester_id)
         )).await;
-        HostConsentDecision { approved: true, remember_technician: false }
+        HostConsentDecision {
+            approved: true, remember_technician: false, allow_audio: false,
+            allow_files: false,
+        }
     } else {
         request_host_consent(
             remote_addr_str.clone(), &incoming_auth, &runtime_event_tx, &ui_bridge,
@@ -2632,6 +3348,10 @@ async fn run_host_peer_session(
     let _ = runtime_event_tx.send(RuntimeEvent::HostSessionActive {
         active: true
     }).await;
+    let _ = runtime_event_tx.send(RuntimeEvent::ConnectionAuthenticated {
+        peer: format!("technician:{}", hex::encode(&remote_id[..6])),
+        direction: history::Direction::ReceivingHelp,
+    }).await;
 
     let input = Arc::new(InputController::new()?);
     input.set_state(InputSessionState::Active);
@@ -2645,6 +3365,24 @@ async fn run_host_peer_session(
     .await
     .context("failed to send session approval acknowledgement")?;
 
+    let audio_stop = Arc::new(AtomicBool::new(false));
+    let audio_enabled = Arc::new(AtomicBool::new(false));
+    let audio_permission = decision.allow_audio;
+    let services_connection = connection.clone();
+    let audio_stop_for_task = Arc::clone(&audio_stop);
+    let audio_enabled_for_task = Arc::clone(&audio_enabled);
+    let allow_files = decision.allow_files;
+    let mut audio_task = AbortOnDrop(tokio::spawn(async move {
+        if let Err(error) = run_host_service_dispatcher(
+            services_connection, audio_permission, allow_files,
+            audio_stop_for_task, audio_enabled_for_task,
+        ).await {
+            warn!(?error, "remote auxiliary service dispatcher ended");
+        }
+    }));
+    let live_fps = Arc::new(AtomicU16::new(fps));
+    let live_fps_for_control = Arc::clone(&live_fps);
+    let audio_enabled_for_control = Arc::clone(&audio_enabled);
     let session_state_for_control = Arc::clone(&session_state);
     let input_for_control = Arc::clone(&input);
     let inject_input = config.inject_input;
@@ -2683,6 +3421,27 @@ async fn run_host_peer_session(
 
                     // Do not flood the control channel with acknowledgements for
                     // every mouse movement. QUIC already provides reliable delivery.
+                }
+                Ok(ControlMessage::ReleaseAllInputs) => {
+                    if session_state_for_control.is_active() {
+                        input_for_control.release_all();
+                    }
+                }
+                Ok(ControlMessage::SetAudioEnabled { enabled }) => {
+                    if session_state_for_control.is_active() && audio_permission {
+                        audio_enabled_for_control.store(enabled, Ordering::Release);
+                        info!(enabled, "technician audio state changed after host approval");
+                    } else {
+                        warn!("audio requested without explicit remote audio consent");
+                    }
+                }
+                Ok(ControlMessage::SetTargetFps { fps }) => {
+                    if session_state_for_control.is_active() && (1..=60).contains(&fps) {
+                        live_fps_for_control.store(fps, Ordering::Release);
+                        info!(requested_fps = fps, "technician adjusted video rate");
+                    } else {
+                        warn!(fps, "ignored unauthorized or invalid FPS request");
+                    }
                 }
                 Ok(ControlMessage::MouseButtonEvent { button, pressed }) => {
                     if !session_state_for_control.is_active() || !inject_input {
@@ -2752,6 +3511,7 @@ async fn run_host_peer_session(
     let mut control_task_finished = false;
     let mut capture_failures = 0u32;
     let mut pacer = adaptive::AdaptiveFrameRate::new(fps);
+    let mut last_requested_fps = fps;
     let mut delta_encoder = delta::DeltaEncoder::new();
     let mut video_sequence = 0u64;
     let mut last_video_packet = Instant::now();
@@ -2782,6 +3542,14 @@ async fn run_host_peer_session(
                 "SECURITY: blocked frame transmission while session not active"
             );
             continue;
+        }
+
+        let new_fps = live_fps.load(Ordering::Acquire);
+        if last_requested_fps != new_fps {
+            last_requested_fps = new_fps;
+            pacer.set_requested(new_fps);
+            ticker = time::interval(pacer.interval());
+            ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
         }
 
         let started = Instant::now();
@@ -2875,6 +3643,9 @@ async fn run_host_peer_session(
     }
 
     input.set_state(InputSessionState::Inactive);
+    audio_stop.store(true, Ordering::Release);
+    audio_task.0.abort();
+    let _ = (&mut audio_task.0).await;
     let _ = session_state.transition(SessionState::Terminated);
     if let Some(ref c) = quic_conn_to_close {
         c.close(0u32.into(), b"server shutdown");
@@ -2886,6 +3657,258 @@ async fn run_host_peer_session(
     Ok(())
 }
 
+// Audio is isolated from video/control and never runs until the remote
+// person explicitly authorized sound sharing. The client owns the stream:
+// it sends a fixed service name on its own QUIC bidirectional channel.
+struct AudioShutdown(Arc<AtomicBool>);
+impl Drop for AudioShutdown {
+    fn drop(&mut self) { self.0.store(true, Ordering::Release); }
+}
+
+async fn run_host_service_dispatcher(
+    connection: nexus_network::Connection,
+    allow_audio: bool,
+    allow_files: bool,
+    stop: Arc<AtomicBool>,
+    enabled: Arc<AtomicBool>,
+) -> Result<()> {
+    let _shutdown = AudioShutdown(Arc::clone(&stop));
+    let mut children: Vec<AbortOnDrop<()>> = Vec::new();
+    while !stop.load(Ordering::Acquire) {
+        let stream = tokio::select! {
+            result = connection.accept_bi() => result
+                .context("auxiliary connection closed")?,
+            _ = time::sleep(Duration::from_secs(2)) => continue,
+        };
+        let (mut out, mut input) = stream;
+        let label: String = time::timeout(
+            Duration::from_secs(10),
+            recv_message_limited(&mut input, 64),
+        ).await.context("auxiliary service negotiation timed out")??;
+        match label.as_str() {
+            "XLINK-AUDIO-1" => {
+                if children.len() >= 8 { bail!("too many auxiliary channels"); }
+                let enabled = Arc::clone(&enabled);
+                let stop = Arc::clone(&stop);
+                children.push(AbortOnDrop(tokio::spawn(async move {
+                    if let Err(error) = run_host_audio_stream(
+                        out, input, allow_audio, stop, enabled
+                    ).await {
+                        warn!(?error, "audio service ended");
+                    }
+                })));
+            }
+            "XLINK-FILES-1" => {
+                if children.len() >= 8 { bail!("too many auxiliary channels"); }
+                children.push(AbortOnDrop(tokio::spawn(async move {
+                    if let Err(error) = run_host_file_stream(
+                        out, input, allow_files
+                    ).await {
+                        warn!(?error, "file service ended");
+                    }
+                })));
+            }
+            _ => {
+                warn!(%label, "unrecognized auxiliary channel");
+            }
+        }
+        children.retain(|task| !task.0.is_finished());
+    }
+    Ok(())
+}
+
+async fn run_host_file_stream(
+    mut output: SendStream,
+    mut input: RecvStream,
+    approved: bool,
+) -> Result<()> {
+    send_message_limited(&mut output, &approved, 64).await?;
+    if !approved {
+        warn!("file service denied: remote person did not grant file access");
+        return Ok(());
+    }
+    let root = file_service::share_root()?;
+    let mut upload: Option<file_service::Upload> = None;
+    loop {
+        let request: file_service::Request = match time::timeout(
+            Duration::from_secs(90),
+            recv_message_limited(&mut input, file_service::MAX_PACKET_BYTES),
+        ).await {
+            Ok(Ok(request)) => request,
+            Ok(Err(error)) => {
+                info!(?error, "remote file explorer closed");
+                return Ok(());
+            }
+            Err(_) => return Ok(()),
+        };
+        use file_service::{Reply, Request};
+        // A failed operation is a bounded, non-panicking reply. It must never
+        // close the desktop control stream or leak arbitrary local paths.
+        match request {
+            Request::List { path } => {
+                let reply = match file_service::list(&root, &path) {
+                    Ok(items) => Reply::Items { path, items },
+                    Err(error) => Reply::Failed { reason: error.to_string() },
+                };
+                send_message_limited(&mut output, &reply, file_service::MAX_PACKET_BYTES).await?;
+            }
+            Request::Delete { path } => {
+                let reply = match file_service::delete(&root, &path) {
+                    Ok(()) => Reply::Done,
+                    Err(error) => Reply::Failed { reason: error.to_string() },
+                };
+                send_message_limited(&mut output, &reply, file_service::MAX_PACKET_BYTES).await?;
+            }
+            Request::Move { from, to } => {
+                let reply = match file_service::move_item(&root, &from, &to) {
+                    Ok(()) => Reply::Done,
+                    Err(error) => Reply::Failed { reason: error.to_string() },
+                };
+                send_message_limited(&mut output, &reply, file_service::MAX_PACKET_BYTES).await?;
+            }
+            Request::Copy { from, to } => {
+                let reply = match file_service::copy_item(&root, &from, &to) {
+                    Ok(()) => Reply::Done,
+                    Err(error) => Reply::Failed { reason: error.to_string() },
+                };
+                send_message_limited(&mut output, &reply, file_service::MAX_PACKET_BYTES).await?;
+            }
+            Request::Mkdir { path } => {
+                let reply = match file_service::create_folder(&root, &path) {
+                    Ok(()) => Reply::Done,
+                    Err(error) => Reply::Failed { reason: error.to_string() },
+                };
+                send_message_limited(&mut output, &reply, file_service::MAX_PACKET_BYTES).await?;
+            }
+            Request::UploadBegin { path, size, sha256 } => {
+                let reply = match file_service::Upload::new(&root, &path, size, sha256) {
+                    Ok(new_upload) => {
+                        upload = Some(new_upload);
+                        Reply::Done
+                    }
+                    Err(error) => Reply::Failed { reason: error.to_string() },
+                };
+                send_message_limited(&mut output, &reply, file_service::MAX_PACKET_BYTES).await?;
+            }
+            Request::UploadChunk { data } => {
+                let reply = match upload.as_mut() {
+                    Some(file) => match file.append(&data) {
+                        Ok(completed) => Reply::Progress {
+                            completed, total: completed.max(1),
+                        },
+                        Err(error) => Reply::Failed { reason: error.to_string() },
+                    },
+                    None => Reply::Failed { reason: "no active upload".into() },
+                };
+                send_message_limited(&mut output, &reply, file_service::MAX_PACKET_BYTES).await?;
+            }
+            Request::UploadFinish => {
+                let reply = match upload.take() {
+                    Some(file) => match file.finish() {
+                        Ok(()) => Reply::Done,
+                        Err(error) => Reply::Failed { reason: error.to_string() },
+                    },
+                    None => Reply::Failed { reason: "no active upload".into() },
+                };
+                send_message_limited(&mut output, &reply, file_service::MAX_PACKET_BYTES).await?;
+            }
+            Request::Download { path } => {
+                // Download is streamed in bounded chunks on this independent
+                // channel. No file bytes are ever allocated as one Vec.
+                let resolved = file_service::rooted_path(&root, &path);
+                let metadata = file_service::hash_file(&root, &path);
+                match (resolved, metadata) {
+                    (Ok(path), Ok((size, sha256))) => {
+                        send_message_limited(&mut output, &Reply::Meta {
+                            size, sha256,
+                        }, file_service::MAX_PACKET_BYTES).await?;
+                        use std::io::Read;
+                        let mut file = std::fs::File::open(path)?;
+                        let mut chunk = vec![0u8; file_service::BLOCK_BYTES];
+                        loop {
+                            let n = file.read(&mut chunk)?;
+                            if n == 0 { break; }
+                            send_message_limited(&mut output, &Reply::Data {
+                                bytes: chunk[..n].to_vec(),
+                            }, file_service::MAX_PACKET_BYTES).await?;
+                        }
+                        send_message_limited(&mut output, &Reply::Done, file_service::MAX_PACKET_BYTES).await?;
+                    }
+                    (_, Err(error)) | (Err(error), _) => {
+                        send_message_limited(&mut output, &Reply::Failed {
+                            reason: error.to_string(),
+                        }, file_service::MAX_PACKET_BYTES).await?;
+                    }
+                }
+            }
+        }
+    }
+}
+
+async fn run_host_audio_stream(
+    mut audio_s: SendStream,
+    _audio_r: RecvStream,
+    approved: bool,
+    stop: Arc<AtomicBool>,
+    enabled: Arc<AtomicBool>,
+) -> Result<()> {
+    send_message_limited(&mut audio_s, &approved, 64).await?;
+    if !approved { return Ok(()); }
+    let samples = audio::spawn_loopback_capture(Arc::clone(&stop))?;
+    while !stop.load(Ordering::Acquire) {
+        match samples.try_recv() {
+            Ok(chunk) if enabled.load(Ordering::Acquire) => {
+                audio::validate_chunk(&chunk)?;
+                time::timeout(
+                    Duration::from_secs(2),
+                    send_message_limited(&mut audio_s, &chunk, audio::MAX_CHUNK + 128)
+                ).await.context("audio transport is too slow")??;
+            }
+            Ok(_) => {}
+            Err(std::sync::mpsc::TryRecvError::Empty) => {
+                time::sleep(Duration::from_millis(7)).await;
+            }
+            Err(std::sync::mpsc::TryRecvError::Disconnected) =>
+                bail!("Windows loopback audio capture stopped"),
+        }
+    }
+    Ok(())
+}
+
+async fn run_client_audio_service(
+    connection: nexus_network::Connection,
+    stop: Arc<AtomicBool>,
+) -> Result<()> {
+    let _shutdown = AudioShutdown(Arc::clone(&stop));
+    let (mut audio_s, mut audio_r) = connection.open_bi().await
+        .context("failed to open isolated QUIC audio channel")?;
+    send_message_limited(&mut audio_s, &"XLINK-AUDIO-1", 64).await?;
+    let approved: bool = time::timeout(
+        Duration::from_secs(15), recv_message_limited(&mut audio_r, 64)
+    ).await.context("Host audio permission response timed out")??;
+    if !approved {
+        info!("Remote computer did not approve audio; silence enforced");
+        return Ok(());
+    }
+    let sink = audio::spawn_playback(Arc::clone(&stop))?;
+    while !stop.load(Ordering::Acquire) {
+        let chunk: Vec<u8> = match time::timeout(
+            Duration::from_secs(20),
+            recv_message_limited(&mut audio_r, audio::MAX_CHUNK + 128),
+        ).await {
+            Ok(Ok(chunk)) => chunk,
+            Ok(Err(error)) => return Err(error).context("audio stream ended"),
+            Err(_) => continue, // Silence is normal; no background polling.
+        };
+        audio::validate_chunk(&chunk)?;
+        if sink.try_send(chunk).is_err() {
+            // Stale audio packets are dropped; QUIC video priority is unaffected.
+            tracing::debug!("dropping queued audio to maintain low latency");
+        }
+    }
+    Ok(())
+}
+
 async fn run_client_session(
     invitation: short_code::Invitation,
     display_name: Option<String>,
@@ -2893,15 +3916,16 @@ async fn run_client_session(
     ui_bridge: Arc<UiBridge>,
     trust_registry: trusted::TrustRegistry,
     remember_host: bool,
+    network_profile: network_profile::NetworkProfile,
 ) -> Result<()> {
     let remote_id = iroh::PublicKey::from_bytes(&invitation.endpoint_id)
         .context("connection ID is not a valid endpoint public key")?;
     let session_id = invitation.ticket;
 
     // Create client endpoint
-    let endpoint = create_client_endpoint_with_secret(
-        SecretKey::from_bytes(&trust_registry.technician_seed()?),
-    ).await?;
+    let endpoint = network_profile.endpoint_builder()?
+        .secret_key(SecretKey::from_bytes(&trust_registry.technician_seed()?))
+        .bind().await.context("failed to create selected infrastructure endpoint")?;
 
     // N0 provides endpoint discovery, NAT traversal and managed relay fallback.
     // Avoid pinning a guessed relay hostname that may not be the host's actual home relay.
@@ -2909,7 +3933,7 @@ async fn run_client_session(
     let mut last_connect_error = String::from("no connection attempt completed");
     let mut connection = None;
     for attempt in 0..3u32 {
-        let target_addr = EndpointAddr::new(remote_id.clone());
+        let target_addr = network_profile.target(remote_id.clone())?;
         match time::timeout(HANDSHAKE_TIMEOUT, connect_to_peer(&endpoint, target_addr)).await {
             Ok(Ok(connected)) => {
                 connection = Some(connected);
@@ -3000,6 +4024,10 @@ async fn run_client_session(
             Duration::from_secs(210), wait_for_session_consent(&control_recv)
         ).await.context("waiting for host consent timed out")??;
         session_state.transition(SessionState::Active)?;
+        let _ = runtime_event_tx.send(RuntimeEvent::ConnectionAuthenticated {
+            peer: format!("host:{}", hex::encode(&invitation.endpoint_id[..6])),
+            direction: history::Direction::Helping,
+        }).await;
         if enrollment_confirmed && remember_host {
             // A successful encrypted QUIC session AND an explicit Host
             // enrollment acknowledgement are required before saving a device.
@@ -3023,13 +4051,33 @@ async fn run_client_session(
             .await.context("approved session did not start its video stream")?
             .context("server failed to provide a video stream")?;
         let frame_recv = FrameReceiver(Arc::new(tokio::sync::Mutex::new(frame_r)));
+        let _ = runtime_event_tx.send(
+            RuntimeEvent::ClientServiceConnection(connection.clone())
+        ).await;
+
+        let client_audio_stop = Arc::new(AtomicBool::new(false));
+        let client_audio_connection = connection.clone();
+        let client_audio_shutdown = Arc::clone(&client_audio_stop);
+        let mut client_audio_task = AbortOnDrop(tokio::spawn(async move {
+            if let Err(error) = run_client_audio_service(
+                client_audio_connection, client_audio_shutdown,
+            ).await {
+                warn!(?error, "audio playback channel ended");
+            }
+        }));
 
         let (viewer_frame_tx, mut viewer_input_rx) =
             spawn_remote_viewer("NexusP2P - Remote Session [Active]")?;
 
         let session_state_for_input = Arc::clone(&session_state);
         let control_send_clone = control_send.clone();
+        let event_tx_for_screenshots = runtime_event_tx.clone();
         let mut input_task = AbortOnDrop(tokio::spawn(async move {
+            let mut audio_playing = false;
+            let mut recording: Option<actions::Recorder> = None;
+            let mut saved_action_path: Option<PathBuf> = None;
+            let playback_stop = Arc::new(AtomicBool::new(false));
+            let mut playback_task: Option<AbortOnDrop<()>> = None;
             while let Some(event) = viewer_input_rx.recv().await {
                 if !session_state_for_input.is_active() {
                     error!(
@@ -3039,6 +4087,179 @@ async fn run_client_session(
                     continue;
                 }
 
+                // Macro playback can emit hundreds of input events, but is
+                // allowed only within an explicitly authorized QUIC session.
+                match &event {
+                    ViewerInputEvent::OpenFileManager => {
+                        let _ = event_tx_for_screenshots.send(
+                            RuntimeEvent::OpenFileManager
+                        ).await;
+                        continue;
+                    }
+                    ViewerInputEvent::ToggleAudio => {
+                        audio_playing = !audio_playing;
+                        if let Err(error) = control_send_clone.send_control(
+                            &ControlMessage::SetAudioEnabled {
+                                enabled: audio_playing
+                            }
+                        ).await {
+                            warn!(?error, "unable to toggle remote audio");
+                        }
+                        let _ = event_tx_for_screenshots.send(
+                            RuntimeEvent::SessionStatus(format!(
+                                "Remote sound {} (requires Host audio consent)",
+                                if audio_playing { "requested ON" } else { "muted" }
+                            ))
+                        ).await;
+                        continue;
+                    }
+                    ViewerInputEvent::ActionRecordStart => {
+                        if recording.is_some() || playback_task.is_some() {
+                            let _ = event_tx_for_screenshots.send(
+                                RuntimeEvent::SessionStatus("Stop existing recording/replay first".into())
+                            ).await;
+                            continue;
+                        }
+                        match actions::Recorder::start() {
+                            Ok(started) => {
+                                recording = Some(started);
+                                let _ = event_tx_for_screenshots.send(
+                                    RuntimeEvent::SessionStatus(
+                                        "ACTION RECORDING ACTIVE — F5 to stop".to_string()
+                                    )
+                                ).await;
+                            }
+                            Err(error) => warn!(?error, "cannot start action recorder"),
+                        }
+                        continue;
+                    }
+                    ViewerInputEvent::ActionRecordStop => {
+                        if let Some(recorder) = recording.take() {
+                            match recorder.finish() {
+                                Ok((path, count)) => {
+                                    let msg = format!(
+                                        "Recorded {count} actions to {}. F6 to replay",
+                                        path.display()
+                                    );
+                                    saved_action_path = Some(path);
+                                    let _ = event_tx_for_screenshots.send(
+                                        RuntimeEvent::SessionStatus(msg)
+                                    ).await;
+                                }
+                                Err(error) => warn!(?error, "cannot finish action recording"),
+                            }
+                        }
+                        continue;
+                    }
+                    ViewerInputEvent::ActionStopPlayback => {
+                        playback_stop.store(true, Ordering::Release);
+                        playback_task.take(); // AbortOnDrop aborts current playback.
+                        let _ = control_send_clone.send_control(
+                            &ControlMessage::ReleaseAllInputs
+                        ).await;
+                        let _ = event_tx_for_screenshots.send(
+                            RuntimeEvent::SessionStatus("Action playback stopped".into())
+                        ).await;
+                        continue;
+                    }
+                    ViewerInputEvent::ActionReplay { repetitions }
+                    | ViewerInputEvent::ActionReplayFile { repetitions } => {
+                        if recording.is_some() {
+                            let _ = event_tx_for_screenshots.send(
+                                RuntimeEvent::SessionStatus(
+                                    "Stop recording before replay".into()
+                                )
+                            ).await;
+                            continue;
+                        }
+                        playback_stop.store(true, Ordering::Release);
+                        playback_task.take();
+                        let _ = control_send_clone.send_control(
+                            &ControlMessage::ReleaseAllInputs
+                        ).await;
+                        // File-based actions are portable across XLINK machines.
+                        // File dialog is explicit: do not open the last recording silently.
+                        let path = if matches!(&event,
+                            ViewerInputEvent::ActionReplayFile { .. }) {
+                            tokio::task::spawn_blocking(|| {
+                                rfd::FileDialog::new()
+                                    .add_filter("XLINK actions", &["xlaction"])
+                                    .pick_file()
+                            }).await.unwrap_or(None)
+                        } else {
+                            saved_action_path.clone()
+                        };
+                        if let Some(path) = path {
+                            if let Err(error) = actions::inspect(&path) {
+                                let _ = event_tx_for_screenshots.send(
+                                    RuntimeEvent::Error(format!(
+                                        "Invalid action recording: {error}"
+                                    ))
+                                ).await;
+                                continue;
+                            }
+                            playback_stop.store(false, Ordering::Release);
+                            let stop = Arc::clone(&playback_stop);
+                            let sender = control_send_clone.clone();
+                            let events = event_tx_for_screenshots.clone();
+                            let play_path = path.clone();
+                            // The replay count must be copied out of the borrowed UI
+                            // event before entering the 'static task.
+                            let replay_count = *repetitions;
+                            playback_task = Some(AbortOnDrop(tokio::spawn(async move {
+                                let result = actions::replay(
+                                    &play_path, replay_count, &stop, |action| {
+                                        let sender = sender.clone();
+                                        async move {
+                                            let message = match action {
+                                                actions::Action::Move { x_norm, y_norm } =>
+                                                    ControlMessage::SimulatedMouseMove {
+                                                        x_norm, y_norm
+                                                    },
+                                                actions::Action::Button { button, pressed } =>
+                                                    ControlMessage::MouseButtonEvent {
+                                                        button, pressed
+                                                    },
+                                                actions::Action::Key { virtual_key, pressed } =>
+                                                    ControlMessage::SimulatedKeyEvent {
+                                                        virtual_key, pressed
+                                                    },
+                                            };
+                                            sender.send_control(&message).await
+                                        }
+                                    }
+                                ).await;
+                                let _ = sender.send_control(
+                                    &ControlMessage::ReleaseAllInputs
+                                ).await;
+                                let message = match result {
+                                    Ok(count) => format!(
+                                        "Action playback finished: {count} events"
+                                    ),
+                                    Err(error) => format!("Action playback failed: {error}"),
+                                };
+                                let _ = events.send(
+                                    RuntimeEvent::SessionStatus(message)
+                                ).await;
+                            })));
+                            let _ = event_tx_for_screenshots.send(
+                                RuntimeEvent::SessionStatus(format!(
+                                    "Action playback started: {} (F4 to stop)",
+                                    path.display(),
+                                ))
+                            ).await;
+                        } else {
+                            let _ = event_tx_for_screenshots.send(
+                                RuntimeEvent::SessionStatus(
+                                    "No action file selected / recording available".into()
+                                )
+                            ).await;
+                        }
+                        continue;
+                    }
+                    _ => {}
+                }
+
                 let message = match event {
                     ViewerInputEvent::MouseMove { x_norm, y_norm } => {
                         ControlMessage::SimulatedMouseMove { x_norm, y_norm }
@@ -3046,15 +4267,70 @@ async fn run_client_session(
                     ViewerInputEvent::MouseButton { button, pressed } => {
                         ControlMessage::MouseButtonEvent { button, pressed }
                     }
-                    ViewerInputEvent::Keyboard {
-                        virtual_key,
-                        pressed,
-                    } => ControlMessage::SimulatedKeyEvent {
-                        virtual_key,
-                        pressed,
-                    },
+                    ViewerInputEvent::Keyboard { virtual_key, pressed } => {
+                        ControlMessage::SimulatedKeyEvent { virtual_key, pressed }
+                    }
+                    ViewerInputEvent::SetFrameRate(fps) => {
+                        ControlMessage::SetTargetFps { fps }
+                    }
+                    ViewerInputEvent::ToggleAudio
+                    | ViewerInputEvent::OpenFileManager => continue,
+                    ViewerInputEvent::ActionRecordStart
+                    | ViewerInputEvent::ActionRecordStop
+                    | ViewerInputEvent::ActionReplay { .. }
+                    | ViewerInputEvent::ActionReplayFile { .. }
+                    | ViewerInputEvent::ActionStopPlayback => continue,
+                    ViewerInputEvent::ScreenshotRemote(frame) => {
+                        let status = event_tx_for_screenshots.clone();
+                        tokio::task::spawn_blocking(move || {
+                            let msg = match screenshot::capture_remote(frame) {
+                                Ok(path) => format!(
+                                    "Remote screenshot saved to {} and clipboard", path.display()
+                                ),
+                                Err(error) => format!("Remote screenshot error: {error}"),
+                            };
+                            let _ = status.blocking_send(RuntimeEvent::SessionStatus(msg));
+                        });
+                        continue;
+                    }
+                    ViewerInputEvent::ScreenshotLocal => {
+                        let status = event_tx_for_screenshots.clone();
+                        tokio::task::spawn_blocking(move || {
+                            let msg = match screenshot::capture_local() {
+                                Ok(path) => format!(
+                                    "Local screenshot saved to {} and clipboard", path.display()
+                                ),
+                                Err(error) => format!("Local screenshot error: {error}"),
+                            };
+                            let _ = status.blocking_send(RuntimeEvent::SessionStatus(msg));
+                        });
+                        continue;
+                    }
                 };
 
+                if let Some(recorder) = recording.as_mut() {
+                    let event = match &message {
+                        ControlMessage::SimulatedMouseMove { x_norm, y_norm } =>
+                            Some(actions::Action::Move {
+                                x_norm: *x_norm, y_norm: *y_norm,
+                            }),
+                        ControlMessage::MouseButtonEvent { button, pressed } =>
+                            Some(actions::Action::Button {
+                                button: *button, pressed: *pressed,
+                            }),
+                        ControlMessage::SimulatedKeyEvent { virtual_key, pressed } =>
+                            Some(actions::Action::Key {
+                                virtual_key: *virtual_key, pressed: *pressed,
+                            }),
+                        _ => None,
+                    };
+                    if let Some(event) = event {
+                        if let Err(error) = recorder.push(event) {
+                            warn!(?error, "recording write failed; stopping capture");
+                            recording.take();
+                        }
+                    }
+                }
                 if let Err(error) = control_send_clone.send_control(&message).await {
                     warn!(?error, "failed to forward viewer input event");
                     break;
@@ -3139,6 +4415,9 @@ async fn run_client_session(
             }
         }
 
+        client_audio_stop.store(true, Ordering::Release);
+        client_audio_task.0.abort();
+        let _ = (&mut client_audio_task.0).await;
         let _ = session_state.transition(SessionState::Terminated);
         if let Some(ref c) = quic_conn_to_close {
             c.close(0u32.into(), b"client shutdown");
@@ -3208,7 +4487,10 @@ async fn request_host_consent(
         }
         if matches!(normalized.as_str(), "0" | "false" | "no" | "n") {
             warn!("NEXUS_AUTO_CONSENT enabled: auto-denying consent for this session");
-            return Ok(HostConsentDecision { approved: false, remember_technician: false });
+            return Ok(HostConsentDecision {
+                approved: false, remember_technician: false, allow_audio: false,
+                allow_files: false,
+            });
         }
     }
 

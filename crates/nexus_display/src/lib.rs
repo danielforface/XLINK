@@ -1,6 +1,6 @@
 use anyhow::{anyhow, Context, Result};
 use bytes::Bytes;
-use minifb::{Key, KeyRepeat, MouseButton, MouseMode, Window, WindowOptions};
+use minifb::{Key, KeyRepeat, Menu, MouseButton, MouseMode, ScaleMode, Window, WindowOptions};
 use std::thread;
 use tokio::sync::mpsc::{self, Receiver, Sender};
 use windows::core::{ComInterface, Error as WindowsError};
@@ -53,6 +53,16 @@ pub enum ViewerInputEvent {
     MouseMove { x_norm: f32, y_norm: f32 },
     MouseButton { button: u8, pressed: bool },
     Keyboard { virtual_key: u16, pressed: bool },
+    ScreenshotRemote(ViewerFrame),
+    ScreenshotLocal,
+    SetFrameRate(u16),
+    ToggleAudio,
+    OpenFileManager,
+    ActionRecordStart,
+    ActionRecordStop,
+    ActionReplay { repetitions: Option<u32> },
+    ActionReplayFile { repetitions: Option<u32> },
+    ActionStopPlayback,
 }
 
 impl ScreenCapturer {
@@ -361,13 +371,21 @@ fn run_remote_viewer(
 
     let mut width = latest_frame.width.max(1) as usize;
     let mut height = latest_frame.height.max(1) as usize;
-    let mut window = Window::new(title, width, height, WindowOptions::default())
-        .map_err(|error| anyhow!("failed to create remote viewer window: {error}"))?;
+    let mut window = Window::new(title, width, height, WindowOptions {
+        resize: true,
+        scale_mode: ScaleMode::AspectRatioStretch,
+        ..WindowOptions::default()
+    }).map_err(|error| anyhow!("failed to create remote viewer window: {error}"))?;
     window.set_target_fps(60);
+    attach_session_menu(&mut window)?;
 
     let mut pixel_buffer = vec![0_u32; width * height];
     let mut last_mouse_absolute: Option<(u16, u16)> = None;
     let mut last_buttons = [false; 3];
+    let mut fullscreen = None;
+    let mut desired_fps = 30u16;
+    let mut sound_enabled = false;
+    let mut recording = false;
 
     loop {
         if !window.is_open() {
@@ -390,13 +408,138 @@ fn run_remote_viewer(
             width = latest_frame.width.max(1) as usize;
             height = latest_frame.height.max(1) as usize;
             pixel_buffer.resize(width * height, 0_u32);
-            window = Window::new(title, width, height, WindowOptions::default())
-                .map_err(|error| anyhow!("failed to rebuild remote viewer window: {error}"))?;
+            window = Window::new(title, width, height, WindowOptions {
+                resize: true,
+                scale_mode: ScaleMode::AspectRatioStretch,
+                ..WindowOptions::default()
+            }).map_err(|error| anyhow!("failed to rebuild remote viewer window: {error}"))?;
             window.set_target_fps(60);
+            attach_session_menu(&mut window)?;
             last_mouse_absolute = None;
             last_buttons = [false; 3];
         }
 
+        // A native always-visible menu exposes the actual viewer controls.
+        // F-key shortcuts remain available in full-screen mode.
+        match window.is_menu_pressed() {
+            Some(1) => {
+                if let Err(error) = toggle_native_fullscreen(
+                    window.get_window_handle(), &mut fullscreen
+                ) {
+                    eprintln!("cannot toggle full-screen viewer: {error:#}");
+                }
+            }
+            Some(2) => {
+                let _ = input_tx.blocking_send(
+                    ViewerInputEvent::ScreenshotRemote(latest_frame.clone())
+                );
+            }
+            Some(3) => { let _ = input_tx.blocking_send(ViewerInputEvent::ScreenshotLocal); }
+            Some(4) => {
+                desired_fps = desired_fps.saturating_sub(5).max(1);
+                let _ = input_tx.blocking_send(ViewerInputEvent::SetFrameRate(desired_fps));
+            }
+            Some(5) => {
+                desired_fps = desired_fps.saturating_add(5).min(60);
+                let _ = input_tx.blocking_send(ViewerInputEvent::SetFrameRate(desired_fps));
+            }
+            Some(6) => {
+                recording = !recording;
+                let _ = input_tx.blocking_send(if recording {
+                    ViewerInputEvent::ActionRecordStart
+                } else {
+                    ViewerInputEvent::ActionRecordStop
+                });
+            }
+            Some(7) => { let _ = input_tx.blocking_send(
+                ViewerInputEvent::ActionReplay { repetitions: Some(1) }
+            ); }
+            Some(8) => { let _ = input_tx.blocking_send(
+                ViewerInputEvent::ActionReplay { repetitions: Some(5) }
+            ); }
+            Some(9) => { let _ = input_tx.blocking_send(
+                ViewerInputEvent::ActionReplay { repetitions: None }
+            ); }
+            Some(10) => { let _ = input_tx.blocking_send(
+                ViewerInputEvent::ActionStopPlayback
+            ); }
+            Some(13) => { let _ = input_tx.blocking_send(
+                ViewerInputEvent::OpenFileManager
+            ); }
+            Some(12) => { sound_enabled = !sound_enabled; let _ = input_tx.blocking_send(
+                ViewerInputEvent::ToggleAudio
+            ); }
+            Some(11) => { let _ = input_tx.blocking_send(
+                ViewerInputEvent::ActionReplayFile { repetitions: Some(1) }
+            ); }
+            _ => {}
+        }
+        if window.is_key_pressed(Key::F12, KeyRepeat::No) {
+            let _ = input_tx.blocking_send(ViewerInputEvent::OpenFileManager);
+        }
+        if window.is_key_pressed(Key::F2, KeyRepeat::No) {
+            sound_enabled = !sound_enabled;
+            let _ = input_tx.blocking_send(ViewerInputEvent::ToggleAudio);
+            window.set_title(&format!("{title} | Audio {}", if sound_enabled {"ON"} else {"OFF"}));
+        }
+        if window.is_key_pressed(Key::F5, KeyRepeat::No) {
+            recording = !recording;
+            let event = if recording {
+                ViewerInputEvent::ActionRecordStart
+            } else {
+                ViewerInputEvent::ActionRecordStop
+            };
+            let _ = input_tx.blocking_send(event);
+            window.set_title(&format!(
+                "{} | {} | F11 Fullscreen",
+                title, if recording { "REC ●" } else { "Recording stopped" }
+            ));
+        }
+        if window.is_key_pressed(Key::F6, KeyRepeat::No) {
+            let repeated = if window.is_key_down(Key::LeftShift)
+                || window.is_key_down(Key::RightShift) {
+                None
+            } else if window.is_key_down(Key::LeftCtrl)
+                || window.is_key_down(Key::RightCtrl) {
+                Some(5)
+            } else { Some(1) };
+            let _ = input_tx.blocking_send(
+                ViewerInputEvent::ActionReplay { repetitions: repeated },
+            );
+        }
+        if window.is_key_pressed(Key::F3, KeyRepeat::No) {
+            let _ = input_tx.blocking_send(
+                ViewerInputEvent::ActionReplayFile { repetitions: Some(1) },
+            );
+        }
+        if window.is_key_pressed(Key::F4, KeyRepeat::No) {
+            let _ = input_tx.blocking_send(ViewerInputEvent::ActionStopPlayback);
+        }
+        if window.is_key_pressed(Key::F11, KeyRepeat::No) {
+            if let Err(error) = toggle_native_fullscreen(
+                window.get_window_handle(), &mut fullscreen
+            ) {
+                eprintln!("cannot toggle full-screen viewer: {error:#}");
+            }
+        }
+        if window.is_key_pressed(Key::F9, KeyRepeat::No) {
+            let _ = input_tx.blocking_send(ViewerInputEvent::ScreenshotRemote(
+                latest_frame.clone()
+            ));
+        }
+        if window.is_key_pressed(Key::F10, KeyRepeat::No) {
+            let _ = input_tx.blocking_send(ViewerInputEvent::ScreenshotLocal);
+        }
+        if window.is_key_pressed(Key::F7, KeyRepeat::No) {
+            desired_fps = desired_fps.saturating_sub(5).max(1);
+            let _ = input_tx.try_send(ViewerInputEvent::SetFrameRate(desired_fps));
+            window.set_title(&format!("{title} | {} FPS | F11 Fullscreen", desired_fps));
+        }
+        if window.is_key_pressed(Key::F8, KeyRepeat::No) {
+            desired_fps = desired_fps.saturating_add(5).min(60);
+            let _ = input_tx.try_send(ViewerInputEvent::SetFrameRate(desired_fps));
+            window.set_title(&format!("{title} | {} FPS | F11 Fullscreen", desired_fps));
+        }
         copy_bgra_into_u32(&latest_frame, &mut pixel_buffer)?;
         capture_window_input(&window, width, height, &input_tx, &mut last_mouse_absolute, &mut last_buttons);
 
@@ -405,6 +548,122 @@ fn run_remote_viewer(
             .map_err(|error| anyhow!("failed to present frame: {error}"))?;
     }
 
+    Ok(())
+}
+
+fn attach_session_menu(window: &mut Window) -> Result<()> {
+    let mut session = Menu::new("Session")
+        .map_err(|e| anyhow!("cannot create viewer session menu: {e}"))?;
+    session.add_item("Full screen (F11)", 1).build();
+    window.add_menu(&session);
+
+    let mut image = Menu::new("Capture")
+        .map_err(|e| anyhow!("cannot create Capture menu: {e}"))?;
+    image.add_item("Remote screenshot (F9)", 2).build();
+    image.add_item("My desktop screenshot (F10)", 3).build();
+    window.add_menu(&image);
+
+    let mut performance = Menu::new("Performance")
+        .map_err(|e| anyhow!("cannot create Performance menu: {e}"))?;
+    performance.add_item("Reduce FPS (F7)", 4).build();
+    performance.add_item("Increase FPS (F8)", 5).build();
+    window.add_menu(&performance);
+
+    let mut files = Menu::new("Files")
+        .map_err(|e| anyhow!("cannot create Files menu: {e}"))?;
+    files.add_item("Open two-pane file explorer (F12)", 13).build();
+    window.add_menu(&files);
+
+    let mut sound = Menu::new("Sound")
+        .map_err(|e| anyhow!("cannot create Sound menu: {e}"))?;
+    sound.add_item("Toggle remote sound (F2)", 12).build();
+    window.add_menu(&sound);
+
+    let mut actions = Menu::new("Actions")
+        .map_err(|e| anyhow!("cannot create Actions menu: {e}"))?;
+    actions.add_item("Start/stop recording (F5)", 6).build();
+    actions.add_item("Replay once (F6)", 7).build();
+    actions.add_item("Replay five times (Ctrl+F6)", 8).build();
+    actions.add_item("Loop until stopped (Shift+F6)", 9).build();
+    actions.add_item("Stop playback (F4)", 10).build();
+    actions.add_item("Replay action file (F3)", 11).build();
+    window.add_menu(&actions);
+    Ok(())
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+struct NativeRect { left: i32, top: i32, right: i32, bottom: i32 }
+
+#[repr(C)]
+struct NativeMonitorInfo {
+    size: u32,
+    monitor: NativeRect,
+    work: NativeRect,
+    flags: u32,
+}
+
+#[link(name = "user32")]
+extern "system" {
+    fn GetWindowLongPtrW(hwnd: *mut std::ffi::c_void, index: i32) -> isize;
+    fn SetWindowLongPtrW(hwnd: *mut std::ffi::c_void, index: i32, value: isize) -> isize;
+    fn GetWindowRect(hwnd: *mut std::ffi::c_void, rect: *mut NativeRect) -> i32;
+    fn MonitorFromWindow(hwnd: *mut std::ffi::c_void, flags: u32) -> *mut std::ffi::c_void;
+    fn GetMonitorInfoW(monitor: *mut std::ffi::c_void, info: *mut NativeMonitorInfo) -> i32;
+    fn SetWindowPos(
+        hwnd: *mut std::ffi::c_void, after: *mut std::ffi::c_void,
+        x: i32, y: i32, width: i32, height: i32, flags: u32,
+    ) -> i32;
+}
+
+fn toggle_native_fullscreen(
+    hwnd: *mut std::ffi::c_void,
+    state: &mut Option<(isize, NativeRect)>,
+) -> Result<()> {
+    const GWL_STYLE: i32 = -16;
+    const WS_OVERLAPPEDWINDOW: isize = 0x00CF0000;
+    const WS_POPUP: isize = 0x80000000u32 as isize;
+    const SWP_FRAMECHANGED: u32 = 0x0020;
+    const SWP_NOZORDER: u32 = 0x0004;
+    const SWP_NOOWNERZORDER: u32 = 0x0200;
+    let flags = SWP_FRAMECHANGED | SWP_NOZORDER | SWP_NOOWNERZORDER;
+    if let Some((style, rect)) = state.take() {
+        unsafe {
+            SetWindowLongPtrW(hwnd, GWL_STYLE, style);
+            SetWindowPos(
+                hwnd, std::ptr::null_mut(),
+                rect.left, rect.top, rect.right - rect.left, rect.bottom - rect.top, flags,
+            );
+        }
+        return Ok(());
+    }
+    let mut rect = NativeRect { left: 0, top: 0, right: 0, bottom: 0 };
+    if unsafe { GetWindowRect(hwnd, &mut rect) } == 0 {
+        return Err(anyhow!("cannot read viewer window bounds"));
+    }
+    let style = unsafe { GetWindowLongPtrW(hwnd, GWL_STYLE) };
+    let monitor = unsafe { MonitorFromWindow(hwnd, 2) };
+    if monitor.is_null() { return Err(anyhow!("cannot locate active monitor")); }
+    let empty = NativeRect { left: 0, top: 0, right: 0, bottom: 0 };
+    let mut info = NativeMonitorInfo {
+        size: std::mem::size_of::<NativeMonitorInfo>() as u32,
+        monitor: empty, work: empty, flags: 0,
+    };
+    if unsafe { GetMonitorInfoW(monitor, &mut info) } == 0 {
+        return Err(anyhow!("cannot query monitor dimensions"));
+    }
+    unsafe {
+        SetWindowLongPtrW(hwnd, GWL_STYLE, (style & !WS_OVERLAPPEDWINDOW) | WS_POPUP);
+        let bounds = info.monitor;
+        if SetWindowPos(
+            hwnd, std::ptr::null_mut(), bounds.left, bounds.top,
+            bounds.right - bounds.left, bounds.bottom - bounds.top, flags,
+        ) == 0 {
+            SetWindowLongPtrW(hwnd, GWL_STYLE, style);
+            return Err(anyhow!("unable to enter borderless fullscreen"));
+        }
+    }
+    *state = Some((style, rect));
     Ok(())
 }
 
@@ -457,8 +716,10 @@ fn capture_window_input(
     last_buttons: &mut [bool; 3],
 ) {
     if let Some((mouse_x, mouse_y)) = window.get_mouse_pos(MouseMode::Discard) {
-        let x_norm = normalize_position(mouse_x, width);
-        let y_norm = normalize_position(mouse_y, height);
+        let (client_w, client_h) = window.get_size();
+        let (x_norm, y_norm) = viewer_coordinates(
+            mouse_x, mouse_y, client_w, client_h, width, height,
+        );
         let absolute = (
             (x_norm * u16::MAX as f32).round() as u16,
             (y_norm * u16::MAX as f32).round() as u16,
@@ -504,6 +765,27 @@ fn capture_window_input(
             });
         }
     }
+}
+
+/// Preserve correct remote mouse placement when a window is enlarged,
+/// maximized, or the desktop has a different aspect ratio.
+fn viewer_coordinates(
+    x: f32, y: f32, win_width: usize, win_height: usize,
+    video_width: usize, video_height: usize,
+) -> (f32, f32) {
+    let ww = win_width.max(1) as f32;
+    let wh = win_height.max(1) as f32;
+    let vw = video_width.max(1) as f32;
+    let vh = video_height.max(1) as f32;
+    let fit = (ww / vw).min(wh / vh);
+    let drawn_w = vw * fit;
+    let drawn_h = vh * fit;
+    let x0 = (ww - drawn_w) * 0.5;
+    let y0 = (wh - drawn_h) * 0.5;
+    (
+        ((x - x0) / drawn_w.max(1.0)).clamp(0.0, 1.0),
+        ((y - y0) / drawn_h.max(1.0)).clamp(0.0, 1.0),
+    )
 }
 
 fn normalize_position(value: f32, max_extent: usize) -> f32 {
@@ -584,6 +866,16 @@ fn desktop_dimensions() -> Option<(u32, u32)> {
 #[cfg(test)]
 mod tests {
     use super::{copy_bgra_into_u32, normalize_position, ViewerFrame};
+
+    #[test]
+    fn full_screen_letterboxing_maps_pointer_correctly() {
+        let (x, y) = super::viewer_coordinates(960.0, 540.0, 1920, 1080, 1280, 720);
+        assert!((x - 0.5).abs() < 0.001);
+        assert!((y - 0.5).abs() < 0.001);
+        let (x, y) = super::viewer_coordinates(100.0, 100.0, 1920, 1200, 1280, 720);
+        assert!(x >= 0.0 && x <= 1.0);
+        assert!(y >= 0.0 && y <= 1.0);
+    }
 
     #[test]
     fn normalize_position_clamps_values() {

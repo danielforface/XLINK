@@ -2,7 +2,7 @@ name: Windows production gate
 
 on:
   push:
-    branches: [main, "feature/public-numeric-pairing-v5"]
+    branches: [main, "feature/public-numeric-pairing-v5", "feature/support-workspace-v6"]
   pull_request:
     branches: [main]
   workflow_dispatch:
