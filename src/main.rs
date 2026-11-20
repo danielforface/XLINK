@@ -1,6 +1,7 @@
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 
 mod adaptive;
+mod actions;
 mod delta;
 mod frame_codec;
 mod history;
@@ -2768,6 +2769,11 @@ async fn run_host_peer_session(
                     // Do not flood the control channel with acknowledgements for
                     // every mouse movement. QUIC already provides reliable delivery.
                 }
+                Ok(ControlMessage::ReleaseAllInputs) => {
+                    if session_state_for_control.is_active() {
+                        input_for_control.release_all();
+                    }
+                }
                 Ok(ControlMessage::SetTargetFps { fps }) => {
                     if session_state_for_control.is_active() && (1..=60).contains(&fps) {
                         live_fps_for_control.store(fps, Ordering::Release);
@@ -3136,6 +3142,10 @@ async fn run_client_session(
         let control_send_clone = control_send.clone();
         let event_tx_for_screenshots = runtime_event_tx.clone();
         let mut input_task = AbortOnDrop(tokio::spawn(async move {
+            let mut recording: Option<actions::Recorder> = None;
+            let mut saved_action_path: Option<PathBuf> = None;
+            let playback_stop = Arc::new(AtomicBool::new(false));
+            let mut playback_task: Option<AbortOnDrop<()>> = None;
             while let Some(event) = viewer_input_rx.recv().await {
                 if !session_state_for_input.is_active() {
                     error!(
@@ -3143,6 +3153,153 @@ async fn run_client_session(
                         "SECURITY: blocked outbound input event while session not active"
                     );
                     continue;
+                }
+
+                // Macro playback can emit hundreds of input events, but is
+                // allowed only within an explicitly authorized QUIC session.
+                match &event {
+                    ViewerInputEvent::ActionRecordStart => {
+                        if recording.is_some() || playback_task.is_some() {
+                            let _ = event_tx_for_screenshots.send(
+                                RuntimeEvent::SessionStatus("Stop existing recording/replay first".into())
+                            ).await;
+                            continue;
+                        }
+                        match actions::Recorder::start() {
+                            Ok(started) => {
+                                recording = Some(started);
+                                let _ = event_tx_for_screenshots.send(
+                                    RuntimeEvent::SessionStatus(
+                                        "ACTION RECORDING ACTIVE — F5 to stop".to_string()
+                                    )
+                                ).await;
+                            }
+                            Err(error) => warn!(?error, "cannot start action recorder"),
+                        }
+                        continue;
+                    }
+                    ViewerInputEvent::ActionRecordStop => {
+                        if let Some(recorder) = recording.take() {
+                            match recorder.finish() {
+                                Ok((path, count)) => {
+                                    let msg = format!(
+                                        "Recorded {count} actions to {}. F6 to replay",
+                                        path.display()
+                                    );
+                                    saved_action_path = Some(path);
+                                    let _ = event_tx_for_screenshots.send(
+                                        RuntimeEvent::SessionStatus(msg)
+                                    ).await;
+                                }
+                                Err(error) => warn!(?error, "cannot finish action recording"),
+                            }
+                        }
+                        continue;
+                    }
+                    ViewerInputEvent::ActionStopPlayback => {
+                        playback_stop.store(true, Ordering::Release);
+                        playback_task.take(); // AbortOnDrop aborts current playback.
+                        let _ = control_send_clone.send_control(
+                            &ControlMessage::ReleaseAllInputs
+                        ).await;
+                        let _ = event_tx_for_screenshots.send(
+                            RuntimeEvent::SessionStatus("Action playback stopped".into())
+                        ).await;
+                        continue;
+                    }
+                    ViewerInputEvent::ActionReplay { repetitions }
+                    | ViewerInputEvent::ActionReplayFile { repetitions } => {
+                        if recording.is_some() {
+                            let _ = event_tx_for_screenshots.send(
+                                RuntimeEvent::SessionStatus(
+                                    "Stop recording before replay".into()
+                                )
+                            ).await;
+                            continue;
+                        }
+                        playback_stop.store(true, Ordering::Release);
+                        playback_task.take();
+                        let _ = control_send_clone.send_control(
+                            &ControlMessage::ReleaseAllInputs
+                        ).await;
+                        // File-based actions are portable across XLINK machines.
+                        // File dialog is explicit: do not open the last recording silently.
+                        let path = if matches!(&event,
+                            ViewerInputEvent::ActionReplayFile { .. }) {
+                            tokio::task::spawn_blocking(|| {
+                                rfd::FileDialog::new()
+                                    .add_filter("XLINK actions", &["xlaction"])
+                                    .pick_file()
+                            }).await.unwrap_or(None)
+                        } else {
+                            saved_action_path.clone()
+                        };
+                        if let Some(path) = path {
+                            if let Err(error) = actions::inspect(&path) {
+                                let _ = event_tx_for_screenshots.send(
+                                    RuntimeEvent::Error(format!(
+                                        "Invalid action recording: {error}"
+                                    ))
+                                ).await;
+                                continue;
+                            }
+                            playback_stop.store(false, Ordering::Release);
+                            let stop = Arc::clone(&playback_stop);
+                            let sender = control_send_clone.clone();
+                            let events = event_tx_for_screenshots.clone();
+                            let play_path = path.clone();
+                            playback_task = Some(AbortOnDrop(tokio::spawn(async move {
+                                let result = actions::replay(
+                                    &play_path, *repetitions, &stop, |action| {
+                                        let sender = sender.clone();
+                                        async move {
+                                            let message = match action {
+                                                actions::Action::Move { x_norm, y_norm } =>
+                                                    ControlMessage::SimulatedMouseMove {
+                                                        x_norm, y_norm
+                                                    },
+                                                actions::Action::Button { button, pressed } =>
+                                                    ControlMessage::MouseButtonEvent {
+                                                        button, pressed
+                                                    },
+                                                actions::Action::Key { virtual_key, pressed } =>
+                                                    ControlMessage::SimulatedKeyEvent {
+                                                        virtual_key, pressed
+                                                    },
+                                            };
+                                            sender.send_control(&message).await
+                                        }
+                                    }
+                                ).await;
+                                let _ = sender.send_control(
+                                    &ControlMessage::ReleaseAllInputs
+                                ).await;
+                                let message = match result {
+                                    Ok(count) => format!(
+                                        "Action playback finished: {count} events"
+                                    ),
+                                    Err(error) => format!("Action playback failed: {error}"),
+                                };
+                                let _ = events.send(
+                                    RuntimeEvent::SessionStatus(message)
+                                ).await;
+                            })));
+                            let _ = event_tx_for_screenshots.send(
+                                RuntimeEvent::SessionStatus(format!(
+                                    "Action playback started: {} (F4 to stop)",
+                                    path.display(),
+                                ))
+                            ).await;
+                        } else {
+                            let _ = event_tx_for_screenshots.send(
+                                RuntimeEvent::SessionStatus(
+                                    "No action file selected / recording available".into()
+                                )
+                            ).await;
+                        }
+                        continue;
+                    }
+                    _ => {}
                 }
 
                 let message = match event {
@@ -3186,6 +3343,29 @@ async fn run_client_session(
                     }
                 };
 
+                if let Some(recorder) = recording.as_mut() {
+                    let event = match &message {
+                        ControlMessage::SimulatedMouseMove { x_norm, y_norm } =>
+                            Some(actions::Action::Move {
+                                x_norm: *x_norm, y_norm: *y_norm,
+                            }),
+                        ControlMessage::MouseButtonEvent { button, pressed } =>
+                            Some(actions::Action::Button {
+                                button: *button, pressed: *pressed,
+                            }),
+                        ControlMessage::SimulatedKeyEvent { virtual_key, pressed } =>
+                            Some(actions::Action::Key {
+                                virtual_key: *virtual_key, pressed: *pressed,
+                            }),
+                        _ => None,
+                    };
+                    if let Some(event) = event {
+                        if let Err(error) = recorder.push(event) {
+                            warn!(?error, "recording write failed; stopping capture");
+                            recording.take();
+                        }
+                    }
+                }
                 if let Err(error) = control_send_clone.send_control(&message).await {
                     warn!(?error, "failed to forward viewer input event");
                     break;
