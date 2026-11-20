@@ -8,6 +8,7 @@ mod frame_codec;
 mod file_service;
 mod file_client;
 mod history;
+mod local_actions;
 mod screenshot;
 mod numeric_entry;
 mod ui_widgets;
@@ -387,6 +388,13 @@ struct NexusGuiApp {
     show_preferences: bool,
     show_history: bool,
     show_files: bool,
+    show_actions: bool,
+    local_record_confirmation: bool,
+    local_record_stop: Arc<AtomicBool>,
+    local_record_handle: Option<std::thread::JoinHandle<Result<(PathBuf, u64)>>>,
+    local_action_file: Option<PathBuf>,
+    local_playback_stop: Arc<AtomicBool>,
+    local_playback_status: Arc<Mutex<String>>,
     recent_history: Option<history::History>,
     client_service_connection: Option<nexus_network::Connection>,
     file_snapshot: Arc<Mutex<FileUiSnapshot>>,
@@ -485,6 +493,13 @@ impl NexusGuiApp {
             show_preferences: false,
             show_history: false,
             show_files: false,
+            show_actions: false,
+            local_record_confirmation: false,
+            local_record_stop: Arc::new(AtomicBool::new(false)),
+            local_record_handle: None,
+            local_action_file: None,
+            local_playback_stop: Arc::new(AtomicBool::new(true)),
+            local_playback_status: Arc::new(Mutex::new("Idle".into())),
             client_service_connection: None,
             file_snapshot: Arc::new(Mutex::new(FileUiSnapshot::default())),
             file_local_folder: std::env::var_os("USERPROFILE")
@@ -2287,6 +2302,7 @@ impl eframe::App for NexusGuiApp {
                         self.show_preferences = false;
                         self.show_history = false;
                         self.show_files = false;
+                        self.show_actions = false;
                         self.refocus_number_input = true;
                     }
                     if self.host_session_active {
@@ -2315,6 +2331,14 @@ impl eframe::App for NexusGuiApp {
                             ).clicked() {
                                 self.start_hosting_clicked();
                             }
+                            if ui.add(egui::Button::new("Actions")).clicked() {
+                                self.show_actions = !self.show_actions;
+                                self.show_files = false;
+                                self.show_history = false;
+                                self.show_logs = false;
+                                self.show_preferences = false;
+                                if !self.show_actions { self.refocus_number_input = true; }
+                            }
                             if ui.add(
                                 egui::Button::new("Files")
                                     .fill(if self.show_files {
@@ -2324,6 +2348,7 @@ impl eframe::App for NexusGuiApp {
                                     }).rounding(Rounding::same(10.0))
                             ).clicked() {
                                 self.show_files = !self.show_files;
+                                self.show_actions = false;
                                 self.show_logs = false;
                                 self.show_history = false;
                                 self.show_preferences = false;
@@ -2343,6 +2368,7 @@ impl eframe::App for NexusGuiApp {
                                     .rounding(Rounding::same(10.0))
                             ).clicked() {
                                 self.show_history = !self.show_history;
+                                self.show_actions = false;
                                 self.show_files = false;
                                 self.show_logs = false;
                                 self.show_preferences = false;
@@ -2352,6 +2378,7 @@ impl eframe::App for NexusGuiApp {
                                 ui, Glyph::Logs, "Logs", self.show_logs, false,
                             ).clicked() {
                                 self.show_logs = !self.show_logs;
+                                self.show_actions = false;
                                 self.show_files = false;
                                 self.show_preferences = false;
                                 self.show_history = false;
@@ -2363,6 +2390,7 @@ impl eframe::App for NexusGuiApp {
                                 ui, Glyph::Settings, "Settings", self.show_preferences, false,
                             ).clicked() {
                                 self.show_preferences = !self.show_preferences;
+                                self.show_actions = false;
                                 self.show_files = false;
                                 self.show_logs = false;
                                 self.show_history = false;
@@ -2383,7 +2411,9 @@ impl eframe::App for NexusGuiApp {
             .show(ctx, |ui| {
                 egui::ScrollArea::vertical().auto_shrink([false, false])
                     .show(ui, |ui| {
-                        if self.show_files {
+                        if self.show_actions {
+                            self.draw_local_actions_screen(ui);
+                        } else if self.show_files {
                             self.draw_file_manager(ui);
                         } else if self.show_preferences {
                             self.draw_preferences_screen(ui);
@@ -2402,6 +2432,13 @@ impl eframe::App for NexusGuiApp {
         self.draw_host_consent_prompt(ctx);
 
         ctx.request_repaint_after(Duration::from_millis(UI_REPAINT_MS));
+    }
+}
+
+impl Drop for NexusGuiApp {
+    fn drop(&mut self) {
+        self.local_record_stop.store(true, Ordering::Release);
+        self.local_playback_stop.store(true, Ordering::Release);
     }
 }
 
