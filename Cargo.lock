@@ -4018,6 +4018,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "wasapi",
  "winreg",
 ]
 
@@ -6781,6 +6782,20 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bfa7760aed19e106de2c7c0b581b509f2f25d3dacaf737cb82ac61bc6d760b0e"
 dependencies = [
  "try-lock",
+]
+
+[[package]]
+name = "wasapi"
+version = "0.20.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ff78ce7daf6c647c89bdf710523e4660ff05800952fdffefe49fe60b04f4b2bd"
+dependencies = [
+ "log",
+ "num-integer",
+ "thiserror 2.0.18",
+ "widestring",
+ "windows 0.62.2",
+ "windows-core 0.62.2",
 ]
 
 [[package]]
