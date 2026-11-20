@@ -5,6 +5,7 @@ mod actions;
 mod audio;
 mod delta;
 mod frame_codec;
+mod file_service;
 mod history;
 mod screenshot;
 mod numeric_entry;
@@ -258,6 +259,7 @@ struct HostConsentDecision {
     approved: bool,
     remember_technician: bool,
     allow_audio: bool,
+    allow_files: bool,
 }
 
 #[derive(Default)]
@@ -379,6 +381,7 @@ struct NexusGuiApp {
     remember_this_computer: bool,
     trust_current_technician: bool,
     approve_audio_for_session: bool,
+    approve_files_for_session: bool,
     trust_registry: trusted::TrustRegistry,
     host_advertise_addr_input: String,
 
@@ -473,6 +476,7 @@ impl NexusGuiApp {
             remember_this_computer: false,
             trust_current_technician: false,
             approve_audio_for_session: false,
+            approve_files_for_session: false,
             trust_registry,
             host_advertise_addr_input: default_advertise,
             client_display_name: String::new(),
@@ -567,6 +571,7 @@ impl NexusGuiApp {
                 } => {
                     self.trust_current_technician = false;
                     self.approve_audio_for_session = false;
+                    self.approve_files_for_session = false;
                     self.pending_host_consent = Some(HostConsentPrompt {
                         requester_id,
                         remote_addr,
@@ -1808,6 +1813,8 @@ impl NexusGuiApp {
                 ui.add_space(10.0);
                 ui.checkbox(&mut self.approve_audio_for_session,
                     "Share this computer's speaker audio with the technician");
+                ui.checkbox(&mut self.approve_files_for_session,
+                    "Allow file operations inside Downloads/XLINK-Shared only");
                 ui.label(RichText::new("Audio is OFF by default and requires separate consent.")
                     .size(11.0).color(Color32::from_rgb(110, 126, 147)));
                 if prompt.remember_requested {
@@ -1828,6 +1835,7 @@ impl NexusGuiApp {
                         match self.ui_bridge.respond_host_consent(HostConsentDecision {
                             approved: false, remember_technician: false,
                             allow_audio: false,
+                            allow_files: false,
                         }) {
                             Ok(()) => {
                                 self.pending_host_consent = None;
@@ -1848,6 +1856,7 @@ impl NexusGuiApp {
                             remember_technician: prompt.remember_requested
                                 && self.trust_current_technician,
                             allow_audio: self.approve_audio_for_session,
+                            allow_files: self.approve_files_for_session,
                         }) {
                             Ok(()) => {
                                 self.pending_host_consent = None;
@@ -2673,7 +2682,10 @@ async fn run_host_peer_session(
             format!("Trusted technician {} connected; use Stop Sharing to revoke",
                 incoming_auth.requester_id)
         )).await;
-        HostConsentDecision { approved: true, remember_technician: false, allow_audio: false }
+        HostConsentDecision {
+            approved: true, remember_technician: false, allow_audio: false,
+            allow_files: false,
+        }
     } else {
         request_host_consent(
             remote_addr_str.clone(), &incoming_auth, &runtime_event_tx, &ui_bridge,
@@ -2743,15 +2755,16 @@ async fn run_host_peer_session(
     let audio_stop = Arc::new(AtomicBool::new(false));
     let audio_enabled = Arc::new(AtomicBool::new(false));
     let audio_permission = decision.allow_audio;
-    let audio_connection = connection.clone();
+    let services_connection = connection.clone();
     let audio_stop_for_task = Arc::clone(&audio_stop);
     let audio_enabled_for_task = Arc::clone(&audio_enabled);
+    let allow_files = decision.allow_files;
     let mut audio_task = AbortOnDrop(tokio::spawn(async move {
-        if let Err(error) = run_host_audio_service(
-            audio_connection, audio_permission, audio_stop_for_task,
-            audio_enabled_for_task,
+        if let Err(error) = run_host_service_dispatcher(
+            services_connection, audio_permission, allow_files,
+            audio_stop_for_task, audio_enabled_for_task,
         ).await {
-            warn!(?error, "remote audio service ended");
+            warn!(?error, "remote auxiliary service dispatcher ended");
         }
     }));
     let live_fps = Arc::new(AtomicU16::new(fps));
@@ -3039,23 +3052,67 @@ impl Drop for AudioShutdown {
     fn drop(&mut self) { self.0.store(true, Ordering::Release); }
 }
 
-async fn run_host_audio_service(
+async fn run_host_service_dispatcher(
     connection: nexus_network::Connection,
-    approved: bool,
+    allow_audio: bool,
+    allow_files: bool,
     stop: Arc<AtomicBool>,
     enabled: Arc<AtomicBool>,
 ) -> Result<()> {
     let _shutdown = AudioShutdown(Arc::clone(&stop));
-    let (mut audio_s, mut audio_r) = time::timeout(
-        Duration::from_secs(45), connection.accept_bi(),
-    ).await.context("technician did not open audio service")?
-        .context("audio stream could not be accepted")?;
-    let label: String = recv_message_limited(&mut audio_r, 64).await
-        .context("audio negotiation failed")?;
-    if label != "XLINK-AUDIO-1" { bail!("unknown QUIC audio service label"); }
+    let mut children: Vec<AbortOnDrop<()>> = Vec::new();
+    while !stop.load(Ordering::Acquire) {
+        let stream = tokio::select! {
+            result = connection.accept_bi() => result
+                .context("auxiliary connection closed")?,
+            _ = time::sleep(Duration::from_secs(2)) => continue,
+        };
+        let (mut out, mut input) = stream;
+        let label: String = time::timeout(
+            Duration::from_secs(10),
+            recv_message_limited(&mut input, 64),
+        ).await.context("auxiliary service negotiation timed out")??;
+        match label.as_str() {
+            "XLINK-AUDIO-1" => {
+                if children.len() >= 8 { bail!("too many auxiliary channels"); }
+                let enabled = Arc::clone(&enabled);
+                let stop = Arc::clone(&stop);
+                children.push(AbortOnDrop(tokio::spawn(async move {
+                    if let Err(error) = run_host_audio_stream(
+                        out, input, allow_audio, stop, enabled
+                    ).await {
+                        warn!(?error, "audio service ended");
+                    }
+                })));
+            }
+            "XLINK-FILES-1" => {
+                if children.len() >= 8 { bail!("too many auxiliary channels"); }
+                children.push(AbortOnDrop(tokio::spawn(async move {
+                    if let Err(error) = run_host_file_stream(
+                        out, input, allow_files
+                    ).await {
+                        warn!(?error, "file service ended");
+                    }
+                })));
+            }
+            _ => {
+                warn!(%label, "unrecognized auxiliary channel");
+            }
+        }
+        children.retain(|task| !task.0.is_finished());
+    }
+    Ok(())
+}
+
+async fn run_host_audio_stream(
+    mut audio_s: SendStream,
+    _audio_r: RecvStream,
+    approved: bool,
+    stop: Arc<AtomicBool>,
+    enabled: Arc<AtomicBool>,
+) -> Result<()> {
     send_message_limited(&mut audio_s, &approved, 64).await?;
     if !approved { return Ok(()); }
-
     let samples = audio::spawn_loopback_capture(Arc::clone(&stop))?;
     while !stop.load(Ordering::Acquire) {
         match samples.try_recv() {
@@ -3675,7 +3732,10 @@ async fn request_host_consent(
         }
         if matches!(normalized.as_str(), "0" | "false" | "no" | "n") {
             warn!("NEXUS_AUTO_CONSENT enabled: auto-denying consent for this session");
-            return Ok(HostConsentDecision { approved: false, remember_technician: false, allow_audio: false });
+            return Ok(HostConsentDecision {
+                approved: false, remember_technician: false, allow_audio: false,
+                allow_files: false,
+            });
         }
     }
 
