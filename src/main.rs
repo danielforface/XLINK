@@ -1313,24 +1313,27 @@ impl NexusGuiApp {
         let muted = Color32::from_rgb(109, 125, 149);
         let accent = Color32::from_rgb(31, 100, 217);
         let width = ui.available_width().max(0.0);
-        let card_width = width.min(450.0);
-        let compact = width < 405.0;
-        let padding = if compact { 15.0 } else { 24.0 };
+        let card_width = width.min(436.0);
+        // Dense by default: the complete home screen must fit the 688×732
+        // startup window without demanding an initial scroll.
+        let dense = ui.ctx().screen_rect().height() < 830.0 || width < 405.0;
+        ui.spacing_mut().item_spacing.y = if dense { 3.0 } else { 6.0 };
+        let padding = if dense { 17.0 } else { 23.0 };
         let content_width = (card_width - padding * 2.0).max(240.0);
         let m = ui_widgets::metrics(content_width);
 
-        ui.add_space(if compact { 6.0 } else { 14.0 });
+        ui.add_space(if dense { 3.0 } else { 14.0 });
         ui.vertical_centered(|ui| {
             ui.label(RichText::new("SECURE CONNECTION")
                 .size(10.5).strong().color(accent));
-            ui.add_space(5.0);
+            ui.add_space(if dense { 2.0 } else { 5.0 });
             ui.label(RichText::new("Connect to a computer")
-                .size(if compact { 22.0 } else { 25.0 }).strong().color(ink));
-            ui.add_space(5.0);
+                .size(if dense { 22.0 } else { 25.0 }).strong().color(ink));
+            ui.add_space(if dense { 2.0 } else { 5.0 });
             ui.label(RichText::new("One code. Private and encrypted.")
                 .size(12.0).color(muted));
         });
-        ui.add_space(if compact { 12.0 } else { 19.0 });
+        ui.add_space(if dense { 9.0 } else { 19.0 });
 
         ui.vertical_centered(|ui| {
             ui.allocate_ui_with_layout(
@@ -1349,19 +1352,19 @@ impl NexusGuiApp {
                             ui_widgets::centered_row(ui, content_width, |ui| {
                                 self.draw_compact_own_code(ui);
                             });
-                            ui.add_space(13.0);
+                            ui.add_space(if dense { 7.0 } else { 13.0 });
                             ui.separator();
-                            ui.add_space(12.0);
+                            ui.add_space(if dense { 6.0 } else { 12.0 });
 
                             ui.vertical_centered(|ui| {
                                 ui.label(RichText::new("REMOTE COMPUTER ID")
                                     .size(11.0).strong().color(muted));
-                                ui.add_space(3.0);
+                                ui.add_space(2.0);
                                 ui.label(RichText::new(
                                     "8–10 digits · type, paste or use the keypad"
                                 ).size(10.5).color(Color32::from_rgb(151, 166, 185)));
                             });
-                            ui.add_space(11.0);
+                            ui.add_space(if dense { 5.0 } else { 11.0 });
 
                             let focus = self.refocus_number_input;
                             self.refocus_number_input = false;
@@ -1372,7 +1375,7 @@ impl NexusGuiApp {
                                     focus, !self.client_running, m.slots_width,
                                 ).submit;
                             });
-                            ui.add_space(15.0);
+                            ui.add_space(if dense { 7.0 } else { 15.0 });
 
                             let keys = [
                                 ["1", "2", "3"], ["4", "5", "6"],
@@ -1384,7 +1387,8 @@ impl NexusGuiApp {
                                     for (col_idx, key) in row.iter().enumerate() {
                                         ui.push_id(("num_key", row_idx, col_idx), |ui| {
                                             let pressed = ui_widgets::numeric_key(
-                                                ui, key, m.key_width, 46.0
+                                                ui, key, m.key_width,
+                                                if dense { 40.0 } else { 46.0 }
                                             ).clicked();
                                             if pressed && !self.client_running {
                                                 let action = match *key {
@@ -1403,9 +1407,11 @@ impl NexusGuiApp {
                                         });
                                     }
                                 });
-                                if row_idx != 3 { ui.add_space(8.0); }
+                                if row_idx != 3 {
+                                    ui.add_space(if dense { 5.0 } else { 8.0 });
+                                }
                             }
-                            ui.add_space(15.0);
+                            ui.add_space(if dense { 8.0 } else { 15.0 });
                             let valid = short_code::parse_code(&self.access_id_input).is_ok();
                             let enabled = valid && !self.client_running;
                             let mut connect_pressed = false;
@@ -1425,11 +1431,11 @@ impl NexusGuiApp {
                                         .try_send(RuntimeCommand::DisconnectClient);
                                 }
                             }
-                            ui.add_space(10.0);
+                            ui.add_space(if dense { 5.0 } else { 10.0 });
                             ui.vertical_centered(|ui| {
                                 ui.checkbox(&mut self.remember_this_computer,
                                     "Remember this computer if its owner also agrees");
-                                ui.add_space(4.0);
+                                ui.add_space(if dense { 1.0 } else { 4.0 });
                                 ui.label(RichText::new(
                                     "The remote person must approve the connection."
                                 ).size(11.0).color(muted));
@@ -1467,7 +1473,7 @@ impl NexusGuiApp {
                 });
             }
         }
-        ui.add_space(12.0);
+        ui.add_space(if dense { 6.0 } else { 12.0 });
         ui.vertical_centered(|ui| {
             ui.label(RichText::new(&self.status_message)
                 .size(11.5).color(muted));
@@ -2392,17 +2398,22 @@ impl eframe::App for NexusGuiApp {
             self.set_status("Refreshing your temporary ID...");
         }
 
+        // Reserve the brand's own width; the toolbar never paints across it.
+        // At the default window size navigation uses uniform icon controls.
+        // Tooltips retain every feature name. Larger windows reveal labels.
+        let compact_nav = ui_widgets::compact_navigation(ctx.screen_rect().width());
         egui::TopBottomPanel::top("home_navigation")
             .frame(egui::Frame::none()
                 .fill(Color32::WHITE)
-                .inner_margin(egui::Margin::symmetric(20.0, 14.0)))
+                .inner_margin(egui::Margin::symmetric(14.0, 8.0)))
             .show(ctx, |ui| {
+                ui.spacing_mut().item_spacing.x = if compact_nav { 5.0 } else { 8.0 };
                 ui.horizontal(|ui| {
                     if ui.add(
                         egui::Button::new(RichText::new("XLINK")
-                            .size(24.0).strong().color(Color32::from_rgb(28, 64, 119)))
+                            .size(21.0).strong().color(Color32::from_rgb(28, 64, 119)))
                             .frame(false)
-                    ).on_hover_text("Home").clicked() {
+                    ).on_hover_text("Back to connection screen").clicked() {
                         self.show_logs = false;
                         self.show_preferences = false;
                         self.show_history = false;
@@ -2410,12 +2421,14 @@ impl eframe::App for NexusGuiApp {
                         self.show_actions = false;
                         self.refocus_number_input = true;
                     }
-                    if self.host_session_active {
-                        ui.label(RichText::new("●  LIVE SUPPORT")
-                            .strong().size(11.0).color(Color32::from_rgb(190, 51, 65)));
-                    } else if ui.available_width() > 430.0 {
-                        ui.label(RichText::new("Remote support")
-                            .size(12.0).color(Color32::from_rgb(106, 123, 142)));
+                    if !compact_nav {
+                        if self.host_session_active {
+                            ui.label(RichText::new("● LIVE SUPPORT")
+                                .strong().size(10.0).color(Color32::from_rgb(190, 51, 65)));
+                        } else if ui.available_width() > 930.0 {
+                            ui.label(RichText::new("Remote support")
+                                .size(12.0).color(Color32::from_rgb(106, 123, 142)));
+                        }
                     }
                     ui.with_layout(
                         egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -2436,7 +2449,13 @@ impl eframe::App for NexusGuiApp {
                             ).clicked() {
                                 self.start_hosting_clicked();
                             }
-                            if ui.add(egui::Button::new("Actions")).clicked() {
+
+                            let actions = if compact_nav {
+                                ui_widgets::toolbar_icon_button(ui, Glyph::Actions, "Actions", self.show_actions)
+                            } else {
+                                ui_widgets::toolbar_button(ui, Glyph::Actions, "Actions", self.show_actions, false)
+                            };
+                            if actions.clicked() {
                                 self.show_actions = !self.show_actions;
                                 self.show_files = false;
                                 self.show_history = false;
@@ -2444,34 +2463,29 @@ impl eframe::App for NexusGuiApp {
                                 self.show_preferences = false;
                                 if !self.show_actions { self.refocus_number_input = true; }
                             }
-                            if ui.add(
-                                egui::Button::new("Files")
-                                    .fill(if self.show_files {
-                                        Color32::from_rgb(225, 235, 251)
-                                    } else {
-                                        Color32::from_rgb(246, 249, 253)
-                                    }).rounding(Rounding::same(10.0))
-                            ).clicked() {
+
+                            let files = if compact_nav {
+                                ui_widgets::toolbar_icon_button(ui, Glyph::Files, "Files", self.show_files)
+                            } else {
+                                ui_widgets::toolbar_button(ui, Glyph::Files, "Files", self.show_files, false)
+                            };
+                            if files.clicked() {
                                 self.show_files = !self.show_files;
                                 self.show_actions = false;
                                 self.show_logs = false;
                                 self.show_history = false;
                                 self.show_preferences = false;
                                 if self.show_files {
-                                    self.start_file_action(
-                                        file_client::Operation::List("".into())
-                                    );
+                                    self.start_file_action(file_client::Operation::List("".into()));
                                 } else { self.refocus_number_input = true; }
                             }
-                            if ui.add(
-                                egui::Button::new("Recent")
-                                    .fill(if self.show_history {
-                                        Color32::from_rgb(225, 235, 251)
-                                    } else {
-                                        Color32::from_rgb(246, 249, 253)
-                                    })
-                                    .rounding(Rounding::same(10.0))
-                            ).clicked() {
+
+                            let recent = if compact_nav {
+                                ui_widgets::toolbar_icon_button(ui, Glyph::Recent, "Recent connections", self.show_history)
+                            } else {
+                                ui_widgets::toolbar_button(ui, Glyph::Recent, "Recent", self.show_history, false)
+                            };
+                            if recent.clicked() {
                                 self.show_history = !self.show_history;
                                 self.show_actions = false;
                                 self.show_files = false;
@@ -2479,29 +2493,33 @@ impl eframe::App for NexusGuiApp {
                                 self.show_preferences = false;
                                 if !self.show_history { self.refocus_number_input = true; }
                             }
-                            if ui_widgets::toolbar_button(
-                                ui, Glyph::Logs, "Logs", self.show_logs, false,
-                            ).clicked() {
+
+                            let logs = if compact_nav {
+                                ui_widgets::toolbar_icon_button(ui, Glyph::Logs, "Detailed logs", self.show_logs)
+                            } else {
+                                ui_widgets::toolbar_button(ui, Glyph::Logs, "Logs", self.show_logs, false)
+                            };
+                            if logs.clicked() {
                                 self.show_logs = !self.show_logs;
                                 self.show_actions = false;
                                 self.show_files = false;
                                 self.show_preferences = false;
                                 self.show_history = false;
-                                if !self.show_logs {
-                                    self.refocus_number_input = true;
-                                }
+                                if !self.show_logs { self.refocus_number_input = true; }
                             }
-                            if ui_widgets::toolbar_button(
-                                ui, Glyph::Settings, "Settings", self.show_preferences, false,
-                            ).clicked() {
+
+                            let settings = if compact_nav {
+                                ui_widgets::toolbar_icon_button(ui, Glyph::Settings, "Settings", self.show_preferences)
+                            } else {
+                                ui_widgets::toolbar_button(ui, Glyph::Settings, "Settings", self.show_preferences, false)
+                            };
+                            if settings.clicked() {
                                 self.show_preferences = !self.show_preferences;
                                 self.show_actions = false;
                                 self.show_files = false;
                                 self.show_logs = false;
                                 self.show_history = false;
-                                if !self.show_preferences {
-                                    self.refocus_number_input = true;
-                                }
+                                if !self.show_preferences { self.refocus_number_input = true; }
                             }
                         });
                 });
@@ -2510,26 +2528,36 @@ impl eframe::App for NexusGuiApp {
             .frame(egui::Frame::none()
                 .fill(Color32::from_rgb(248, 250, 253))
                 .inner_margin(egui::Margin::symmetric(
-                    if ctx.available_rect().width() < 580.0 { 10.0 } else { 24.0 },
-                    16.0,
+                    if ctx.available_rect().width() < 580.0 { 9.0 } else { 17.0 },
+                    8.0,
                 )))
             .show(ctx, |ui| {
-                egui::ScrollArea::vertical().auto_shrink([false, false])
-                    .show(ui, |ui| {
-                        if self.show_actions {
-                            self.draw_local_actions_screen(ui);
-                        } else if self.show_files {
-                            self.draw_file_manager(ui);
-                        } else if self.show_preferences {
-                            self.draw_preferences_screen(ui);
-                        } else if self.show_logs {
-                            self.draw_logs_screen(ui);
-                        } else if self.show_history {
-                            self.draw_history_screen(ui);
-                        } else {
-                            self.draw_numeric_home(ui);
-                        }
-                    });
+                let on_home = !(self.show_actions || self.show_files ||
+                    self.show_preferences || self.show_logs || self.show_history);
+                // The default 688×732 startup view has no vertical scrollbar.
+                // Restore scrolling for very small windows and for long lists.
+                let needs_scroll = !on_home || ui.available_height() < 610.0 ||
+                    !self.trust_registry.saved_computers().is_empty();
+                if needs_scroll {
+                    egui::ScrollArea::vertical().auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            if self.show_actions {
+                                self.draw_local_actions_screen(ui);
+                            } else if self.show_files {
+                                self.draw_file_manager(ui);
+                            } else if self.show_preferences {
+                                self.draw_preferences_screen(ui);
+                            } else if self.show_logs {
+                                self.draw_logs_screen(ui);
+                            } else if self.show_history {
+                                self.draw_history_screen(ui);
+                            } else {
+                                self.draw_numeric_home(ui);
+                            }
+                        });
+                } else {
+                    self.draw_numeric_home(ui);
+                }
             });
 
         self.draw_copy_notice(ctx);
