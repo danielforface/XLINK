@@ -56,6 +56,7 @@ pub enum ViewerInputEvent {
     ScreenshotRemote(ViewerFrame),
     ScreenshotLocal,
     SetFrameRate(u16),
+    ToggleAudio,
     ActionRecordStart,
     ActionRecordStop,
     ActionReplay { repetitions: Option<u32> },
@@ -382,6 +383,7 @@ fn run_remote_viewer(
     let mut last_buttons = [false; 3];
     let mut fullscreen = None;
     let mut desired_fps = 30u16;
+    let mut sound_enabled = false;
     let mut recording = false;
 
     loop {
@@ -460,10 +462,18 @@ fn run_remote_viewer(
             Some(10) => { let _ = input_tx.blocking_send(
                 ViewerInputEvent::ActionStopPlayback
             ); }
+            Some(12) => { sound_enabled = !sound_enabled; let _ = input_tx.blocking_send(
+                ViewerInputEvent::ToggleAudio
+            ); }
             Some(11) => { let _ = input_tx.blocking_send(
                 ViewerInputEvent::ActionReplayFile { repetitions: Some(1) }
             ); }
             _ => {}
+        }
+        if window.is_key_pressed(Key::F2, KeyRepeat::No) {
+            sound_enabled = !sound_enabled;
+            let _ = input_tx.blocking_send(ViewerInputEvent::ToggleAudio);
+            window.set_title(&format!("{title} | Audio {}", if sound_enabled {"ON"} else {"OFF"}));
         }
         if window.is_key_pressed(Key::F5, KeyRepeat::No) {
             recording = !recording;
@@ -551,6 +561,11 @@ fn attach_session_menu(window: &mut Window) -> Result<()> {
     performance.add_item("Reduce FPS (F7)", 4).build();
     performance.add_item("Increase FPS (F8)", 5).build();
     window.add_menu(&performance);
+
+    let mut sound = Menu::new("Sound")
+        .map_err(|e| anyhow!("cannot create Sound menu: {e}"))?;
+    sound.add_item("Toggle remote sound (F2)", 12).build();
+    window.add_menu(&sound);
 
     let mut actions = Menu::new("Actions")
         .map_err(|e| anyhow!("cannot create Actions menu: {e}"))?;
