@@ -3,6 +3,7 @@
 mod adaptive;
 mod delta;
 mod frame_codec;
+mod history;
 mod numeric_entry;
 mod ui_widgets;
 mod short_code;
@@ -232,6 +233,7 @@ enum RuntimeEvent {
     HostSessionActive {
         active: bool,
     },
+    ConnectionAuthenticated { peer: String, direction: history::Direction },
     ClientLifecycle {
         running: bool,
     },
@@ -364,6 +366,8 @@ struct NexusGuiApp {
     host_inject_input: bool,
     show_logs: bool,
     show_preferences: bool,
+    show_history: bool,
+    recent_history: Option<history::History>,
     code_ready_at: Option<Instant>,
     refocus_number_input: bool,
     numeric_cursor: usize,
@@ -449,6 +453,14 @@ impl NexusGuiApp {
             host_inject_input: true,
             show_logs: false,
             show_preferences: false,
+            show_history: false,
+            recent_history: match history::History::open() {
+                Ok(archive) => Some(archive),
+                Err(error) => {
+                    tracing::warn!(?error, "encrypted connection history unavailable");
+                    None
+                }
+            },
             code_ready_at: None,
             refocus_number_input: true,
             numeric_cursor: 0,
@@ -578,6 +590,13 @@ impl NexusGuiApp {
                         self.set_status("REMOTE SUPPORT SESSION ACTIVE");
                     } else if self.host_running {
                         self.set_status("Ready for another connection");
+                    }
+                }
+                RuntimeEvent::ConnectionAuthenticated { peer, direction } => {
+                    if let Some(history) = self.recent_history.as_mut() {
+                        if let Err(error) = history.record(direction, &peer) {
+                            self.push_log(format!("History save failed: {error}"));
+                        }
                     }
                 }
                 RuntimeEvent::PairingCodeRevoked => {
@@ -1513,6 +1532,45 @@ impl NexusGuiApp {
         );
     }
 
+    fn draw_history_screen(&mut self, ui: &mut egui::Ui) {
+        let ink = Color32::from_rgb(27, 47, 73);
+        ui.heading("Recent sessions");
+        ui.label("Encrypted locally for your Windows account. No passwords or screen data.");
+        ui.add_space(14.0);
+        let mut bookmark: Option<(usize, bool)> = None;
+        match self.recent_history.as_ref() {
+            Some(archive) => {
+                if archive.entries().is_empty() {
+                    ui.label("No successful sessions recorded yet.");
+                }
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    for (index, entry) in archive.entries().iter().enumerate() {
+                        ui.horizontal(|ui| {
+                            let action = if entry.direction == history::Direction::Helping {
+                                "Helped" } else { "Received help" };
+                            ui.label(RichText::new(format!(
+                                "{} · {} · {}",
+                                entry.at_epoch_secs, action, entry.peer
+                            )).color(ink).size(12.0));
+                            if ui.button(if entry.saved { "Unsave" } else { "Save" }).clicked() {
+                                bookmark = Some((index, !entry.saved));
+                            }
+                        });
+                        ui.separator();
+                    }
+                });
+            }
+            None => { ui.label("Protected history unavailable. Check Logs."); }
+        }
+        if let Some((index, state)) = bookmark {
+            if let Some(archive) = self.recent_history.as_mut() {
+                if let Err(error) = archive.set_saved(index, state) {
+                    self.push_log(format!("Cannot save history bookmark: {error}"));
+                }
+            }
+        }
+    }
+
     fn draw_logs_screen(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             ui.heading("Activity log");
@@ -1904,6 +1962,7 @@ impl eframe::App for NexusGuiApp {
                     ).on_hover_text("Home").clicked() {
                         self.show_logs = false;
                         self.show_preferences = false;
+                        self.show_history = false;
                         self.refocus_number_input = true;
                     }
                     if self.host_session_active {
@@ -1932,11 +1991,26 @@ impl eframe::App for NexusGuiApp {
                             ).clicked() {
                                 self.start_hosting_clicked();
                             }
+                            if ui.add(
+                                egui::Button::new("Recent")
+                                    .fill(if self.show_history {
+                                        Color32::from_rgb(225, 235, 251)
+                                    } else {
+                                        Color32::from_rgb(246, 249, 253)
+                                    })
+                                    .rounding(Rounding::same(10.0))
+                            ).clicked() {
+                                self.show_history = !self.show_history;
+                                self.show_logs = false;
+                                self.show_preferences = false;
+                                if !self.show_history { self.refocus_number_input = true; }
+                            }
                             if ui_widgets::toolbar_button(
                                 ui, Glyph::Logs, "Logs", self.show_logs, false,
                             ).clicked() {
                                 self.show_logs = !self.show_logs;
                                 self.show_preferences = false;
+                                self.show_history = false;
                                 if !self.show_logs {
                                     self.refocus_number_input = true;
                                 }
@@ -1946,6 +2020,7 @@ impl eframe::App for NexusGuiApp {
                             ).clicked() {
                                 self.show_preferences = !self.show_preferences;
                                 self.show_logs = false;
+                                self.show_history = false;
                                 if !self.show_preferences {
                                     self.refocus_number_input = true;
                                 }
@@ -1967,6 +2042,8 @@ impl eframe::App for NexusGuiApp {
                             self.draw_preferences_screen(ui);
                         } else if self.show_logs {
                             self.draw_logs_screen(ui);
+                        } else if self.show_history {
+                            self.draw_history_screen(ui);
                         } else {
                             self.draw_numeric_home(ui);
                         }
@@ -2632,6 +2709,10 @@ async fn run_host_peer_session(
     let _ = runtime_event_tx.send(RuntimeEvent::HostSessionActive {
         active: true
     }).await;
+    let _ = runtime_event_tx.send(RuntimeEvent::ConnectionAuthenticated {
+        peer: format!("technician:{}", hex::encode(&remote_id[..6])),
+        direction: history::Direction::ReceivingHelp,
+    }).await;
 
     let input = Arc::new(InputController::new()?);
     input.set_state(InputSessionState::Active);
@@ -3000,6 +3081,10 @@ async fn run_client_session(
             Duration::from_secs(210), wait_for_session_consent(&control_recv)
         ).await.context("waiting for host consent timed out")??;
         session_state.transition(SessionState::Active)?;
+        let _ = runtime_event_tx.send(RuntimeEvent::ConnectionAuthenticated {
+            peer: format!("host:{}", hex::encode(&invitation.endpoint_id[..6])),
+            direction: history::Direction::Helping,
+        }).await;
         if enrollment_confirmed && remember_host {
             // A successful encrypted QUIC session AND an explicit Host
             // enrollment acknowledgement are required before saving a device.
