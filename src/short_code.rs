@@ -1,4 +1,4 @@
-//! Zero-owned-server numeric pairing over the public Magic Wormhole mailbox.
+//! Numeric pairing over the explicit public or user-provided private mailbox.
 //! The short code is an ephemeral SPAKE2 password/nameplate, NEVER an endpoint
 //! identity and NEVER permission to control a computer.
 use anyhow::{bail, Context, Result};
@@ -10,8 +10,7 @@ use tokio::time::{self, Duration};
 
 // A publicly operated mailbox, NOT XLINK infrastructure. The mailbox only
 // carries authenticated/encrypted endpoint bootstrap data, never video/input.
-const PUBLIC_MAILBOX: &str = "ws://relay.magic-wormhole.io:4000/v1";
-const APP_ID: &str = "io.github.danielforface.xlink.pairing.v1";
+ const APP_ID: &str = "io.github.danielforface.xlink.pairing.v1";
 const NUMERIC_SECRET_DIGITS: usize = 6;
 const MAX_CODE_DIGITS: usize = 10;
 const PAIR_TIMEOUT: Duration = Duration::from_secs(180);
@@ -22,10 +21,10 @@ pub struct Invitation {
     pub ticket: String,
 }
 
-fn app_config() -> AppConfig<&'static str> {
+fn app_config(profile: &crate::network_profile::NetworkProfile) -> AppConfig<&'static str> {
     AppConfig {
         id: AppID::new(APP_ID),
-        rendezvous_url: PUBLIC_MAILBOX.into(),
+        rendezvous_url: profile.mailbox().to_owned().into(),
         app_version: "xlink-numeric-pair-v1",
     }
 }
@@ -68,13 +67,15 @@ pub fn parse_code(code: &str) -> Result<Code> {
 pub async fn advertise_and_pair(
     endpoint_id: [u8; 32],
     ready_tx: &mpsc::Sender<String>,
+    profile: &crate::network_profile::NetworkProfile,
 ) -> Result<Invitation> {
+    profile.validate()?;
     let mut random = [0u8; 4];
     OsRng.fill_bytes(&mut random);
     let secret = format!("{:06}", u32::from_be_bytes(random) % 1_000_000);
     let mailbox = time::timeout(Duration::from_secs(20),
         MailboxConnection::create_with_password(
-            app_config(), secret.as_str(),
+            app_config(profile), secret.as_str(),
         ))
         .await.context("public mailbox allocation timed out")?
         .context("public mailbox rejected connection")?;
@@ -106,10 +107,14 @@ pub async fn advertise_and_pair(
 
 /// Technician: digits discover a PAKE-authenticated temporary QUIC identity.
 /// A valid code alone never grants screen sharing or remote input rights.
-pub async fn resolve(code: &str) -> Result<Invitation> {
+pub async fn resolve(
+    code: &str,
+    profile: &crate::network_profile::NetworkProfile,
+) -> Result<Invitation> {
+    profile.validate()?;
     let mailbox_code = parse_code(code)?;
     let mailbox = time::timeout(Duration::from_secs(20),
-        MailboxConnection::connect(app_config(), mailbox_code, false))
+        MailboxConnection::connect(app_config(profile), mailbox_code, false))
         .await.context("public mailbox lookup timed out")?
         .context("code expired, unavailable, or mailbox unreachable")?;
     let mut wormhole = time::timeout(Duration::from_secs(90), Wormhole::connect(mailbox))
@@ -158,11 +163,13 @@ mod tests {
         let identity = *iroh::SecretKey::generate().public().as_bytes();
         let (tx, mut rx) = mpsc::channel(1);
         let host = tokio::spawn(async move {
-            advertise_and_pair(identity, &tx).await.expect("public pairing host")
+            advertise_and_pair(identity, &tx, &crate::network_profile::NetworkProfile::default())
+                .await.expect("public pairing host")
         });
         let code = time::timeout(Duration::from_secs(30), rx.recv())
             .await.expect("server did not allocate code").expect("server closed");
-        let client = resolve(&code).await.expect("public pairing client");
+        let client = resolve(&code, &crate::network_profile::NetworkProfile::default())
+            .await.expect("public pairing client");
         let remote = host.await.expect("host task crashed");
         assert_eq!(remote.endpoint_id, client.endpoint_id);
         assert_eq!(remote.ticket, client.ticket);
