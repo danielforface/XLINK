@@ -2,6 +2,7 @@
 
 mod adaptive;
 mod actions;
+mod audio;
 mod delta;
 mod frame_codec;
 mod history;
@@ -256,6 +257,7 @@ enum RuntimeEvent {
 struct HostConsentDecision {
     approved: bool,
     remember_technician: bool,
+    allow_audio: bool,
 }
 
 #[derive(Default)]
@@ -376,6 +378,7 @@ struct NexusGuiApp {
     window_was_focused: bool,
     remember_this_computer: bool,
     trust_current_technician: bool,
+    approve_audio_for_session: bool,
     trust_registry: trusted::TrustRegistry,
     host_advertise_addr_input: String,
 
@@ -469,6 +472,7 @@ impl NexusGuiApp {
             window_was_focused: false,
             remember_this_computer: false,
             trust_current_technician: false,
+            approve_audio_for_session: false,
             trust_registry,
             host_advertise_addr_input: default_advertise,
             client_display_name: String::new(),
@@ -562,6 +566,7 @@ impl NexusGuiApp {
                     remember_requested,
                 } => {
                     self.trust_current_technician = false;
+                    self.approve_audio_for_session = false;
                     self.pending_host_consent = Some(HostConsentPrompt {
                         requester_id,
                         remote_addr,
@@ -1800,6 +1805,11 @@ impl NexusGuiApp {
                 ui.add(egui::Label::new(format!("Session: {}", prompt.target_session)).wrap(true));
                 ui.add_space(10.0);
                 ui.add(egui::Label::new("Allow screen viewing? Keyboard and mouse control only if explicitly enabled in Host settings. You may revoke at any time.").wrap(true));
+                ui.add_space(10.0);
+                ui.checkbox(&mut self.approve_audio_for_session,
+                    "Share this computer's speaker audio with the technician");
+                ui.label(RichText::new("Audio is OFF by default and requires separate consent.")
+                    .size(11.0).color(Color32::from_rgb(110, 126, 147)));
                 if prompt.remember_requested {
                     ui.add_space(10.0);
                     ui.checkbox(&mut self.trust_current_technician,
@@ -1817,6 +1827,7 @@ impl NexusGuiApp {
                     {
                         match self.ui_bridge.respond_host_consent(HostConsentDecision {
                             approved: false, remember_technician: false,
+                            allow_audio: false,
                         }) {
                             Ok(()) => {
                                 self.pending_host_consent = None;
@@ -1836,6 +1847,7 @@ impl NexusGuiApp {
                             approved: true,
                             remember_technician: prompt.remember_requested
                                 && self.trust_current_technician,
+                            allow_audio: self.approve_audio_for_session,
                         }) {
                             Ok(()) => {
                                 self.pending_host_consent = None;
@@ -2661,7 +2673,7 @@ async fn run_host_peer_session(
             format!("Trusted technician {} connected; use Stop Sharing to revoke",
                 incoming_auth.requester_id)
         )).await;
-        HostConsentDecision { approved: true, remember_technician: false }
+        HostConsentDecision { approved: true, remember_technician: false, allow_audio: false }
     } else {
         request_host_consent(
             remote_addr_str.clone(), &incoming_auth, &runtime_event_tx, &ui_bridge,
@@ -2728,8 +2740,23 @@ async fn run_host_peer_session(
     .await
     .context("failed to send session approval acknowledgement")?;
 
+    let audio_stop = Arc::new(AtomicBool::new(false));
+    let audio_enabled = Arc::new(AtomicBool::new(false));
+    let audio_permission = decision.allow_audio;
+    let audio_connection = connection.clone();
+    let audio_stop_for_task = Arc::clone(&audio_stop);
+    let audio_enabled_for_task = Arc::clone(&audio_enabled);
+    let mut audio_task = AbortOnDrop(tokio::spawn(async move {
+        if let Err(error) = run_host_audio_service(
+            audio_connection, audio_permission, audio_stop_for_task,
+            audio_enabled_for_task,
+        ).await {
+            warn!(?error, "remote audio service ended");
+        }
+    }));
     let live_fps = Arc::new(AtomicU16::new(fps));
     let live_fps_for_control = Arc::clone(&live_fps);
+    let audio_enabled_for_control = Arc::clone(&audio_enabled);
     let session_state_for_control = Arc::clone(&session_state);
     let input_for_control = Arc::clone(&input);
     let inject_input = config.inject_input;
@@ -2772,6 +2799,14 @@ async fn run_host_peer_session(
                 Ok(ControlMessage::ReleaseAllInputs) => {
                     if session_state_for_control.is_active() {
                         input_for_control.release_all();
+                    }
+                }
+                Ok(ControlMessage::SetAudioEnabled { enabled }) => {
+                    if session_state_for_control.is_active() && audio_permission {
+                        audio_enabled_for_control.store(enabled, Ordering::Release);
+                        info!(enabled, "technician audio state changed after host approval");
+                    } else {
+                        warn!("audio requested without explicit remote audio consent");
                     }
                 }
                 Ok(ControlMessage::SetTargetFps { fps }) => {
@@ -2982,6 +3017,9 @@ async fn run_host_peer_session(
     }
 
     input.set_state(InputSessionState::Inactive);
+    audio_stop.store(true, Ordering::Release);
+    audio_task.0.abort();
+    let _ = (&mut audio_task.0).await;
     let _ = session_state.transition(SessionState::Terminated);
     if let Some(ref c) = quic_conn_to_close {
         c.close(0u32.into(), b"server shutdown");
@@ -3142,6 +3180,7 @@ async fn run_client_session(
         let control_send_clone = control_send.clone();
         let event_tx_for_screenshots = runtime_event_tx.clone();
         let mut input_task = AbortOnDrop(tokio::spawn(async move {
+            let mut audio_playing = false;
             let mut recording: Option<actions::Recorder> = None;
             let mut saved_action_path: Option<PathBuf> = None;
             let playback_stop = Arc::new(AtomicBool::new(false));
@@ -3158,6 +3197,23 @@ async fn run_client_session(
                 // Macro playback can emit hundreds of input events, but is
                 // allowed only within an explicitly authorized QUIC session.
                 match &event {
+                    ViewerInputEvent::ToggleAudio => {
+                        audio_playing = !audio_playing;
+                        if let Err(error) = control_send_clone.send_control(
+                            &ControlMessage::SetAudioEnabled {
+                                enabled: audio_playing
+                            }
+                        ).await {
+                            warn!(?error, "unable to toggle remote audio");
+                        }
+                        let _ = event_tx_for_screenshots.send(
+                            RuntimeEvent::SessionStatus(format!(
+                                "Remote sound {} (requires Host audio consent)",
+                                if audio_playing { "requested ON" } else { "muted" }
+                            ))
+                        ).await;
+                        continue;
+                    }
                     ViewerInputEvent::ActionRecordStart => {
                         if recording.is_some() || playback_task.is_some() {
                             let _ = event_tx_for_screenshots.send(
@@ -3315,6 +3371,7 @@ async fn run_client_session(
                     ViewerInputEvent::SetFrameRate(fps) => {
                         ControlMessage::SetTargetFps { fps }
                     }
+                    ViewerInputEvent::ToggleAudio => continue,
                     ViewerInputEvent::ActionRecordStart
                     | ViewerInputEvent::ActionRecordStop
                     | ViewerInputEvent::ActionReplay { .. }
@@ -3524,7 +3581,7 @@ async fn request_host_consent(
         }
         if matches!(normalized.as_str(), "0" | "false" | "no" | "n") {
             warn!("NEXUS_AUTO_CONSENT enabled: auto-denying consent for this session");
-            return Ok(HostConsentDecision { approved: false, remember_technician: false });
+            return Ok(HostConsentDecision { approved: false, remember_technician: false, allow_audio: false });
         }
     }
 
