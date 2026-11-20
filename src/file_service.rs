@@ -215,7 +215,7 @@ impl Upload {
     }
 
     pub fn finish(self) -> Result<()> {
-        if self.actual != self.expected || self.hash.finalize().as_slice() != self.checksum {
+        if self.actual != self.expected || self.hash.clone().finalize().as_slice() != self.checksum {
             bail!("upload length or SHA-256 verification failed");
         }
         self.file.sync_all()?;
