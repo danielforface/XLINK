@@ -1661,6 +1661,111 @@ impl NexusGuiApp {
         });
     }
 
+    fn draw_local_actions_screen(&mut self, ui: &mut egui::Ui) {
+        if self.local_record_handle.as_ref().is_some_and(|thread| thread.is_finished()) {
+            let task = self.local_record_handle.take().unwrap();
+            match task.join() {
+                Ok(Ok((path, count))) => {
+                    self.local_action_file = Some(path.clone());
+                    self.set_status(format!("{count} actions saved to {}", path.display()));
+                }
+                Ok(Err(error)) => self.set_status(format!("Recording failed: {error}")),
+                Err(_) => self.set_status("Local action recording thread crashed"),
+            }
+        }
+        ui.heading("Local action studio");
+        ui.add(egui::Label::new(
+            "Record and replay mouse and keyboard on THIS computer, without a remote session.              Global recording may capture passwords or private information.              Pause/Break stops a recording or a playback, even when XLINK is not focused."
+        ).wrap(true));
+        ui.add_space(14.0);
+        let recording = self.local_record_handle.is_some();
+        if recording {
+            ui.label(RichText::new("● LOCAL RECORDING ACTIVE").strong()
+                .color(Color32::from_rgb(183, 47, 62)));
+            if ui.button("Stop local recording").clicked() {
+                self.local_record_stop.store(true, Ordering::Release);
+            }
+        } else {
+            ui.checkbox(&mut self.local_record_confirmation,
+                "I authorize an explicit local recording of keyboard and mouse input");
+            if ui.add_enabled(self.local_record_confirmation,
+                egui::Button::new("Start local recording")).clicked() {
+                self.local_record_stop.store(false, Ordering::Release);
+                let stop = Arc::clone(&self.local_record_stop);
+                match std::thread::Builder::new()
+                    .name("xlink-local-input-recorder".into())
+                    .spawn(move || local_actions::record_global_input(stop)) {
+                    Ok(handle) => {
+                        self.local_record_handle = Some(handle);
+                        self.local_record_confirmation = false;
+                        self.set_status("LOCAL RECORDING — Press Pause/Break to stop");
+                    }
+                    Err(error) => self.push_log(format!("Cannot start recording: {error}")),
+                }
+            }
+        }
+        ui.add_space(15.0);
+        if ui.button("Load portable XLINK .xlaction recording").clicked() {
+            if let Some(path) = rfd::FileDialog::new()
+                .add_filter("XLINK actions", &["xlaction"]).pick_file() {
+                match actions::inspect(&path) {
+                    Ok((events, length_ms)) => {
+                        self.local_action_file = Some(path);
+                        self.set_status(format!(
+                            "{events} events · {:.2}s",
+                            length_ms as f64 / 1000.0
+                        ));
+                    }
+                    Err(error) => self.set_status(format!("Invalid recording: {error}")),
+                }
+            }
+        }
+        if let Some(path) = &self.local_action_file {
+            ui.add(egui::Label::new(format!("Current action: {}",path.display()))
+                .wrap(true));
+        }
+        let playing = !self.local_playback_stop.load(Ordering::Acquire);
+        if playing {
+            ui.label(RichText::new("● LOCAL ACTION PLAYBACK").strong()
+                .color(Color32::from_rgb(37, 106, 211)));
+            if ui.button("STOP PLAYBACK").clicked() {
+                self.local_playback_stop.store(true, Ordering::Release);
+            }
+        } else {
+            ui.horizontal(|ui| {
+                for (label,repeat) in [
+                    ("Replay once", Some(1u32)),
+                    ("Replay 5 times", Some(5u32)),
+                    ("Loop until stopped", None),
+                ] {
+                    if ui.add_enabled(!recording && self.local_action_file.is_some(),
+                        egui::Button::new(label)).clicked() {
+                        if let Some(path) = self.local_action_file.clone() {
+                            self.local_playback_stop.store(false, Ordering::Release);
+                            let stop = Arc::clone(&self.local_playback_stop);
+                            let status = Arc::clone(&self.local_playback_status);
+                            self._runtime.spawn(async move {
+                                let result = local_actions::play_local(
+                                    path, repeat, Arc::clone(&stop)
+                                ).await;
+                                stop.store(true, Ordering::Release);
+                                if let Ok(mut state) = status.lock() {
+                                    *state = match result {
+                                        Ok(count) => format!("Played {count} events"),
+                                        Err(error) => format!("Action replay error: {error}"),
+                                    };
+                                }
+                            });
+                        }
+                    }
+                }
+            });
+        }
+        if let Ok(status) = self.local_playback_status.lock() {
+            ui.label(status.clone());
+        }
+    }
+
     fn draw_file_manager(&mut self, ui: &mut egui::Ui) {
         let snapshot = match self.file_snapshot.lock() {
             Ok(state) => state.clone(),
