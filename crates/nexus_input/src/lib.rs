@@ -75,6 +75,11 @@ impl InputController {
         }
     }
 
+    pub fn release_all(&self) {
+        self.release_held_keys();
+        self.release_held_buttons();
+    }
+
     fn release_held_keys(&self) {
         if let Ok(mut keys) = self.pressed_keys.lock() {
             for key in keys.drain() {
