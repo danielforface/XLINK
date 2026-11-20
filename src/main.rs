@@ -3104,6 +3104,134 @@ async fn run_host_service_dispatcher(
     Ok(())
 }
 
+async fn run_host_file_stream(
+    mut output: SendStream,
+    mut input: RecvStream,
+    approved: bool,
+) -> Result<()> {
+    send_message_limited(&mut output, &approved, 64).await?;
+    if !approved {
+        warn!("file service denied: remote person did not grant file access");
+        return Ok(());
+    }
+    let root = file_service::share_root()?;
+    let mut upload: Option<file_service::Upload> = None;
+    loop {
+        let request: file_service::Request = match time::timeout(
+            Duration::from_secs(90),
+            recv_message_limited(&mut input, file_service::MAX_PACKET_BYTES),
+        ).await {
+            Ok(Ok(request)) => request,
+            Ok(Err(error)) => {
+                info!(?error, "remote file explorer closed");
+                return Ok(());
+            }
+            Err(_) => return Ok(()),
+        };
+        use file_service::{Reply, Request};
+        // A failed operation is a bounded, non-panicking reply. It must never
+        // close the desktop control stream or leak arbitrary local paths.
+        match request {
+            Request::List { path } => {
+                let reply = match file_service::list(&root, &path) {
+                    Ok(items) => Reply::Items { path, items },
+                    Err(error) => Reply::Failed { reason: error.to_string() },
+                };
+                send_message_limited(&mut output, &reply, file_service::MAX_PACKET_BYTES).await?;
+            }
+            Request::Delete { path } => {
+                let reply = match file_service::delete(&root, &path) {
+                    Ok(()) => Reply::Done,
+                    Err(error) => Reply::Failed { reason: error.to_string() },
+                };
+                send_message_limited(&mut output, &reply, file_service::MAX_PACKET_BYTES).await?;
+            }
+            Request::Move { from, to } => {
+                let reply = match file_service::move_item(&root, &from, &to) {
+                    Ok(()) => Reply::Done,
+                    Err(error) => Reply::Failed { reason: error.to_string() },
+                };
+                send_message_limited(&mut output, &reply, file_service::MAX_PACKET_BYTES).await?;
+            }
+            Request::Copy { from, to } => {
+                let reply = match file_service::copy_item(&root, &from, &to) {
+                    Ok(()) => Reply::Done,
+                    Err(error) => Reply::Failed { reason: error.to_string() },
+                };
+                send_message_limited(&mut output, &reply, file_service::MAX_PACKET_BYTES).await?;
+            }
+            Request::Mkdir { path } => {
+                let reply = match file_service::create_folder(&root, &path) {
+                    Ok(()) => Reply::Done,
+                    Err(error) => Reply::Failed { reason: error.to_string() },
+                };
+                send_message_limited(&mut output, &reply, file_service::MAX_PACKET_BYTES).await?;
+            }
+            Request::UploadBegin { path, size, sha256 } => {
+                let reply = match file_service::Upload::new(&root, &path, size, sha256) {
+                    Ok(new_upload) => {
+                        upload = Some(new_upload);
+                        Reply::Done
+                    }
+                    Err(error) => Reply::Failed { reason: error.to_string() },
+                };
+                send_message_limited(&mut output, &reply, file_service::MAX_PACKET_BYTES).await?;
+            }
+            Request::UploadChunk { data } => {
+                let reply = match upload.as_mut() {
+                    Some(file) => match file.append(&data) {
+                        Ok(completed) => Reply::Progress {
+                            completed, total: completed.max(1),
+                        },
+                        Err(error) => Reply::Failed { reason: error.to_string() },
+                    },
+                    None => Reply::Failed { reason: "no active upload".into() },
+                };
+                send_message_limited(&mut output, &reply, file_service::MAX_PACKET_BYTES).await?;
+            }
+            Request::UploadFinish => {
+                let reply = match upload.take() {
+                    Some(file) => match file.finish() {
+                        Ok(()) => Reply::Done,
+                        Err(error) => Reply::Failed { reason: error.to_string() },
+                    },
+                    None => Reply::Failed { reason: "no active upload".into() },
+                };
+                send_message_limited(&mut output, &reply, file_service::MAX_PACKET_BYTES).await?;
+            }
+            Request::Download { path } => {
+                // Download is streamed in bounded chunks on this independent
+                // channel. No file bytes are ever allocated as one Vec.
+                let resolved = file_service::rooted_path(&root, &path);
+                let metadata = file_service::hash_file(&root, &path);
+                match (resolved, metadata) {
+                    (Ok(path), Ok((size, sha256))) => {
+                        send_message_limited(&mut output, &Reply::Meta {
+                            size, sha256,
+                        }, file_service::MAX_PACKET_BYTES).await?;
+                        use std::io::Read;
+                        let mut file = std::fs::File::open(path)?;
+                        let mut chunk = vec![0u8; file_service::BLOCK_BYTES];
+                        loop {
+                            let n = file.read(&mut chunk)?;
+                            if n == 0 { break; }
+                            send_message_limited(&mut output, &Reply::Data {
+                                bytes: chunk[..n].to_vec(),
+                            }, file_service::MAX_PACKET_BYTES).await?;
+                        }
+                        send_message_limited(&mut output, &Reply::Done, file_service::MAX_PACKET_BYTES).await?;
+                    }
+                    (_, Err(error)) | (Err(error), _) => {
+                        send_message_limited(&mut output, &Reply::Failed {
+                            reason: error.to_string(),
+                        }, file_service::MAX_PACKET_BYTES).await?;
+                    }
+                }
+            }
+        }
+    }
+}
+
 async fn run_host_audio_stream(
     mut audio_s: SendStream,
     _audio_r: RecvStream,
