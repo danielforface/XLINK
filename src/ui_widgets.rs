@@ -15,6 +15,9 @@ pub enum Glyph {
     Backspace,
     Settings,
     Logs,
+    Recent,
+    Files,
+    Actions,
     Stop,
     Connect,
 }
@@ -73,6 +76,40 @@ pub fn paint_glyph(p: &egui::Painter, glyph: Glyph, center: Pos2, color: Color32
                     center + egui::vec2(4.5, y),
                 ], s);
             }
+        }
+        Glyph::Recent => {
+            p.circle_stroke(center, 7.3, s);
+            p.line_segment([
+                center,
+                center + egui::vec2(0.0, -4.4),
+            ], s);
+            p.line_segment([
+                center,
+                center + egui::vec2(4.0, 2.2),
+            ], s);
+        }
+        Glyph::Files => {
+            p.add(egui::Shape::closed_line(vec![
+                center + egui::vec2(-8.0, -4.0),
+                center + egui::vec2(-4.4, -7.0),
+                center + egui::vec2(0.0, -7.0),
+                center + egui::vec2(2.0, -4.0),
+                center + egui::vec2(8.0, -4.0),
+                center + egui::vec2(8.0, 6.5),
+                center + egui::vec2(-8.0, 6.5),
+            ], s));
+        }
+        Glyph::Actions => {
+            p.circle_stroke(center + egui::vec2(-5.5, -4.0), 2.3, s);
+            p.circle_stroke(center + egui::vec2(5.5, 4.5), 2.3, s);
+            p.line_segment([
+                center + egui::vec2(-5.5, -1.3),
+                center + egui::vec2(-5.5, 4.5),
+            ], s);
+            p.line_segment([
+                center + egui::vec2(-5.5, 4.5),
+                center + egui::vec2(2.7, 4.5),
+            ], s);
         }
         Glyph::Settings => {
             let r1 = 6.8;
@@ -164,6 +201,24 @@ pub fn toolbar_button(
     response
 }
 
+/// Consistent icon-only navigation for narrow windows. Labels stay accessible
+/// as tooltips instead of competing with the XLINK wordmark.
+pub fn toolbar_icon_button(
+    ui: &mut egui::Ui, glyph: Glyph, tooltip: &str, selected: bool,
+) -> Response {
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(35.0, 35.0), Sense::click());
+    surface(ui, rect, &response, selected, false);
+    paint_glyph(ui.painter(), glyph, rect.center(), INK);
+    response.on_hover_text(tooltip)
+}
+
+/// Switch to icon navigation before the brand and all controls can collide.
+/// At the minimum supported 490 px inner window, compact controls take
+/// ~430 px including the Stop Sharing label and navigation spacing.
+pub fn compact_navigation(window_width: f32) -> bool {
+    window_width < 910.0
+}
+
 pub fn numeric_key(ui: &mut egui::Ui, text: &str, width: f32, height: f32) -> Response {
     let (rect, response) = ui.allocate_exact_size(
         egui::vec2(width.max(34.0), height), Sense::click()
@@ -187,7 +242,7 @@ pub fn numeric_key(ui: &mut egui::Ui, text: &str, width: f32, height: f32) -> Re
 
 pub fn connect_button(ui: &mut egui::Ui, width: f32, enabled: bool) -> Response {
     let (rect, response) = ui.allocate_exact_size(
-        egui::vec2(width.max(130.0), 46.0), Sense::click(),
+        egui::vec2(width.max(130.0), 42.0), Sense::click(),
     );
     let hover = ui.ctx().animate_bool(response.id.with("hover"), response.hovered() && enabled);
     let bg = if enabled {
@@ -256,7 +311,7 @@ pub fn code_slots(
 ) -> SlotResult {
     let m = metrics(width);
     let (rect, response) = ui.allocate_exact_size(
-        Vec2::new(m.slots_width, 57.0),
+        Vec2::new(m.slots_width, 48.0),
         Sense::click(),
     );
     if refocus && enabled { response.request_focus(); }
@@ -368,6 +423,19 @@ pub fn code_slots(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn compact_toolbar_activates_before_labels_collide() {
+        assert!(compact_navigation(490.0));
+        assert!(compact_navigation(688.0));
+        assert!(compact_navigation(909.0));
+        assert!(!compact_navigation(910.0));
+        assert!(!compact_navigation(1200.0));
+        // 5 icon-only navigation buttons (35px each), Stop Sharing (130px),
+        // brand (75px), eight 6px gaps and horizontal 28px margins.
+        let required = 5.0 * 35.0 + 130.0 + 75.0 + 8.0 * 6.0 + 28.0;
+        assert!(required <= 490.0, "compact header exceeds minimum window");
+    }
 
     #[test]
     fn responsive_slots_and_keypad_fit_container() {
