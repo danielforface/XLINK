@@ -395,6 +395,7 @@ struct NexusGuiApp {
     file_selected_remote: Option<file_service::Item>,
     file_destination: String,
     file_clipboard: Option<(String, bool)>,
+    file_pending_delete: Option<String>,
     code_ready_at: Option<Instant>,
     refocus_number_input: bool,
     numeric_cursor: usize,
@@ -492,6 +493,7 @@ impl NexusGuiApp {
             file_selected_remote: None,
             file_destination: String::new(),
             file_clipboard: None,
+            file_pending_delete: None,
             recent_history: match history::History::open() {
                 Ok(archive) => Some(archive),
                 Err(error) => {
@@ -1585,6 +1587,261 @@ impl NexusGuiApp {
                     });
             }
         );
+    }
+
+    fn start_file_action(&mut self, action: file_client::Operation) {
+        let Some(connection) = self.client_service_connection.clone() else {
+            self.set_status("Connect to an approved remote computer to browse its files");
+            return;
+        };
+        let snapshot = Arc::clone(&self.file_snapshot);
+        if let Ok(mut state) = snapshot.lock() {
+            if state.busy {
+                self.set_status("A file transfer is already in progress");
+                return;
+            }
+            state.busy = true;
+            state.message = "Communicating securely with the remote computer...".into();
+            state.transferred = 0;
+            state.total = 0;
+        }
+        let should_refresh = !matches!(action, file_client::Operation::List(_));
+        self._runtime.spawn(async move {
+            let feedback = Arc::clone(&snapshot);
+            let result = file_client::execute(&connection, action, |current, total| {
+                if let Ok(mut state) = feedback.lock() {
+                    state.transferred = current;
+                    state.total = total;
+                }
+            }).await;
+            if let Ok(mut state) = snapshot.lock() {
+                match result {
+                    Ok(file_client::Outcome::Directory { path, items }) => {
+                        state.remote_path = path;
+                        state.remote_items = items;
+                        state.message = "Remote folder refreshed".into();
+                    }
+                    Ok(file_client::Outcome::Complete(msg)) => {
+                        state.message = msg;
+                    }
+                    Err(error) => state.message = format!("File operation failed: {error}"),
+                }
+                state.busy = false;
+            }
+            if should_refresh {
+                let path = snapshot.lock().ok().map(|s| s.remote_path.clone())
+                    .unwrap_or_default();
+                if let Ok(file_client::Outcome::Directory { path, items }) =
+                    file_client::execute(
+                        &connection,
+                        file_client::Operation::List(path),
+                        |_, _| {},
+                    ).await {
+                    if let Ok(mut state) = snapshot.lock() {
+                        state.remote_items = items;
+                        state.remote_path = path;
+                    }
+                }
+            }
+        });
+    }
+
+    fn draw_file_manager(&mut self, ui: &mut egui::Ui) {
+        let snapshot = match self.file_snapshot.lock() {
+            Ok(state) => state.clone(),
+            Err(_) => {
+                ui.label("File manager is temporarily unavailable");
+                return;
+            }
+        };
+        ui.heading("Secure file explorer");
+        ui.add(egui::Label::new(
+            "File sharing uses a separate encrypted QUIC channel. The remote person              must explicitly authorize access to Downloads/XLINK-Shared."
+        ).wrap(true));
+        ui.add_space(11.0);
+        if snapshot.busy {
+            ui.spinner();
+            if snapshot.total > 0 {
+                ui.add(egui::ProgressBar::new(
+                    (snapshot.transferred as f64 / snapshot.total as f64)
+                        .clamp(0.0, 1.0) as f32
+                ).show_percentage());
+                ui.label(format!(
+                    "{} / {} bytes transferred", snapshot.transferred, snapshot.total
+                ));
+            }
+        }
+        ui.label(RichText::new(&snapshot.message)
+            .size(12.0).color(Color32::from_rgb(60, 101, 169)));
+        ui.add_space(10.0);
+
+        let mut requested: Option<file_client::Operation> = None;
+        let selectable = !snapshot.busy && self.client_service_connection.is_some();
+        ui.columns(2, |panes| {
+            panes[0].heading("This computer");
+            panes[0].label(
+                RichText::new(self.file_local_folder.display().to_string()).size(11.0)
+            );
+            if panes[0].button("Choose folder").clicked() {
+                if let Some(path) = rfd::FileDialog::new().pick_folder() {
+                    self.file_local_folder = path;
+                    self.file_selected_local = None;
+                }
+            }
+            if panes[0].button("Choose any file for upload").clicked() {
+                self.file_selected_local = rfd::FileDialog::new().pick_file();
+            }
+            panes[0].separator();
+            egui::ScrollArea::vertical().max_height(260.0)
+                .show(&mut panes[0], |ui| {
+                    if let Ok(entries) = std::fs::read_dir(&self.file_local_folder) {
+                        for entry in entries.flatten().take(350) {
+                            let path = entry.path();
+                            let is_dir = path.is_dir();
+                            let label = format!(
+                                "{} {}", if is_dir { "Folder" } else { "File" },
+                                entry.file_name().to_string_lossy()
+                            );
+                            let selected = self.file_selected_local.as_ref()
+                                .is_some_and(|selection| selection == &path);
+                            if ui.selectable_label(selected, label).clicked() {
+                                if is_dir {
+                                    self.file_local_folder = path;
+                                    self.file_selected_local = None;
+                                } else { self.file_selected_local = Some(path); }
+                            }
+                        }
+                    }
+                });
+            if let Some(selected) = self.file_selected_local.as_ref() {
+                panes[0].label(RichText::new(format!(
+                    "Selected: {}", selected.display()
+                )).small());
+            }
+            if panes[0].add_enabled(selectable, egui::Button::new(
+                "Upload selected file to remote"
+            )).clicked() {
+                if let Some(source) = self.file_selected_local.clone() {
+                    let name = source.file_name()
+                        .map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+                    let path = if snapshot.remote_path.is_empty() {
+                        name
+                    } else {
+                        format!("{}/{}", snapshot.remote_path, name)
+                    };
+                    requested = Some(file_client::Operation::Upload {
+                        source, target: path,
+                    });
+                }
+            }
+
+            panes[1].heading("Remote computer");
+            panes[1].label(format!("XLINK-Shared / {}", snapshot.remote_path));
+            panes[1].horizontal(|ui| {
+                if ui.add_enabled(selectable, egui::Button::new("Up")).clicked() {
+                    let parent = std::path::Path::new(&snapshot.remote_path)
+                        .parent().map(|p| p.to_string_lossy().to_string())
+                        .unwrap_or_default();
+                    requested = Some(file_client::Operation::List(parent));
+                    self.file_selected_remote = None;
+                }
+                if ui.add_enabled(selectable, egui::Button::new("Refresh")).clicked() {
+                    requested = Some(file_client::Operation::List(
+                        snapshot.remote_path.clone()
+                    ));
+                }
+            });
+            panes[1].separator();
+            egui::ScrollArea::vertical().max_height(260.0)
+                .show(&mut panes[1], |ui| {
+                    for entry in &snapshot.remote_items {
+                        let title = format!(
+                            "{} {}{}", if entry.is_dir { "Folder" } else { "File" },
+                            entry.name, if entry.is_dir { "" } else { "" },
+                        );
+                        let selected = self.file_selected_remote.as_ref()
+                            .is_some_and(|item| item.name == entry.name);
+                        if ui.selectable_label(selected, title).clicked() {
+                            if entry.is_dir {
+                                let path = if snapshot.remote_path.is_empty() {
+                                    entry.name.clone()
+                                } else {
+                                    format!("{}/{}", snapshot.remote_path, entry.name)
+                                };
+                                requested = Some(file_client::Operation::List(path));
+                                self.file_selected_remote = None;
+                            } else {
+                                self.file_selected_remote = Some(entry.clone());
+                            }
+                        }
+                    }
+                });
+            let selected_remote_path = self.file_selected_remote.as_ref().map(|file| {
+                if snapshot.remote_path.is_empty() { file.name.clone() }
+                else { format!("{}/{}", snapshot.remote_path, file.name) }
+            });
+            if panes[1].add_enabled(selectable && selected_remote_path.is_some(),
+                egui::Button::new("Download to local folder")
+            ).clicked() {
+                if let Some(source) = selected_remote_path.clone() {
+                    requested = Some(file_client::Operation::Download {
+                        source, directory: self.file_local_folder.clone(),
+                    });
+                }
+            }
+            panes[1].horizontal(|ui| {
+                if ui.add_enabled(selectable && selected_remote_path.is_some(),
+                    egui::Button::new("Copy")).clicked() {
+                    self.file_clipboard = selected_remote_path.clone().map(|p| (p, false));
+                }
+                if ui.add_enabled(selectable && selected_remote_path.is_some(),
+                    egui::Button::new("Cut")).clicked() {
+                    self.file_clipboard = selected_remote_path.clone().map(|p| (p, true));
+                }
+                if ui.add_enabled(selectable && selected_remote_path.is_some(),
+                    egui::Button::new("Delete")).clicked() {
+                    self.file_pending_delete = selected_remote_path;
+                }
+            });
+            panes[1].label("Destination name/path (or new folder name):");
+            panes[1].text_edit_singleline(&mut self.file_destination);
+            panes[1].horizontal(|ui| {
+                if ui.add_enabled(selectable && self.file_clipboard.is_some()
+                    && !self.file_destination.is_empty(),
+                    egui::Button::new("Paste")).clicked() {
+                    if let Some((from, cut)) = self.file_clipboard.take() {
+                        let to = self.file_destination.clone();
+                        requested = Some(if cut {
+                            file_client::Operation::Move { from, to }
+                        } else {
+                            file_client::Operation::Copy { from, to }
+                        });
+                    }
+                }
+                if ui.add_enabled(selectable && !self.file_destination.is_empty(),
+                    egui::Button::new("New folder")).clicked() {
+                    requested = Some(file_client::Operation::Mkdir(
+                        self.file_destination.clone()
+                    ));
+                }
+            });
+        });
+
+        if let Some(path) = self.file_pending_delete.clone() {
+            ui.add_space(10.0);
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(format!("Delete remote file {path}?"))
+                    .color(Color32::from_rgb(174, 54, 64)));
+                if ui.button("Confirm deletion").clicked() {
+                    requested = Some(file_client::Operation::Delete(path));
+                    self.file_pending_delete = None;
+                }
+                if ui.button("Cancel").clicked() {
+                    self.file_pending_delete = None;
+                }
+            });
+        }
+        if let Some(request) = requested { self.start_file_action(request); }
     }
 
     fn draw_history_screen(&mut self, ui: &mut egui::Ui) {
