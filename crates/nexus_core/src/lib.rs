@@ -179,6 +179,7 @@ pub enum ControlMessage {
     SimulatedMouseMove { x_norm: f32, y_norm: f32 },
     SimulatedKeyEvent { virtual_key: u16, pressed: bool },
     MouseButtonEvent { button: u8, pressed: bool },
+    SetTargetFps { fps: u16 },
     Ack(String),
 }
 
