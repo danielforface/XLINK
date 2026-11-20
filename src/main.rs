@@ -3031,6 +3031,86 @@ async fn run_host_peer_session(
     Ok(())
 }
 
+// Audio is isolated from video/control and never runs until the remote
+// person explicitly authorized sound sharing. The client owns the stream:
+// it sends a fixed service name on its own QUIC bidirectional channel.
+struct AudioShutdown(Arc<AtomicBool>);
+impl Drop for AudioShutdown {
+    fn drop(&mut self) { self.0.store(true, Ordering::Release); }
+}
+
+async fn run_host_audio_service(
+    connection: nexus_network::Connection,
+    approved: bool,
+    stop: Arc<AtomicBool>,
+    enabled: Arc<AtomicBool>,
+) -> Result<()> {
+    let _shutdown = AudioShutdown(Arc::clone(&stop));
+    let (mut audio_s, mut audio_r) = time::timeout(
+        Duration::from_secs(45), connection.accept_bi(),
+    ).await.context("technician did not open audio service")?
+        .context("audio stream could not be accepted")?;
+    let label: String = recv_message_limited(&mut audio_r, 64).await
+        .context("audio negotiation failed")?;
+    if label != "XLINK-AUDIO-1" { bail!("unknown QUIC audio service label"); }
+    send_message_limited(&mut audio_s, &approved, 64).await?;
+    if !approved { return Ok(()); }
+
+    let samples = audio::spawn_loopback_capture(Arc::clone(&stop))?;
+    while !stop.load(Ordering::Acquire) {
+        match samples.try_recv() {
+            Ok(chunk) if enabled.load(Ordering::Acquire) => {
+                audio::validate_chunk(&chunk)?;
+                time::timeout(
+                    Duration::from_secs(2),
+                    send_message_limited(&mut audio_s, &chunk, audio::MAX_CHUNK + 128)
+                ).await.context("audio transport is too slow")??;
+            }
+            Ok(_) => {}
+            Err(std::sync::mpsc::TryRecvError::Empty) => {
+                time::sleep(Duration::from_millis(7)).await;
+            }
+            Err(std::sync::mpsc::TryRecvError::Disconnected) =>
+                bail!("Windows loopback audio capture stopped"),
+        }
+    }
+    Ok(())
+}
+
+async fn run_client_audio_service(
+    connection: nexus_network::Connection,
+    stop: Arc<AtomicBool>,
+) -> Result<()> {
+    let _shutdown = AudioShutdown(Arc::clone(&stop));
+    let (mut audio_s, mut audio_r) = connection.open_bi().await
+        .context("failed to open isolated QUIC audio channel")?;
+    send_message_limited(&mut audio_s, &"XLINK-AUDIO-1", 64).await?;
+    let approved: bool = time::timeout(
+        Duration::from_secs(15), recv_message_limited(&mut audio_r, 64)
+    ).await.context("Host audio permission response timed out")??;
+    if !approved {
+        info!("Remote computer did not approve audio; silence enforced");
+        return Ok(());
+    }
+    let sink = audio::spawn_playback(Arc::clone(&stop))?;
+    while !stop.load(Ordering::Acquire) {
+        let chunk: Vec<u8> = match time::timeout(
+            Duration::from_secs(20),
+            recv_message_limited(&mut audio_r, audio::MAX_CHUNK + 128),
+        ).await {
+            Ok(Ok(chunk)) => chunk,
+            Ok(Err(error)) => return Err(error).context("audio stream ended"),
+            Err(_) => continue, // Silence is normal; no background polling.
+        };
+        audio::validate_chunk(&chunk)?;
+        if sink.try_send(chunk).is_err() {
+            // Stale audio packets are dropped; QUIC video priority is unaffected.
+            tracing::debug!("dropping queued audio to maintain low latency");
+        }
+    }
+    Ok(())
+}
+
 async fn run_client_session(
     invitation: short_code::Invitation,
     display_name: Option<String>,
@@ -3172,6 +3252,17 @@ async fn run_client_session(
             .await.context("approved session did not start its video stream")?
             .context("server failed to provide a video stream")?;
         let frame_recv = FrameReceiver(Arc::new(tokio::sync::Mutex::new(frame_r)));
+
+        let client_audio_stop = Arc::new(AtomicBool::new(false));
+        let client_audio_connection = connection.clone();
+        let client_audio_shutdown = Arc::clone(&client_audio_stop);
+        let mut client_audio_task = AbortOnDrop(tokio::spawn(async move {
+            if let Err(error) = run_client_audio_service(
+                client_audio_connection, client_audio_shutdown,
+            ).await {
+                warn!(?error, "audio playback channel ended");
+            }
+        }));
 
         let (viewer_frame_tx, mut viewer_input_rx) =
             spawn_remote_viewer("NexusP2P - Remote Session [Active]")?;
@@ -3512,6 +3603,9 @@ async fn run_client_session(
             }
         }
 
+        client_audio_stop.store(true, Ordering::Release);
+        client_audio_task.0.abort();
+        let _ = (&mut client_audio_task.0).await;
         let _ = session_state.transition(SessionState::Terminated);
         if let Some(ref c) = quic_conn_to_close {
             c.close(0u32.into(), b"client shutdown");
