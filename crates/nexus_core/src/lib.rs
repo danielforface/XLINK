@@ -181,6 +181,7 @@ pub enum ControlMessage {
     MouseButtonEvent { button: u8, pressed: bool },
     SetTargetFps { fps: u16 },
     ReleaseAllInputs,
+    SetAudioEnabled { enabled: bool },
     Ack(String),
 }
 
