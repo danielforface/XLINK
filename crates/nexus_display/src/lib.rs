@@ -56,6 +56,11 @@ pub enum ViewerInputEvent {
     ScreenshotRemote(ViewerFrame),
     ScreenshotLocal,
     SetFrameRate(u16),
+    ActionRecordStart,
+    ActionRecordStop,
+    ActionReplay { repetitions: Option<u32> },
+    ActionReplayFile { repetitions: Option<u32> },
+    ActionStopPlayback,
 }
 
 impl ScreenCapturer {
@@ -376,6 +381,7 @@ fn run_remote_viewer(
     let mut last_buttons = [false; 3];
     let mut fullscreen = None;
     let mut desired_fps = 30u16;
+    let mut recording = false;
 
     loop {
         if !window.is_open() {
@@ -408,6 +414,39 @@ fn run_remote_viewer(
             last_buttons = [false; 3];
         }
 
+        if window.is_key_pressed(Key::F5, KeyRepeat::No) {
+            recording = !recording;
+            let event = if recording {
+                ViewerInputEvent::ActionRecordStart
+            } else {
+                ViewerInputEvent::ActionRecordStop
+            };
+            let _ = input_tx.blocking_send(event);
+            window.set_title(&format!(
+                "{} | {} | F11 Fullscreen",
+                title, if recording { "REC ●" } else { "Recording stopped" }
+            ));
+        }
+        if window.is_key_pressed(Key::F6, KeyRepeat::No) {
+            let repeated = if window.is_key_down(Key::LeftShift)
+                || window.is_key_down(Key::RightShift) {
+                None
+            } else if window.is_key_down(Key::LeftCtrl)
+                || window.is_key_down(Key::RightCtrl) {
+                Some(5)
+            } else { Some(1) };
+            let _ = input_tx.blocking_send(
+                ViewerInputEvent::ActionReplay { repetitions: repeated },
+            );
+        }
+        if window.is_key_pressed(Key::F3, KeyRepeat::No) {
+            let _ = input_tx.blocking_send(
+                ViewerInputEvent::ActionReplayFile { repetitions: Some(1) },
+            );
+        }
+        if window.is_key_pressed(Key::F4, KeyRepeat::No) {
+            let _ = input_tx.blocking_send(ViewerInputEvent::ActionStopPlayback);
+        }
         if window.is_key_pressed(Key::F11, KeyRepeat::No) {
             if let Err(error) = toggle_native_fullscreen(
                 window.get_window_handle(), &mut fullscreen
