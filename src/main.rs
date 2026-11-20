@@ -10,6 +10,7 @@ mod file_client;
 mod history;
 mod local_actions;
 mod screenshot;
+mod network_profile;
 mod numeric_entry;
 mod ui_widgets;
 mod short_code;
@@ -92,6 +93,8 @@ fn main() -> Result<()> {
     init_tracing();
     let trust_registry = trusted::TrustRegistry::load_or_create()
         .context("cannot load Windows-protected device identity")?;
+    let network_profile = network_profile::NetworkProfile::load()
+        .context("cannot load protected network configuration")?;
 
     if let Err(error) = register_nexus_protocol_handler() {
         warn!(?error, "failed to register nexus protocol handler");
@@ -114,6 +117,7 @@ fn main() -> Result<()> {
         runtime_event_tx,
         Arc::clone(&ui_bridge),
         trust_registry.clone(),
+        network_profile.clone(),
     ));
 
     let mut runtime_event_rx_slot = Some(runtime_event_rx);
@@ -141,6 +145,7 @@ fn main() -> Result<()> {
                 launch_connection_seed.clone(),
                 Arc::clone(&runtime),
                 trust_registry.clone(),
+                network_profile.clone(),
             );
             Box::new(app)
         }),
@@ -187,6 +192,7 @@ struct HostRuntimeConfig {
     max_width: u16,
     inject_input: bool,
     seed: [u8; 32],
+    network_profile: network_profile::NetworkProfile,
 }
 
 #[derive(Debug)]
@@ -196,11 +202,13 @@ enum RuntimeCommand {
         access_id: String,
         display_name: Option<String>,
         remember_host: bool,
+        network_profile: network_profile::NetworkProfile,
         _transport_mode: TransportMode,
     },
     ConnectTrusted {
         endpoint_id: [u8; 32],
         display_name: Option<String>,
+        network_profile: network_profile::NetworkProfile,
     },
     RunDiagnostics,
     StopHosting,
@@ -413,6 +421,8 @@ struct NexusGuiApp {
     approve_audio_for_session: bool,
     approve_files_for_session: bool,
     trust_registry: trusted::TrustRegistry,
+    network_profile: network_profile::NetworkProfile,
+    network_draft: network_profile::NetworkProfile,
     host_advertise_addr_input: String,
 
     client_display_name: String,
@@ -452,6 +462,7 @@ impl NexusGuiApp {
         launch_connection_seed: Option<String>,
         runtime: Arc<Runtime>,
         trust_registry: trusted::TrustRegistry,
+        network_profile: network_profile::NetworkProfile,
     ) -> Self {
         apply_modern_theme(&cc.egui_ctx);
 
@@ -525,6 +536,8 @@ impl NexusGuiApp {
             approve_audio_for_session: false,
             approve_files_for_session: false,
             trust_registry,
+            network_draft: network_profile.clone(),
+            network_profile,
             host_advertise_addr_input: default_advertise,
             client_display_name: String::new(),
             pending_client_permission: None,
@@ -1462,6 +1475,7 @@ impl NexusGuiApp {
                             RuntimeCommand::ConnectTrusted {
                                 endpoint_id: peer.endpoint_id,
                                 display_name: None,
+                                network_profile: self.network_profile.clone(),
                             }
                         ) {
                             self.push_log(format!("Cannot start saved connection: {error}"));
@@ -2069,6 +2083,7 @@ impl NexusGuiApp {
             max_width: self.host_max_width,
             inject_input: self.host_inject_input,
             seed: self.host_seed,
+            network_profile: self.network_profile.clone(),
         });
 
         match self.runtime_cmd_tx.try_send(command) {
@@ -2107,6 +2122,7 @@ impl NexusGuiApp {
                 Some(display_name)
             },
             remember_host: self.remember_this_computer,
+            network_profile: self.network_profile.clone(),
             _transport_mode: self.host_transport_mode,
         };
 
@@ -2660,6 +2676,7 @@ async fn runtime_dispatch_loop(
     runtime_event_tx: mpsc::Sender<RuntimeEvent>,
     ui_bridge: Arc<UiBridge>,
     trust_registry: trusted::TrustRegistry,
+    initial_profile: network_profile::NetworkProfile,
 ) {
     let host_running = Arc::new(AtomicBool::new(false));
     let client_running = Arc::new(AtomicBool::new(false));
@@ -2668,10 +2685,14 @@ async fn runtime_dispatch_loop(
 
     // Spawn STUN network topology diagnostic immediately on startup
     let event_tx_clone = runtime_event_tx.clone();
-    tokio::spawn(async move {
-        let (topology, public_addr) = run_diagnostics(0).await;
-        let _ = event_tx_clone.send(RuntimeEvent::DiagnosticsCompleted { topology, public_addr }).await;
-    });
+    if !initial_profile.is_private() {
+        tokio::spawn(async move {
+            let (topology, public_addr) = run_diagnostics(0).await;
+            let _ = event_tx_clone.send(RuntimeEvent::DiagnosticsCompleted {
+                topology, public_addr
+            }).await;
+        });
+    }
 
     while let Some(command) = runtime_cmd_rx.recv().await {
         match command {
@@ -2727,6 +2748,7 @@ async fn runtime_dispatch_loop(
                 access_id,
                 display_name,
                 remember_host,
+                network_profile,
                 _transport_mode: _,
             } => {
                 if client_running
@@ -2771,16 +2793,17 @@ async fn runtime_dispatch_loop(
 
                     let run_result = async {
                         let _ = event_tx.send(RuntimeEvent::SessionStatus(
-                            "Authenticating short code through public mailbox...".to_string()
+                            format!("Authenticating short code through {}",
+                                network_profile.describe())
                         )).await;
-                        let invitation = short_code::resolve(&access_id).await
-                            .context("public pairing failed")?;
+                        let invitation = short_code::resolve(&access_id, &network_profile).await
+                            .context("selected mailbox pairing failed; no public fallback")?;
                         let _ = event_tx.send(RuntimeEvent::SessionStatus(
                             "Identity verified; starting encrypted QUIC connection".to_string()
                         )).await;
                         run_client_session(
                             invitation, display_name, event_tx.clone(), bridge,
-                            registry, remember_host,
+                            registry, remember_host, network_profile,
                         ).await
                     }.await;
 
@@ -2807,7 +2830,9 @@ async fn runtime_dispatch_loop(
                     }
                 }));
             }
-            RuntimeCommand::ConnectTrusted { endpoint_id, display_name } => {
+            RuntimeCommand::ConnectTrusted {
+                endpoint_id, display_name, network_profile
+            } => {
                 if client_running.compare_exchange(
                     false, true, Ordering::AcqRel, Ordering::Acquire
                 ).is_err() {
@@ -2832,7 +2857,8 @@ async fn runtime_dispatch_loop(
                         ticket: TRUSTED_SESSION_MARKER.to_string(),
                     };
                     let result = run_client_session(
-                        invitation, display_name, event_tx.clone(), bridge, registry, false
+                        invitation, display_name, event_tx.clone(), bridge, registry,
+                        false, network_profile,
                     ).await;
                     running_flag.store(false, Ordering::Release);
                     let _ = event_tx.send(RuntimeEvent::ClientLifecycle {
@@ -2930,7 +2956,7 @@ async fn run_server_session(
     // The private endpoint identity stays local; only its PUBLIC part is
     // exchanged in an authenticated Magic Wormhole pairing.
     let (secret_key, _) = derive_keys_from_seed(&config.seed);
-    let endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::N0)
+    let endpoint = config.network_profile.endpoint_builder()?
         .secret_key(secret_key)
         .alpns(vec![nexus_network::NEXUS_ALPN.to_vec()])
         .bind()
@@ -2940,7 +2966,7 @@ async fn run_server_session(
     'host_pairing: loop {
         let (ready_tx, mut ready_rx) = mpsc::channel(1);
         let pairing = short_code::advertise_and_pair(
-            *node_id.as_bytes(), &ready_tx,
+            *node_id.as_bytes(), &ready_tx, &config.network_profile,
         );
         tokio::pin!(pairing);
         // Never display a randomly fabricated local code: wait for the
@@ -3797,15 +3823,16 @@ async fn run_client_session(
     ui_bridge: Arc<UiBridge>,
     trust_registry: trusted::TrustRegistry,
     remember_host: bool,
+    network_profile: network_profile::NetworkProfile,
 ) -> Result<()> {
     let remote_id = iroh::PublicKey::from_bytes(&invitation.endpoint_id)
         .context("connection ID is not a valid endpoint public key")?;
     let session_id = invitation.ticket;
 
     // Create client endpoint
-    let endpoint = create_client_endpoint_with_secret(
-        SecretKey::from_bytes(&trust_registry.technician_seed()?),
-    ).await?;
+    let endpoint = network_profile.endpoint_builder()?
+        .secret_key(SecretKey::from_bytes(&trust_registry.technician_seed()?))
+        .bind().await.context("failed to create selected infrastructure endpoint")?;
 
     // N0 provides endpoint discovery, NAT traversal and managed relay fallback.
     // Avoid pinning a guessed relay hostname that may not be the host's actual home relay.
@@ -3813,7 +3840,7 @@ async fn run_client_session(
     let mut last_connect_error = String::from("no connection attempt completed");
     let mut connection = None;
     for attempt in 0..3u32 {
-        let target_addr = EndpointAddr::new(remote_id.clone());
+        let target_addr = network_profile.target(remote_id.clone())?;
         match time::timeout(HANDSHAKE_TIMEOUT, connect_to_peer(&endpoint, target_addr)).await {
             Ok(Ok(connected)) => {
                 connection = Some(connected);
