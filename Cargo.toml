@@ -75,6 +75,7 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 winreg.workspace = true
 wasapi.workspace = true
+windows.workspace = true
 nexus_core = { path = "crates/nexus_core" }
 nexus_display = { path = "crates/nexus_display" }
 nexus_input = { path = "crates/nexus_input" }

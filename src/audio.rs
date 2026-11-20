@@ -2,7 +2,7 @@
 //! endpoint in WASAPI loopback CAPTURE mode; never records a microphone.
 //! Each worker owns its own COM apartment, so UI and Tokio threads never
 //! share non-Send Windows COM pointers.
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{bail, Context, Result};
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
@@ -17,7 +17,7 @@ pub const MAX_CHUNK: usize = 32 * 1024; // <= ~85ms per packet
 pub const MAX_BUFFER: usize = 96 * 1024; // <= ~250ms jitter/queued data
 
 fn format() -> WaveFormat {
-    WaveFormat::new(32, 32, &SampleType::Float, SAMPLE_RATE, CHANNELS, None)
+    WaveFormat::new(32, 32, &SampleType::Float, SAMPLE_RATE as usize, CHANNELS, None)
 }
 
 /// Capture default speaker output. Bounded channel drops old audio under
@@ -40,7 +40,7 @@ pub fn spawn_loopback_capture(
 fn capture_loop(
     stop: Arc<AtomicBool>, tx: mpsc::SyncSender<Vec<u8>>,
 ) -> Result<()> {
-    initialize_mta().context("WASAPI COM capture initialization failed")?;
+    initialize_mta().ok().context("WASAPI COM capture initialization failed")?;
     let device = get_default_device(&Direction::Render)
         .context("no default Windows speaker/output to capture")?;
     let mut client = device.get_iaudioclient()?;
@@ -94,7 +94,7 @@ pub fn spawn_playback(
 fn playback_loop(
     stop: Arc<AtomicBool>, rx: mpsc::Receiver<Vec<u8>>,
 ) -> Result<()> {
-    initialize_mta().context("WASAPI COM render initialization failed")?;
+    initialize_mta().ok().context("WASAPI COM render initialization failed")?;
     let device = get_default_device(&Direction::Render)
         .context("no default audio playback device")?;
     let mut client = device.get_iaudioclient()?;

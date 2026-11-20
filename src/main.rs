@@ -4055,9 +4055,12 @@ async fn run_client_session(
                             let sender = control_send_clone.clone();
                             let events = event_tx_for_screenshots.clone();
                             let play_path = path.clone();
+                            // The replay count must be copied out of the borrowed UI
+                            // event before entering the 'static task.
+                            let replay_count = *repetitions;
                             playback_task = Some(AbortOnDrop(tokio::spawn(async move {
                                 let result = actions::replay(
-                                    &play_path, *repetitions, &stop, |action| {
+                                    &play_path, replay_count, &stop, |action| {
                                         let sender = sender.clone();
                                         async move {
                                             let message = match action {

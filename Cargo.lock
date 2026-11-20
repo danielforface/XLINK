@@ -4019,6 +4019,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "wasapi",
+ "windows 0.52.0",
  "winreg",
 ]
 

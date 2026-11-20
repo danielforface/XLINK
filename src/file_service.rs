@@ -106,7 +106,7 @@ pub fn list(root: &Path, path: &str) -> Result<Vec<Item>> {
     let mut entries = Vec::new();
     for result in fs::read_dir(dir)? {
         let entry = result?;
-        let meta = entry.symlink_metadata()?;
+        let meta = fs::symlink_metadata(entry.path())?;
         if meta.file_type().is_symlink() { continue; }
         let name = entry.file_name().to_string_lossy().to_string();
         if name.len() > MAX_NAME_BYTES { continue; }
