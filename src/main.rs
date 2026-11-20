@@ -33,7 +33,7 @@ use nexus_input::{
     InputController, KeyboardPreview, MousePreview, SessionState as InputSessionState,
 };
 use nexus_network::{
-    accept_connection, connect_to_peer, create_client_endpoint_with_secret, EndpointAddr, RecvStream,
+    accept_connection, connect_to_peer, RecvStream,
     SendStream, SecretKey,
 };
 use qrcode_generator::QrCodeEcc;
@@ -1512,6 +1512,89 @@ impl NexusGuiApp {
                     .inner_margin(egui::Margin::same(20.0))
                     .show(ui, |ui| {
                         ui.set_width((width - 40.0).max(100.0));
+                        ui.heading("Connection infrastructure");
+                        ui.add(egui::Label::new(
+                            RichText::new("Choose where XLINK discovers peers and routes encrypted QUIC.")
+                                .size(12.0).color(muted),
+                        ).wrap(true));
+                        ui.add_space(8.0);
+                        ui.radio_value(
+                            &mut self.network_draft.mode,
+                            network_profile::NetworkMode::Public,
+                            "Public (default) · Magic Wormhole + iroh N0",
+                        );
+                        ui.radio_value(
+                            &mut self.network_draft.mode,
+                            network_profile::NetworkMode::Private,
+                            "Private servers · no public fallback",
+                        );
+                        if self.network_draft.is_private() {
+                            ui.add_space(8.0);
+                            ui.label(RichText::new("Private pairing mailbox (WSS)")
+                                .strong().size(12.0));
+                            ui.add(egui::TextEdit::singleline(&mut self.network_draft.mailbox_url)
+                                .desired_width(ui.available_width())
+                                .hint_text("wss://mailbox.example.org/v1"));
+                            ui.add_space(7.0);
+                            ui.label(RichText::new("Private iroh relay (HTTPS)")
+                                .strong().size(12.0));
+                            ui.add(egui::TextEdit::singleline(&mut self.network_draft.relay_url)
+                                .desired_width(ui.available_width())
+                                .hint_text("https://relay.example.org"));
+                            ui.add_space(6.0);
+                            ui.add(egui::Label::new(
+                                RichText::new(
+                                    "Both computers must configure the same servers.                                      Certificates must be valid and trusted by Windows.                                      Private mode does not contact N0 discovery or                                      the public Magic Wormhole mailbox."
+                                ).size(11.0).color(muted),
+                            ).wrap(true));
+                        }
+                        ui.add_space(10.0);
+                        let dirty = self.network_draft != self.network_profile;
+                        ui.horizontal(|ui| {
+                            if ui.add_enabled(
+                                dirty && !self.host_session_active && !self.client_running,
+                                egui::Button::new("Apply connection settings"),
+                            ).clicked() {
+                                match self.network_draft.validate().and_then(|_| self.network_draft.save()) {
+                                    Ok(()) => {
+                                        self.network_profile = self.network_draft.clone();
+                                        if self.host_running {
+                                            let _ = self.runtime_cmd_tx.try_send(
+                                                RuntimeCommand::StopHosting
+                                            );
+                                            self.generated_access_id = None;
+                                            self.code_ready_at = None;
+                                        }
+                                        self.has_auto_hosted = true;
+                                        self.set_status(
+                                            "Infrastructure saved securely. Start hosting again                                              to publish a code using the selected servers."
+                                        );
+                                    }
+                                    Err(error) => {
+                                        self.push_log(format!(
+                                            "Private infrastructure configuration rejected: {error}"
+                                        ));
+                                        self.set_status(format!("Invalid private server settings: {error}"));
+                                    }
+                                }
+                            }
+                            if dirty && ui.small_button("Discard changes").clicked() {
+                                self.network_draft = self.network_profile.clone();
+                            }
+                        });
+                        ui.add_space(7.0);
+                        ui.label(
+                            RichText::new(format!("Active: {}", self.network_profile.describe()))
+                                .size(11.0).color(muted)
+                        );
+                        ui.add(egui::Label::new(
+                            RichText::new(
+                                "TLS validates server identity; remote sessions are still                                  end-to-end encrypted and require consent or trusted enrollment.                                  A private server changes infrastructure ownership; it is not                                  automatically more secure."
+                            ).size(11.0).color(muted),
+                        ).wrap(true));
+                        ui.add_space(16.0);
+                        ui.separator();
+                        ui.add_space(11.0);
                         ui.heading("Input permissions");
                         ui.checkbox(&mut self.host_inject_input,
                             "Allow mouse and keyboard after an approved request");
@@ -2872,11 +2955,21 @@ async fn runtime_dispatch_loop(
                 }));
             }
             RuntimeCommand::RunDiagnostics => {
-                let event_tx = runtime_event_tx.clone();
-                tokio::spawn(async move {
-                    let (topology, public_addr) = run_diagnostics(0).await;
-                    let _ = event_tx.send(RuntimeEvent::DiagnosticsCompleted { topology, public_addr }).await;
-                });
+                // Never probe the public STUN service after a private
+                // infrastructure profile was selected at startup.
+                if initial_profile.is_private() {
+                    let _ = runtime_event_tx.send(RuntimeEvent::SessionStatus(
+                        "Public network diagnostics disabled in private mode".into()
+                    )).await;
+                } else {
+                    let event_tx = runtime_event_tx.clone();
+                    tokio::spawn(async move {
+                        let (topology, public_addr) = run_diagnostics(0).await;
+                        let _ = event_tx.send(RuntimeEvent::DiagnosticsCompleted {
+                            topology, public_addr
+                        }).await;
+                    });
+                }
             }
             RuntimeCommand::StopHosting => {
                 if let Some(task) = host_task.take() {
