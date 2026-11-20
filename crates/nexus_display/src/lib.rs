@@ -1,6 +1,6 @@
 use anyhow::{anyhow, Context, Result};
 use bytes::Bytes;
-use minifb::{Key, KeyRepeat, MouseButton, MouseMode, ScaleMode, Window, WindowOptions};
+use minifb::{Key, KeyRepeat, Menu, MouseButton, MouseMode, ScaleMode, Window, WindowOptions};
 use std::thread;
 use tokio::sync::mpsc::{self, Receiver, Sender};
 use windows::core::{ComInterface, Error as WindowsError};
@@ -375,6 +375,7 @@ fn run_remote_viewer(
         ..WindowOptions::default()
     }).map_err(|error| anyhow!("failed to create remote viewer window: {error}"))?;
     window.set_target_fps(60);
+    attach_session_menu(&mut window)?;
 
     let mut pixel_buffer = vec![0_u32; width * height];
     let mut last_mouse_absolute: Option<(u16, u16)> = None;
@@ -410,10 +411,60 @@ fn run_remote_viewer(
                 ..WindowOptions::default()
             }).map_err(|error| anyhow!("failed to rebuild remote viewer window: {error}"))?;
             window.set_target_fps(60);
+            attach_session_menu(&mut window)?;
             last_mouse_absolute = None;
             last_buttons = [false; 3];
         }
 
+        // A native always-visible menu exposes the actual viewer controls.
+        // F-key shortcuts remain available in full-screen mode.
+        match window.is_menu_pressed() {
+            Some(1) => {
+                if let Err(error) = toggle_native_fullscreen(
+                    window.get_window_handle(), &mut fullscreen
+                ) {
+                    eprintln!("cannot toggle full-screen viewer: {error:#}");
+                }
+            }
+            Some(2) => {
+                let _ = input_tx.blocking_send(
+                    ViewerInputEvent::ScreenshotRemote(latest_frame.clone())
+                );
+            }
+            Some(3) => { let _ = input_tx.blocking_send(ViewerInputEvent::ScreenshotLocal); }
+            Some(4) => {
+                desired_fps = desired_fps.saturating_sub(5).max(1);
+                let _ = input_tx.blocking_send(ViewerInputEvent::SetFrameRate(desired_fps));
+            }
+            Some(5) => {
+                desired_fps = desired_fps.saturating_add(5).min(60);
+                let _ = input_tx.blocking_send(ViewerInputEvent::SetFrameRate(desired_fps));
+            }
+            Some(6) => {
+                recording = !recording;
+                let _ = input_tx.blocking_send(if recording {
+                    ViewerInputEvent::ActionRecordStart
+                } else {
+                    ViewerInputEvent::ActionRecordStop
+                });
+            }
+            Some(7) => { let _ = input_tx.blocking_send(
+                ViewerInputEvent::ActionReplay { repetitions: Some(1) }
+            ); }
+            Some(8) => { let _ = input_tx.blocking_send(
+                ViewerInputEvent::ActionReplay { repetitions: Some(5) }
+            ); }
+            Some(9) => { let _ = input_tx.blocking_send(
+                ViewerInputEvent::ActionReplay { repetitions: None }
+            ); }
+            Some(10) => { let _ = input_tx.blocking_send(
+                ViewerInputEvent::ActionStopPlayback
+            ); }
+            Some(11) => { let _ = input_tx.blocking_send(
+                ViewerInputEvent::ActionReplayFile { repetitions: Some(1) }
+            ); }
+            _ => {}
+        }
         if window.is_key_pressed(Key::F5, KeyRepeat::No) {
             recording = !recording;
             let event = if recording {
@@ -480,6 +531,36 @@ fn run_remote_viewer(
             .map_err(|error| anyhow!("failed to present frame: {error}"))?;
     }
 
+    Ok(())
+}
+
+fn attach_session_menu(window: &mut Window) -> Result<()> {
+    let mut session = Menu::new("Session")
+        .map_err(|e| anyhow!("cannot create viewer session menu: {e}"))?;
+    session.add_item("Full screen (F11)", 1).build();
+    window.add_menu(&session);
+
+    let mut image = Menu::new("Capture")
+        .map_err(|e| anyhow!("cannot create Capture menu: {e}"))?;
+    image.add_item("Remote screenshot (F9)", 2).build();
+    image.add_item("My desktop screenshot (F10)", 3).build();
+    window.add_menu(&image);
+
+    let mut performance = Menu::new("Performance")
+        .map_err(|e| anyhow!("cannot create Performance menu: {e}"))?;
+    performance.add_item("Reduce FPS (F7)", 4).build();
+    performance.add_item("Increase FPS (F8)", 5).build();
+    window.add_menu(&performance);
+
+    let mut actions = Menu::new("Actions")
+        .map_err(|e| anyhow!("cannot create Actions menu: {e}"))?;
+    actions.add_item("Start/stop recording (F5)", 6).build();
+    actions.add_item("Replay once (F6)", 7).build();
+    actions.add_item("Replay five times (Ctrl+F6)", 8).build();
+    actions.add_item("Loop until stopped (Shift+F6)", 9).build();
+    actions.add_item("Stop playback (F4)", 10).build();
+    actions.add_item("Replay action file (F3)", 11).build();
+    window.add_menu(&actions);
     Ok(())
 }
 
