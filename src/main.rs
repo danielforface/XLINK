@@ -6,6 +6,7 @@ mod audio;
 mod delta;
 mod frame_codec;
 mod file_service;
+mod file_client;
 mod history;
 mod screenshot;
 mod numeric_entry;
@@ -238,6 +239,8 @@ enum RuntimeEvent {
         active: bool,
     },
     ConnectionAuthenticated { peer: String, direction: history::Direction },
+    ClientServiceConnection(nexus_network::Connection),
+    OpenFileManager,
     ClientLifecycle {
         running: bool,
     },
@@ -358,6 +361,16 @@ struct HostConsentPrompt {
     remember_requested: bool,
 }
 
+#[derive(Clone, Default)]
+struct FileUiSnapshot {
+    remote_path: String,
+    remote_items: Vec<file_service::Item>,
+    busy: bool,
+    transferred: u64,
+    total: u64,
+    message: String,
+}
+
 struct NexusGuiApp {
     active_tab: ActiveTab,
     access_id_input: String,
@@ -373,7 +386,15 @@ struct NexusGuiApp {
     show_logs: bool,
     show_preferences: bool,
     show_history: bool,
+    show_files: bool,
     recent_history: Option<history::History>,
+    client_service_connection: Option<nexus_network::Connection>,
+    file_snapshot: Arc<Mutex<FileUiSnapshot>>,
+    file_local_folder: PathBuf,
+    file_selected_local: Option<PathBuf>,
+    file_selected_remote: Option<file_service::Item>,
+    file_destination: String,
+    file_clipboard: Option<(String, bool)>,
     code_ready_at: Option<Instant>,
     refocus_number_input: bool,
     numeric_cursor: usize,
@@ -462,6 +483,15 @@ impl NexusGuiApp {
             show_logs: false,
             show_preferences: false,
             show_history: false,
+            show_files: false,
+            client_service_connection: None,
+            file_snapshot: Arc::new(Mutex::new(FileUiSnapshot::default())),
+            file_local_folder: std::env::var_os("USERPROFILE")
+                .map(PathBuf::from).unwrap_or_default().join("Downloads"),
+            file_selected_local: None,
+            file_selected_remote: None,
+            file_destination: String::new(),
+            file_clipboard: None,
             recent_history: match history::History::open() {
                 Ok(archive) => Some(archive),
                 Err(error) => {
@@ -604,6 +634,16 @@ impl NexusGuiApp {
                         self.set_status("Ready for another connection");
                     }
                 }
+                RuntimeEvent::ClientServiceConnection(connection) => {
+                    self.client_service_connection = Some(connection);
+                }
+                RuntimeEvent::OpenFileManager => {
+                    self.show_files = true;
+                    self.show_logs = false;
+                    self.show_history = false;
+                    self.show_preferences = false;
+                    self.start_file_action(file_client::Operation::List("".into()));
+                }
                 RuntimeEvent::ConnectionAuthenticated { peer, direction } => {
                     if let Some(history) = self.recent_history.as_mut() {
                         if let Err(error) = history.record(direction, &peer) {
@@ -617,6 +657,9 @@ impl NexusGuiApp {
                 }
                 RuntimeEvent::ClientLifecycle { running } => {
                     self.client_running = running;
+                    if !running {
+                        self.client_service_connection = None;
+                    }
                     if !running {
                         self.pending_client_permission = None;
                         self.ui_bridge.clear_client_permission_sender();
@@ -1986,6 +2029,7 @@ impl eframe::App for NexusGuiApp {
                         self.show_logs = false;
                         self.show_preferences = false;
                         self.show_history = false;
+                        self.show_files = false;
                         self.refocus_number_input = true;
                     }
                     if self.host_session_active {
@@ -2015,6 +2059,24 @@ impl eframe::App for NexusGuiApp {
                                 self.start_hosting_clicked();
                             }
                             if ui.add(
+                                egui::Button::new("Files")
+                                    .fill(if self.show_files {
+                                        Color32::from_rgb(225, 235, 251)
+                                    } else {
+                                        Color32::from_rgb(246, 249, 253)
+                                    }).rounding(Rounding::same(10.0))
+                            ).clicked() {
+                                self.show_files = !self.show_files;
+                                self.show_logs = false;
+                                self.show_history = false;
+                                self.show_preferences = false;
+                                if self.show_files {
+                                    self.start_file_action(
+                                        file_client::Operation::List("".into())
+                                    );
+                                } else { self.refocus_number_input = true; }
+                            }
+                            if ui.add(
                                 egui::Button::new("Recent")
                                     .fill(if self.show_history {
                                         Color32::from_rgb(225, 235, 251)
@@ -2024,6 +2086,7 @@ impl eframe::App for NexusGuiApp {
                                     .rounding(Rounding::same(10.0))
                             ).clicked() {
                                 self.show_history = !self.show_history;
+                                self.show_files = false;
                                 self.show_logs = false;
                                 self.show_preferences = false;
                                 if !self.show_history { self.refocus_number_input = true; }
@@ -2032,6 +2095,7 @@ impl eframe::App for NexusGuiApp {
                                 ui, Glyph::Logs, "Logs", self.show_logs, false,
                             ).clicked() {
                                 self.show_logs = !self.show_logs;
+                                self.show_files = false;
                                 self.show_preferences = false;
                                 self.show_history = false;
                                 if !self.show_logs {
@@ -2042,6 +2106,7 @@ impl eframe::App for NexusGuiApp {
                                 ui, Glyph::Settings, "Settings", self.show_preferences, false,
                             ).clicked() {
                                 self.show_preferences = !self.show_preferences;
+                                self.show_files = false;
                                 self.show_logs = false;
                                 self.show_history = false;
                                 if !self.show_preferences {
@@ -2061,7 +2126,9 @@ impl eframe::App for NexusGuiApp {
             .show(ctx, |ui| {
                 egui::ScrollArea::vertical().auto_shrink([false, false])
                     .show(ui, |ui| {
-                        if self.show_preferences {
+                        if self.show_files {
+                            self.draw_file_manager(ui);
+                        } else if self.show_preferences {
                             self.draw_preferences_screen(ui);
                         } else if self.show_logs {
                             self.draw_logs_screen(ui);
@@ -3437,6 +3504,9 @@ async fn run_client_session(
             .await.context("approved session did not start its video stream")?
             .context("server failed to provide a video stream")?;
         let frame_recv = FrameReceiver(Arc::new(tokio::sync::Mutex::new(frame_r)));
+        let _ = runtime_event_tx.send(
+            RuntimeEvent::ClientServiceConnection(connection.clone())
+        ).await;
 
         let client_audio_stop = Arc::new(AtomicBool::new(false));
         let client_audio_connection = connection.clone();
@@ -3473,6 +3543,12 @@ async fn run_client_session(
                 // Macro playback can emit hundreds of input events, but is
                 // allowed only within an explicitly authorized QUIC session.
                 match &event {
+                    ViewerInputEvent::OpenFileManager => {
+                        let _ = event_tx_for_screenshots.send(
+                            RuntimeEvent::OpenFileManager
+                        ).await;
+                        continue;
+                    }
                     ViewerInputEvent::ToggleAudio => {
                         audio_playing = !audio_playing;
                         if let Err(error) = control_send_clone.send_control(
@@ -3647,7 +3723,8 @@ async fn run_client_session(
                     ViewerInputEvent::SetFrameRate(fps) => {
                         ControlMessage::SetTargetFps { fps }
                     }
-                    ViewerInputEvent::ToggleAudio => continue,
+                    ViewerInputEvent::ToggleAudio
+                    | ViewerInputEvent::OpenFileManager => continue,
                     ViewerInputEvent::ActionRecordStart
                     | ViewerInputEvent::ActionRecordStop
                     | ViewerInputEvent::ActionReplay { .. }
